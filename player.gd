@@ -1,0 +1,5068 @@
+extends PanelContainer
+## MEDIA_PLAYER_SYS.EXE -- retro tactical skin over AudioStreamPlayer / VideoStreamPlayer.
+## FOLDERS tab collects library roots, TRACKS tab lists everything under them, sorted by path.
+
+## Build number, shown at the head of the STATS panel. One constant rather than a literal
+## at the readout, so the next bump is one edit -- boot.gd's POST banner and
+## export_presets.cfg still carry their own copies and have to be bumped alongside it.
+const VERSION := "V1.2"
+
+## The editor and an exported build share user:// on this machine, so an editor save
+## would otherwise be the first thing a shipped player sees. A different filename per
+## side keeps the two odometers, libraries and presets apart; on a player's machine
+## neither file exists yet, so the export always starts clean.
+var _cfg: String = "user://library_dev.cfg" if OS.has_feature("editor") else "user://library.cfg"
+
+## Typed reads out of library.cfg. The file is plain text a user can and will hand-edit,
+## and a value of the WRONG TYPE is not the clamped-away nuisance an out-of-range number
+## is: it throws at that line, which aborts the rest of _load(), leaves _a and _audio
+## unbound, and then _process throws on a null stream every frame for the rest of the
+## session. Measured: a single `folders="x"` line produced 451 errors in 45 frames and a
+## permanently dead window. Wrong type now reads as "absent" and falls back, which is the
+## same outcome as a fresh install.
+static func _cfg_arr(cfg: ConfigFile, sect: String, key: String, fallback := []) -> Array:
+	var v: Variant = cfg.get_value(sect, key, fallback)
+	return v if v is Array else fallback
+
+static func _cfg_dict(cfg: ConfigFile, sect: String, key: String) -> Dictionary:
+	var v: Variant = cfg.get_value(sect, key, {})
+	return v if v is Dictionary else {}
+
+## Scalars need the same treatment, and the clamps do NOT provide it: clampi("name", 0, 3)
+## throws on the String rather than clamping it, so a hand-typed `sort=name` was just as
+## fatal as a wrong-typed Array.
+static func _cfg_num(cfg: ConfigFile, sect: String, key: String, fallback: float) -> float:
+	var v: Variant = cfg.get_value(sect, key, fallback)
+	return float(v) if (v is float or v is int) else fallback
+
+static func _cfg_str(cfg: ConfigFile, sect: String, key: String, fallback := "") -> String:
+	var v: Variant = cfg.get_value(sect, key, fallback)
+	return v if v is String else fallback
+
+static func _cfg_bool(cfg: ConfigFile, sect: String, key: String, fallback: bool) -> bool:
+	var v: Variant = cfg.get_value(sect, key, fallback)
+	return v if v is bool else fallback
+
+static func _cfg_vec2(cfg: ConfigFile, sect: String, key: String, fallback: Vector2) -> Vector2:
+	var v: Variant = cfg.get_value(sect, key, fallback)
+	return v if v is Vector2 else fallback
+const EXTS := ["mp3", "wav", "ogg", "flac"]
+## Shipped defaults, named rather than spelled out at each use. Every one of these was
+## previously written twice -- once as a config fallback, once (or not at all) in the
+## factory reset -- and "or not at all" is exactly how REBOOT came to leave six settings
+## untouched. One constant each means the reset and the fallback cannot drift.
+const VOLUME_DEFAULT := 80.0
+const FADE_ON_DEFAULT := true
+const FADE_MS_DEFAULT := 1000
+const DELAY_MS_DEFAULT := 250
+const SPLIT_FRAC_DEFAULT := 0.5
+const SORTS := ["PATH", "NAME", "TYPE", "DATE", "FOLDER"]
+
+@export_file("*.ogv") var video_path := ""
+
+## The active deck's two players. Which pair these point at is what "switching decks"
+## means; everything downstream (_crossfade, _stop, the scrub readouts) is written
+## against them and needed no changes to become deck-aware.
+var _a: AudioStreamPlayer
+var _b: AudioStreamPlayer
+var _deck_pair := [[], []]      # deck -> [engine primary, scene spare]
+var _deck_live := [null, null]  # deck -> which side of its pair was last live
+var _deck_cur := ["", ""]       # deck -> the path it holds
+var _eq_decks: Array = []       # deck -> Equalizer; the UI rack binds to one at a time
+var _deck_btn: Button
+var _xfade: ProgressBar
+## Whichever player currently owns playback. Everything downstream -- transport,
+## scrub, the spectrum feed -- reads this, so a crossfade only has to reassign it.
+var _audio: AudioStreamPlayer    # whichever side of the active pair is sounding
+@onready var _video: VideoStreamPlayer = %Video
+@onready var _scrub: ProgressBar = %Scrub
+@onready var _vol: ProgressBar = %Vol
+@onready var _elapsed: Label = %Elapsed
+@onready var _total: Label = %Total
+@onready var _stats: Label = %Stats
+@onready var _status: Label = %Status
+@onready var _ticker: Label = %Ticker
+@onready var _clock: Label = %Clock
+@onready var _nosignal: Label = %NoSignal
+@onready var _tracks: ItemList = %Tracks
+@onready var _folder_tree: Tree = %FolderTree
+@onready var _count: Label = %Count
+@onready var _dialog: FileDialog = %Dialog
+@onready var _director: AudioDirector = %Director
+@onready var _engine: AudioEngine = %Engine
+@onready var _viz: Control = %Viz
+var _eq: Equalizer               # the ACTIVE deck's rack; see _bind_deck
+@onready var _tabs: TabContainer = %Tabs
+
+var _folders: Array[String] = []
+## Every audio file found on disk, before the folder checkboxes get a say. `_paths` is the
+## ACTIVE library carved out of this, and it is _paths that feeds the rows, the queue and
+## every index in _row_path -- so nothing downstream had to learn about the filter.
+var _all_paths: Array[String] = []
+var _paths: Array[String] = []
+## Checked directories, as a set rather than the Array the config stores: this is asked
+## once per track on every re-filter, and Array.has() there is the classic quadratic trap.
+var _enabled_folders := {}
+## Directories present at the LAST scan. The enabled set alone cannot tell "the user
+## switched this off" from "this did not exist yet" -- both are simply absent from it --
+## and treating the second as the first is what made a freshly added album invisible.
+var _known_folders := {}
+## Distinguishes "no saved list, so default everything on" from "the user genuinely
+## unchecked everything". Without it, unchecking the lot silently re-enables it on restart.
+var _enabled_known := false
+var _current := ""
+var _dragging := false
+var _note := ""
+var _hover: Callable    # live value readout for the fader under the pointer, or unset
+var _sort := 0
+var _mtime := {}
+## Current SEARCH text, matched against each row's pre-folded lowercase haystack.
+var _filter := ""
+## Sorted view of the library: one entry per _paths index, holding the row string and a
+## pre-folded lowercase haystack so a search keystroke never re-derives either.
+var _index: Array[Dictionary] = []
+## FOLDER view inserts unselectable header rows, so list rows and _paths indices stop
+## lining up. These two keep the mapping in both directions; in every other view they
+## are simply the identity, so nothing downstream needs to branch.
+var _row_path := PackedInt32Array()
+var _path_row := PackedInt32Array()
+var _busy := false
+var _flash := 0.0
+var _viz_cfg := {}
+var _skin := "WIN98"
+var _eq_cfg_decks := [{}, {}]   # deck -> saved Equalizer state
+var _crossfader := 0.0
+var _builtin_font: Font   # the compiled-in PX437, so BUILT-IN can be restored
+var _total_secs := 0.0     # lifetime, carried across sessions
+var _session_secs := 0.0
+## Both periodic jobs are scheduled against _session_secs, which starts at zero every
+## launch. _save_at used to run off _total_secs -- a lifetime counter loaded from the
+## config -- which needed re-anchoring after load or the first frame tripped it.
+var _save_at := 30.0
+var _perf_at := 0.0        # next perf sample, in session seconds
+var _perf_frame_ms := 0.0  # smoothed real frame time, measured from _process's delta
+var _perf_gpu := "--"
+var _perf_ram := "--"
+var _clock_12h := false   # false = 24-hour, the default this program shipped with
+var _show_ms := false     # milliseconds on every playback position readout
+var _show_ms_btn: Button
+var _intro_on := true     # play the opening video, then the BIOS. On by default.
+var _intro_btn: Button
+var _clock_btn: Button
+var _reboot_armed := 0.0
+var _user_name := ""
+## Retained, though nothing writes to it any more: the staging UI is gone but the
+## [library] tbs key is still loaded and saved, so an existing list survives untouched
+## if the feature is ever put back.
+var _tbs: Array[String] = []
+# --- playlists and cue markers (schema documented above _setup_menus) ------
+var _playlists := {}    # NAME -> Array of absolute paths
+var _pl_cues := {}      # NAME -> { path -> Array of cue Dictionaries }
+var _cues := {}         # path -> Array of cue Dictionaries, global scope
+var _labels := {}       # path -> display name, from RENAME TAG
+var _playlist := ""     # active playlist, "" = the whole library
+var _mark_mode := false # deliberately NOT persisted; see _setup_menus
+var _menu_ctx := {}     # what the one PopupMenu is currently about
+var _ask_cb: Callable   # what to do with the text the prompt dialog collects
+var _ask_cancel: Button # shown only for _confirm(), hidden for the prompts
+var _swatch_cache := {}  # colour hex -> the 12 px chip drawn in the colour menu
+var _cue_overlay: Control  # %CueOverlay: the markers' own canvas over %Scrub
+var _drag_cue := {}     # the marker whose tab is held, {} when none
+var _drag_from_x := 0.0 # where that press landed, for the click-vs-drag test
+var _drag_moved := false
+var _audition_gen := 0
+var _fade_on := true
+var _fade_ms := 1000
+var _delay_ms := 250
+var _fading := false
+var _max_fps := FPS_DEFAULT
+var _layout := 0       # 0 auto, 1 force landscape, 2 force portrait
+var _portrait := false
+var _last_vp := Vector2.ZERO
+var _last_screen := -1
+## Geometry to hand back when leaving fullscreen. Session-only on purpose: a saved
+## window rect that no longer fits the current monitor arrangement is worse than none.
+var _windowed_rect := Rect2i()
+var _feed := 0
+var _feed_prev := 0
+## Where the user parked the divider, as a FRACTION of the workspace (0..1), not as a
+## pixel offset.
+##
+## Pixels do not survive a move to another monitor. The stretch base pins the viewport
+## width at 1920 whatever the screen, so only the height changes -- 1080 on the landscape
+## panel, 3413 on the portrait one -- and a single stored offset was being applied to a
+## horizontal split on 1920 and a vertical split on 3413. It could not be correct in both,
+## so dragging the window between displays moved the divider to the wrong place. A
+## fraction is the same number in either orientation and on any screen.
+var _split_frac := 0.5
+## Generation counter for _split_to_fraction. It is a coroutine that spans several
+## frames, so switching feed size twice in quick succession leaves two of them
+## running and both writing the split position -- the loser lands last and wins, and
+## the divider sticks on the previous mode's ratio. Same token rule AudioEngine uses to
+## drop a superseded decode.
+var _split_gen := 0
+var _fade_tween: Tween
+var _ez_faders: Array[VSlider] = []
+var _adv_faders: Array[VSlider] = []
+var _eq_off_note: Label   # shown only while EQ is OFF, so the tab is never blank
+var _fader_base := PackedFloat32Array()
+var _fader_sync := false
+var _presets: Array = []
+var _volume := 80.0
+var _boost := 0        # 0..100 on the dial; 0 is unity, no boost
+
+func _ready() -> void:
+	assert(_fmt(61.0) == "01:01" and _ratio_at(-9.0, 100.0) == 0.0 and _ratio_at(999.0, 100.0) == 1.0)
+	assert(_is_audio("A.MP3") and _is_audio("b.flac") and not _is_audio("cover.jpg"))
+	assert(_cmp_by("NAME", "z/a.mp3", "a/b.mp3") and _cmp_by("PATH", "a/b.mp3", "z/a.mp3"))
+	assert(_cmp_by("TYPE", "b.flac", "a.mp3") and not _cmp_by("TYPE", "a.mp3", "b.flac"))
+	# shuffle must not hand back the track already playing, except in a one-track queue
+	assert(AudioEngine.peek_next(2, AudioEngine.Repeat.ALL, true, 5, 2) != 2)
+	assert(AudioEngine.peek_next(0, AudioEngine.Repeat.ALL, true, 1, 0) == 0)
+	assert(AudioEngine.peek_next(4, AudioEngine.Repeat.OFF, false, 5, 0) == -1)
+	assert(Equalizer.cut_test())   # DJ filter dead-centre and both sweep ends
+	assert(Equalizer.pitch_test())     # TAPE x KEY SHIFT, and unity staying unity
+	assert(Equalizer.flat_test())      # a flat curve bypasses EQ21 instead of processing
+	assert(Equalizer.from_dict_test()) # junk config members clamp instead of throwing
+	assert(asset_test())               # cursor thumbnail cap keeps aspect at both extremes
+	assert(Visualizer.gradient_test()) # hex list round trip and gradient sampling
+	assert(code_test())                # cheat buffer tail-matches and stays capped
+	assert(setlist_test())             # deck B reorder, including both end stops
+	assert(license_test())             # the token signature binds to payload AND user
+	assert(Visualizer.snake_test())    # snake wall and self-collision rules
+	assert(AudioDirector.tempo_test())  # the sweep, now that it runs on a worker
+	assert(AudioEngine.key_tag_test())  # key tag parsing and the Camelot wheel
+	assert(_viz.fps_lerp_test())        # visualizer speed is the same at any FPS
+	assert(clock_test())                # 12-hour wrap: midnight and noon are both 12
+	assert(roots_test())                # library root nesting and path normalisation
+	assert(count_test())                # TRACKS readout: both branches, partial marker
+	assert(cue_test())                  # marker hit-testing and cue id allocation
+	assert(ts_test())                   # MM:SS:MS formatting and its round trip
+	assert(key_test())                  # reserved keys, collisions, and clearing
+	assert(AudioEngine.deck_test())     # crossfader gain law and its silence floor
+	assert(write_in_test())             # which rows the write-in is allowed to touch
+	var cfg := ConfigFile.new()
+	if cfg.load(_cfg) == OK:
+		_folders.assign(_cfg_arr(cfg, "library", "folders"))
+		# an older config can hold un-normalised or nested roots; collapse them once here
+		# so the folder tree never renders the same directory twice
+		_dedupe_roots()
+		# has_section_key, not an is_empty() check: "saved, and the user turned everything
+		# off" has to survive a restart, and an empty Array cannot say that on its own
+		_enabled_known = cfg.has_section_key("library", "enabled_folders")
+		for dir in _cfg_arr(cfg, "library", "enabled_folders"):
+			_enabled_folders[dir] = true
+		# A config written before known_folders existed has no record of what the last
+		# scan saw, so it falls back to the enabled set. The consequence is deliberate:
+		# a folder that was switched off looks new once and comes back on. That is the
+		# right trade, because the same ambiguity is what silently hid whole albums, and
+		# a folder reappearing is one click to undo while a missing album is invisible.
+		for dir in _cfg_arr(cfg, "library", "known_folders",
+				_cfg_arr(cfg, "library", "enabled_folders")):
+			_known_folders[dir] = true
+		_sort = clampi(int(_cfg_num(cfg, "library", "sort", 0.0)), 0, SORTS.size() - 1)
+		_viz_cfg = _cfg_dict(cfg, "visual", "viz")
+		_skin = _cfg_str(cfg, "visual", "skin", "WIN98")
+		# "state" stays deck A's key, so a config written before decks existed loads
+		# straight into the deck the user was already listening on
+		_eq_cfg_decks[0] = _cfg_dict(cfg, "eq", "state")
+		_eq_cfg_decks[1] = _cfg_dict(cfg, "eq", "state_b")
+		_crossfader = clampf(_cfg_num(cfg, "audio", "crossfader", 0.0), 0.0, 1.0)
+		_engine.deck = clampi(int(_cfg_num(cfg, "audio", "deck", 0.0)), 0, 1)
+		_presets = _cfg_arr(cfg, "eq", "presets")
+		_total_secs = _cfg_num(cfg, "stats", "total_seconds", 0.0)
+		_user_name = _cfg_str(cfg, "stats", "user_name")
+		_tbs.assign(_cfg_arr(cfg, "library", "tbs"))
+		_playlists = _cfg_dict(cfg, "playlists", "list")
+		_pl_cues = _cfg_dict(cfg, "playlists", "cues")
+		_cues = _cfg_dict(cfg, "cues", "tracks")
+		_labels = _cfg_dict(cfg, "library", "track_labels")
+		# a playlist deleted by hand out of the config must not leave the list showing
+		# an empty scope with no way back to ALL TRACKS
+		_playlist = _cfg_str(cfg, "library", "playlist")
+		if not _playlists.has(_playlist):
+			_playlist = ""
+		# @onready, so _engine is already bound by the time the _ready body runs
+		_engine.shuffle = _cfg_bool(cfg, "library", "shuffle", false)
+		_engine.repeat = clampi(int(_cfg_num(cfg, "library", "repeat", float(AudioEngine.Repeat.ALL))),
+			0, 2) as AudioEngine.Repeat
+		_volume = clampf(_cfg_num(cfg, "audio", "volume", VOLUME_DEFAULT), 0.0, 100.0)
+		_boost = clampi(int(_cfg_num(cfg, "audio", "boost", 0.0)), 0, 100)
+		_fade_on = _cfg_bool(cfg, "audio", "fade", FADE_ON_DEFAULT)
+		_fade_ms = clampi(int(_cfg_num(cfg, "audio", "fade_ms", FADE_MS_DEFAULT)), FADE_MS_MIN, FADE_MS_MAX)
+		_delay_ms = clampi(int(_cfg_num(cfg, "audio", "play_delay_ms", DELAY_MS_DEFAULT)), DELAY_MS_MIN, DELAY_MS_MAX)
+		_feed = clampi(int(_cfg_num(cfg, "visual", "feed_size", 0.0)), 0, FEED_NAMES.size() - 1)
+		# split_offset was the old pixel key; it has no meaning across orientations, so a
+		# config written before this simply starts from the middle.
+		_split_frac = clampf(_cfg_num(cfg, "visual", "split_frac", SPLIT_FRAC_DEFAULT), 0.05, 0.95)
+		_clock_12h = _cfg_bool(cfg, "visual", "clock_12h", false)
+		_show_ms = _cfg_bool(cfg, "visual", "show_ms", false)
+		_font_name = _cfg_str(cfg, "visual", "font")
+		# clamped on the way in like every other config read: library.cfg is a plain
+		# text file a user can and will hand-edit, and a 400 px font or a 40x cursor is
+		# a UI nobody can click their way out of
+		_font_size = clampi(int(_cfg_num(cfg, "visual", "font_size", FONT_SIZE_DEFAULT)),
+			FONT_SIZE_MIN, FONT_SIZE_MAX)
+		_setlist_b.assign(_cfg_arr(cfg, "library", "setlist_b"))
+		_license_endpoint = _cfg_str(cfg, "secrets", "endpoint")
+		_unlocked.clear()
+		for u in _cfg_str(cfg, "secrets", "unlocked").split(",", false):
+			_unlocked.append(u)
+		# the signed file is additive: codes typed locally live in the cfg, codes
+		# redeemed against a server live in license.dat, and boot merges the two
+		for u in _read_license():
+			if not (u in _unlocked):
+				_unlocked.append(u)
+		_gradients.clear()
+		# numbered keys rather than one blob: library.cfg stays hand-editable, and a
+		# gradient can be pasted straight into the file the same way COPY emits it
+		for gi in GRAD_MAX:
+			var raw := _cfg_str(cfg, "visual", _grad_key(gi))
+			if raw.is_empty():
+				continue
+			var stops := Visualizer.parse_hex_list(raw)
+			if stops.size() >= 2:   # one stop is a colour, not a gradient
+				_gradients.append(stops)
+		_cursor_name = _cfg_str(cfg, "visual", "cursor")
+		_cursor_scale = clampf(_cfg_num(cfg, "visual", "cursor_scale", 1.0),
+			CURSOR_SCALE_MIN, CURSOR_SCALE_MAX)
+		var hs := _cfg_vec2(cfg, "visual", "cursor_hotspot", Vector2.ZERO)
+		_cursor_hotspot = Vector2(clampf(hs.x, 0.0, 1.0), clampf(hs.y, 0.0, 1.0))
+		_intro_on = _cfg_bool(cfg, "visual", "intro_video", true)
+		_layout = clampi(int(_cfg_num(cfg, "visual", "layout", 0.0)), 0, 2)
+		_director.track_tempo = _cfg_bool(cfg, "audio", "track_tempo", false)
+		_max_fps = clampi(int(_cfg_num(cfg, "visual", "max_fps", FPS_DEFAULT)), FPS_MIN, FPS_MAX)
+		# read the whole [effects] section generically, so a knob added to FX_SPEC later
+		# loads with no second edit here -- Equalizer.fx_from_dict does the clamping
+		for i in 2:
+			var sect := "effects" if i == 0 else "effects_b"
+			if cfg.has_section(sect):
+				for key in cfg.get_section_keys(sect):
+					_fx_cfg_decks[i][key] = cfg.get_value(sect, key)
+	# deck B's rack is a second instance of the same class on a second bus -- the UI is
+	# never duplicated, only re-bound
+	var eq_b := Equalizer.new()
+	eq_b.name = "EqB"
+	add_child(eq_b)
+	_eq_decks = [%Eq, eq_b]
+	if video_path:
+		_video.stream = load(video_path)
+	%Play.pressed.connect(_toggle)
+	%Stop.pressed.connect(_stop)
+	%AddFolder.pressed.connect(_dialog.popup_centered)
+	%RemoveFolder.pressed.connect(_remove_folder)
+	%Rescan.pressed.connect(_rescan)
+	%Sort.pressed.connect(_cycle_sort)
+	%Search.text_changed.connect(func(s: String) -> void:
+		_filter = s.strip_edges()
+		_refill())
+	%Reboot.pressed.connect(_on_reboot)
+	_setup_decks()
+	_setup_fade()
+	_setup_feed()
+	_setup_fps()
+	_setup_boost()
+	_setup_layout()
+	_setup_beat()
+	_setup_tbs()
+	_setup_tbs_window()
+	_setup_tear_off()
+	_setup_menus()
+	%Sort.text = "SORT: %s" % SORTS[_sort]
+	_dialog.dir_selected.connect(_add_folder)
+	_folder_tree.item_edited.connect(_on_folder_tree_item_edited)
+	_tracks.item_activated.connect(_on_row_activated)
+	_tracks.gui_input.connect(_on_list_scroll)
+	_engine.track_ready.connect(_on_track_ready)
+	_engine.track_failed.connect(_on_track_failed)
+	%Prev.pressed.connect(_prev)
+	%Next.pressed.connect(_next)
+	%Shuffle.pressed.connect(func() -> void:
+		_engine.shuffle = not _engine.shuffle
+		_refresh_transport()
+		_save())
+	%Repeat.pressed.connect(func() -> void:
+		_engine.repeat = ((_engine.repeat + 1) % 3) as AudioEngine.Repeat
+		_refresh_transport()
+		_save())
+	_refresh_transport()
+	_builtin_font = theme.default_font
+	_setup_pixel_font()
+	_scan_fonts()
+	if not _font_name.is_empty():
+		_apply_font(_font_name)
+	_apply_font_size(_font_size)   # independent of WHICH font: the built-in scales too
+	_setup_eq()
+	_setup_fx()   # after _setup_eq: the rack reads state Equalizer.setup() has to exist for
+	_setup_setlist_b()     # deck B's tab, added before the capture below
+	_capture_tab_order()   # every tab now exists, including the runtime-built ones
+	_tabs.tab_changed.connect(func(_i: int) -> void: _write_in())
+	_setup_cursor()
+	_setup_visual()
+	_director.attach(_audio)
+	_director.beat.connect(func(_i: int) -> void: _flash = 0.10)
+	_scrub.gui_input.connect(_on_scrub_input)
+	_vol.gui_input.connect(_on_vol_input)
+	_hover_note(_vol, func() -> String: return "VOLUME: %d%%" % int(_vol.value))
+	# A marker under the pointer takes the readout over, which is where its label, its
+	# time and its jump key live -- the bar itself has no room to print any of them.
+	# Otherwise the bar's own value, not _pos(): mid-drag that IS the seek target, and
+	# the ELAPSED readout beside it still shows where playback actually is until release.
+	# The hover readout is the one thing that changes the status line's LENGTH, and a
+	# Label's text is part of its minimum size: without this, every marker the pointer
+	# crossed re-fit %StatusBar, which re-fit Main, which re-fit the Workspace split and
+	# resized the visualizer's SubViewport -- a layout pass per mouse move, which is the
+	# flicker. Clipped, the label reports a fixed minimum and nothing above it moves.
+	_status.clip_text = true
+	_hover_note(_cue_overlay, func() -> String:
+		var c := _cue_at(_cue_overlay.get_local_mouse_position().x)
+		if not c.is_empty():
+			var key := str(c.get("key", ""))
+			return "%s @ %s%s  //  SHIFT-CLICK AUDITIONS" % [c["label"],
+				_time_text(float(c["time"])), "" if key.is_empty() else "  //  KEY [%s]" % key]
+		return "SEEK: %s / %s" % [_time_text(_scrub.value / 100.0 * _len()), _time_text(_len())])
+	%TickTimer.timeout.connect(func() -> void: _ticker.text = _ticker.text.substr(1) + _ticker.text[0])
+	_vol.value = _volume
+	_apply_volume()   # the bus was never actually set here, so the slider lied
+	_rescan()
+	%Boot.finished.connect(func(who: String) -> void:
+		_user_name = who
+		_save())
+	_start_intro()
+	_save()   # write a full config immediately, so nothing depends on a later edit
+	if _paths.is_empty() and not _video.stream:
+		_audio.stream = _demo_tone()
+	_stop()
+
+# --- library --------------------------------------------------------------
+func _cycle_sort() -> void:
+	_sort = (_sort + 1) % SORTS.size()
+	%Sort.text = "SORT: %s" % SORTS[_sort]
+	_save()
+	_reindex()  # re-sort only; no reason to re-walk the disk
+
+func _cmp_by(mode: String, a: String, b: String) -> bool:
+	match mode:
+		"NAME":
+			return a.get_file().naturalcasecmp_to(b.get_file()) < 0
+		"TYPE":
+			var d := a.get_extension().nocasecmp_to(b.get_extension())
+			return d < 0 if d != 0 else a.naturalcasecmp_to(b) < 0
+		"DATE":
+			var ta: int = _mtime.get(a, 0)
+			var tb: int = _mtime.get(b, 0)
+			return ta > tb if ta != tb else a.naturalcasecmp_to(b) < 0  # newest first
+	return a.naturalcasecmp_to(b) < 0  # PATH and FOLDER: keeps directories contiguous
+
+## SCAN SONGS: re-walks every root from disk. Reports what the selected folder holds
+## afterwards, so the button visibly did something even when the count has not changed.
+func _rescan() -> void:
+	var sel := _folder_tree.get_selected()
+	var watch: String = sel.get_metadata(0) if sel else ""
+	_all_paths.clear()
+	for f in _folders:
+		_walk(f, _all_paths)
+	# pruned against what is on DISK, not against the checkbox filter -- unchecking a
+	# folder must not delete the transcoded FLACs it would need again the moment it is
+	# rechecked. Only a genuine library change should cost a re-transcode.
+	#
+	# And a walk that found NOTHING while roots are still configured is a failed scan, not
+	# an empty library: a OneDrive root that has not synced yet, an unplugged drive, a
+	# folder renamed out from under the config. Pruning against that deletes every cached
+	# transcode -- gigabytes, and many minutes of ffmpeg to rebuild -- for a condition that
+	# usually fixes itself by the next scan.
+	if _all_paths.is_empty() and not _folders.is_empty():
+		push_warning("scan found no files under %d configured root(s); skipping cache prune"
+			% _folders.size())
+	else:
+		_engine.prune_cache(_all_paths)
+	_build_folder_tree()
+	_apply_folder_filter()
+	if watch.is_empty():
+		_note = "  //  SCANNED %d TRACKS" % _paths.size()
+	else:
+		var n := 0
+		for path in _paths:
+			if path.begins_with(watch):
+				n += 1
+		_note = "  //  %s: %d TRACKS" % [watch.get_file().to_upper(), n]
+	_clear_note_later()
+
+## Everything that is invariant under a search keystroke: the sort, the per-folder track
+## counts, the queue hand-off, and the row strings themselves. Typing used to re-run all of
+## it per character -- an O(n log n) sort plus an O(folders x tracks) prefix scan -- so it
+## is split out here and called only when the library or the sort order actually changes.
+## `_index` stays index-aligned with `_paths`, which is what `_row_path` and the queue mean.
+func _reindex() -> void:
+	_mtime.clear()
+	if SORTS[_sort] == "DATE":  # stat once here, not once per comparison
+		for p in _paths:
+			_mtime[p] = FileAccess.get_modified_time(p)
+	_paths.sort_custom(func(a: String, b: String) -> bool: return _cmp_by(SORTS[_sort], a, b))
+	_index.clear()
+	for path in _paths:
+		var dir := path.get_base_dir()
+		# a RENAME TAG override stands in for the filename in BOTH row forms, flat and
+		# folder-grouped, and so is also what SEARCH matches against: a track you renamed
+		# is findable by the name you gave it
+		var file: String = _labels.get(path, path.get_file())
+		var row := "%s/%s" % [dir.get_file(), file]
+		# folded once here rather than on every keystroke for every track
+		_index.append({"dir": dir, "file": file, "row": row, "hay": row.to_lower()})
+	# the queue hand-off moved into _refill(): the queue is the VISIBLE list now, and
+	# the visible list is what a search keystroke changes
+	_refill()
+	_write_in()
+
+## Rebuilds only the visible list, matching the filter against the cached lowercase
+## haystack. Cheap enough to run on every keystroke.
+func _refill() -> void:
+	# Before the list stops existing. A write-in tween holds ROW INDICES into the list it
+	# was armed on; rebuilding underneath it made _write_step index past the end of a
+	# shorter list (seven engine errors on one search keystroke) and _write_restore paint
+	# the OLD track names onto the NEW rows. Cancel rather than restore -- restoring into
+	# rows that are about to be cleared is the bug, not the fix.
+	_write_cancel()
+	_tracks.clear()
+	_row_path.clear()
+	_path_row.resize(_index.size())
+	_path_row.fill(-1)          # a filtered-out track has no row at all
+	var needle := _filter.to_lower()
+	# A playlist is just a second filter over the same visible list, which is why it
+	# needs no queue code of its own: whatever survives both filters IS the queue.
+	# Dictionary rather than the stored Array, so membership is a hash hit per row
+	# instead of a scan per row.
+	var member := {}
+	for p in _playlists.get(_playlist, []):
+		member[p] = true
+	var grouped: bool = SORTS[_sort] == "FOLDER"
+	var header := theme.get_color("font_color", "Green")
+	var last_dir := ""
+	var shown: Array[String] = []
+	var secs := 0.0
+	var unknown: Array[String] = []
+	for i in _index.size():
+		var e: Dictionary = _index[i]
+		# matched against folder + filename, which is what the row actually shows
+		if not needle.is_empty() and not (e["hay"] as String).contains(needle):
+			continue
+		if not _playlist.is_empty() and not member.has(_paths[i]):
+			continue
+		if grouped:
+			if e["dir"] != last_dir:
+				last_dir = e["dir"]
+				_tracks.add_item((e["dir"] as String).get_file().to_upper() + "/")
+				# headers are labels, not tracks: unselectable so a double-click or an
+				# arrow key can never land on one
+				_tracks.set_item_selectable(_tracks.item_count - 1, false)
+				_tracks.set_item_custom_fg_color(_tracks.item_count - 1, header)
+				_row_path.append(-1)
+			_tracks.add_item("  " + e["file"])
+		else:
+			_tracks.add_item(e["row"])
+		_path_row[i] = _tracks.item_count - 1
+		_row_path.append(i)
+		shown.append(_paths[i])
+		# cached only -- an unprobed track is counted as unknown here and swept below,
+		# never probed inline: one ffprobe per row would stall the keystroke that asked
+		var m := _engine.cached_meta(_paths[i])
+		if m.is_empty():
+			unknown.append(_paths[i])
+		else:
+			secs += float(m.get("duration", 0.0))
+	# the playlist name wins the readout when both are on: it is the scope you chose and
+	# stays chosen, where a search is transient
+	var scope := _playlist if not _playlist.is_empty() else ("FILTERED" if not needle.is_empty() else "")
+	_count.text = count_text(_paths.size(), shown.size(), _folders.size(), secs,
+		scope, not unknown.is_empty())
+	# SEARCH scopes PLAYBACK, not just the view. The queue is the visible list, so NEXT,
+	# PREV, shuffle and auto-advance all stay inside the search result until it is
+	# cleared -- AudioEngine re-anchors its index on _current, so a track that is still
+	# visible keeps playing from where it was, and one that is filtered out simply hands
+	# the next advance to the top of the new queue.
+	_engine.set_queue(shown, _current)
+	if unknown.size() <= SWEEP_MAX:
+		_sweep_durations(unknown)
+	var playing := _paths.find(_current)
+	# the current track can be filtered out, and then it simply has no row to select
+	if playing >= 0 and playing < _path_row.size() and _path_row[playing] >= 0:
+		_tracks.select(_path_row[playing])
+
+## The line under the track list. Pure, so count_test() covers both branches and the
+## partial marker without a library on disk.
+##
+## SORT dropped out of the unfiltered form: the SORT button sits directly above this
+## label and already says the same word. `partial` prints a trailing "+" -- the total is
+## a floor, not a guess, because some visible track has never been probed.
+##
+## Two short fixed lines rather than one long one, for the reason the EQ tab's note is:
+## measured at 1920x1080 the sidebar sits on its 575 px floor and fits ~36 characters of
+## this font, and the filtered form is 45. One line would either clip the total off the
+## right edge or, without clip_text, push the whole sidebar wider.
+## `scope` is "" for the whole library, "FILTERED" for a search, or the playlist's name
+## -- one parameter for both narrowing kinds, because the line says the same thing either
+## way: how many of the library you are looking at, and under what name.
+static func count_text(total: int, shown: int, folders: int, secs: float,
+		scope: String, partial: bool) -> String:
+	var t := (_hms(secs) if secs >= 3600.0 else _fmt(secs)) + ("+" if partial else "")
+	if not scope.is_empty():
+		return "%d TRACKS [%s: %d]\nTOTAL TIME: %s" % [total, scope, shown, t]
+	return "%d TRACKS  //  %d FOLDERS\nTOTAL TIME: %s" % [total, folders, t]
+
+static func count_test() -> bool:
+	return count_text(78, 12, 3, 2535.0, "FILTERED", false) \
+			== "78 TRACKS [FILTERED: 12]\nTOTAL TIME: 42:15" \
+		and count_text(78, 9, 3, 600.0, "LATE NIGHT", false) \
+			== "78 TRACKS [LATE NIGHT: 9]\nTOTAL TIME: 10:00" \
+		and count_text(78, 78, 3, 0.0, "", true) \
+			== "78 TRACKS  //  3 FOLDERS\nTOTAL TIME: 00:00+" \
+		and count_text(2, 2, 1, 3661.0, "", false) \
+			== "2 TRACKS  //  1 FOLDERS\nTOTAL TIME: 01:01:01"
+
+## How many unprobed tracks one readout may probe. A search result, or a small library,
+## lands well under it; a 5,000-track library shown unfiltered does not, and its total
+## stays marked partial rather than spawning 5,000 processes for a line of text.
+# ponytail: one ffprobe per unknown track, and nothing is remembered across sessions.
+# If exact cold totals for a big library ever matter, persist durations in library.cfg
+# rather than raising this cap.
+const SWEEP_MAX := 600
+var _sweep_token := 0
+
+## Fills in the lengths the readout is missing, on a worker, then repaints once.
+##
+## Every path is probed at most once per session even when the probe fails: metadata()
+## caches its defaults either way, so `cached_meta` going non-empty is what ends this --
+## a length of 0 does not, and testing for that would re-probe the same broken file
+## forever.
+func _sweep_durations(todo: Array[String]) -> void:
+	_sweep_token += 1
+	if todo.is_empty():
+		return
+	var token := _sweep_token
+	WorkerThreadPool.add_task(func() -> void:
+		for p in todo:
+			if token != _sweep_token:
+				return   # a newer search superseded this sweep; stop rather than finish
+			_engine.metadata(p)
+		(func() -> void:
+			if token == _sweep_token:
+				_refill()).call_deferred())
+
+func _walk(dir: String, out: Array[String]) -> void:
+	for f in DirAccess.get_files_at(dir):
+		if _is_audio(f):
+			out.append(dir.path_join(f))
+	for d in DirAccess.get_directories_at(dir):
+		_walk(dir.path_join(d), out)
+
+func _add_folder(dir: String) -> void:
+	dir = _norm_root(dir)
+	for root in _folders:
+		if _is_under(dir, root):
+			# already inside a root, so its tracks are in the library either way
+			_note = "  //  ALREADY COVERED BY %s" % root.get_file().to_upper()
+			_clear_note_later()
+			return
+	_folders.append(dir)
+	_dedupe_roots()   # the new root may swallow ones that were already there
+	# a newly added root is on by default, like every folder in a fresh library
+	_enabled_folders[dir] = true
+	_save()
+	_rescan()
+
+## Normalises a library root: backslashes to forward slashes, "." and ".." resolved, no
+## trailing separator -- except on a bare drive, where "D:" alone is not a usable path.
+static func _norm_root(dir: String) -> String:
+	var out := dir.replace("\\", "/").simplify_path()
+	if out.length() > 1 and out.ends_with("/") and not out.ends_with(":/"):
+		out = out.left(out.length() - 1)
+	return out
+
+## True when `child` IS `parent` or sits underneath it. Case-insensitive, because Windows
+## paths are; the separator is required so "C:/Music2" is not read as a child of
+## "C:/Music".
+static func _is_under(child: String, parent: String) -> bool:
+	var c := child.to_lower()
+	var p := parent.to_lower().trim_suffix("/")
+	return c == p or c.begins_with(p + "/")
+
+## Collapses the root list: normalised, de-duplicated case-insensitively, and with any
+## root that lives inside another dropped.
+##
+## Nested roots are not merely redundant. _build_folder_tree walks each root separately,
+## so "C:/Music" and "C:/Music/Rock" both render a Rock branch -- two checkboxes for one
+## directory, whose filter state then depends on which copy was clicked last.
+func _dedupe_roots() -> void:
+	var kept: Array[String] = []
+	for raw in _folders:
+		var dir := _norm_root(raw)
+		var redundant := false
+		for i in range(kept.size() - 1, -1, -1):
+			if _is_under(dir, kept[i]):
+				redundant = true      # covered by a root already kept
+				break
+			if _is_under(kept[i], dir):
+				kept.remove_at(i)     # this root swallows one we had
+		if not redundant:
+			kept.append(dir)
+	_folders = kept
+
+## Self-check for the path rules, asserted from _ready with the rest.
+static func roots_test() -> bool:
+	return _is_under("C:/Music/Rock", "C:/Music") \
+		and _is_under("c:/music/rock", "C:/MUSIC") \
+		and _is_under("C:/Music", "C:/Music") \
+		and not _is_under("C:/Music2", "C:/Music") \
+		and not _is_under("C:/Music", "C:/Music/Rock") \
+		and _norm_root("C:\\Music\\Rock\\") == "C:/Music/Rock" \
+		and _norm_root("D:/") == "D:/"
+
+
+# --- folder tree -----------------------------------------------------------
+## The tree is derived from the walked track paths, NOT from a second recursive DirAccess
+## pass. Every directory worth showing is one that holds audio or leads to one, and that
+## set is already implied by _all_paths -- a folder with no music anywhere under it is not
+## something anyone wants to filter by, and walking the disk twice to find it is wasted IO.
+##
+## Rebuilt only from _rescan(), never from _reindex(): folder counts change when the disk
+## changes, not when the sort order does, and rebuilding would throw away the user's
+## expand/collapse state every time they cycled SORT.
+func _build_folder_tree() -> void:
+	_folder_tree.clear()
+	var counts := _folder_counts()
+	var root := _folder_tree.create_item()
+	for base in _folders:
+		var made := {base: _folder_item(root, base, counts)}
+		for d in _dirs_under(base):
+			# _dirs_under sorts, and for path strings a parent always sorts before its
+			# own children -- so the parent item is guaranteed to exist by now
+			made[d] = _folder_item(made[d.get_base_dir()], d, counts)
+	_sync_enabled_from_tree()
+
+func _folder_item(parent: TreeItem, path: String, counts: Dictionary) -> TreeItem:
+	var item := _folder_tree.create_item(parent)
+	item.set_cell_mode(0, TreeItem.CELL_MODE_CHECK)
+	item.set_editable(0, true)
+	item.set_text(0, "%s/  [%d]" % [path.get_file(), counts.get(path, 0)])
+	item.set_metadata(0, path)
+	# Three ways a folder ends up checked, and the third one is the fix: a directory the
+	# last scan never saw is NEW, not switched off. Before this, a newly dropped album
+	# was absent from the enabled set exactly like a folder the user had unticked, so it
+	# was created unchecked and _apply_folder_filter dropped every track under it -- the
+	# album simply never appeared, with no error anywhere.
+	item.set_checked(0, not _enabled_known                 # fresh library: all on
+		or not _known_folders.has(path)                    # never seen before: new, on
+		or _enabled_folders.has(path))                     # seen before and left on
+	return item
+
+## Recursive track count for every directory, in one pass up each track's ancestor chain:
+## O(tracks x depth). The obvious alternative -- begins_with() for every folder against
+## every track -- is O(folders x tracks), which the old flat list got away with because it
+## only ever had two rows. A tree has one row per directory.
+func _folder_counts() -> Dictionary:
+	var counts := {}
+	for path in _all_paths:
+		var dir := path.get_base_dir()
+		while true:
+			counts[dir] = counts.get(dir, 0) + 1
+			var up := dir.get_base_dir()
+			if up == dir or up.is_empty():
+				break
+			dir = up
+	return counts
+
+## Every directory under `base` that holds audio, plus the ancestors linking them back to
+## base. Sorted, because for path strings sorting puts a parent ahead of its children.
+func _dirs_under(base: String) -> Array[String]:
+	var seen := {}
+	var prefix := base + "/"
+	for path in _all_paths:
+		if not path.begins_with(prefix):
+			continue
+		var dir := path.get_base_dir()
+		while dir != base and dir.length() > base.length():
+			seen[dir] = true
+			dir = dir.get_base_dir()
+	var out: Array[String] = []
+	out.assign(seen.keys())
+	out.sort()
+	return out
+
+## A parent's checkbox owns its whole subtree: unchecking a root turns off everything under
+## it. Deliberately no tri-state -- a half-checked parent needs a third icon and a rule for
+## what clicking it does, and neither earns its keep in a folder filter.
+func _on_folder_tree_item_edited() -> void:
+	var item := _folder_tree.get_edited()
+	if not item:
+		return
+	_set_subtree_checked(item, item.is_checked(0))
+	_sync_enabled_from_tree()
+	_apply_folder_filter()
+	_save()
+
+static func _set_subtree_checked(item: TreeItem, on: bool) -> void:
+	item.set_checked(0, on)
+	var child := item.get_first_child()
+	while child:
+		_set_subtree_checked(child, on)
+		child = child.get_next()
+
+## Reads the tree back into the set. Iterative rather than recursive purely because the
+## hidden root has no metadata and would need special-casing in a recursive version.
+func _sync_enabled_from_tree() -> void:
+	_enabled_folders.clear()
+	# rebuilt rather than added to, so directories that have been deleted from disk drop
+	# out of the known set instead of accumulating in the config forever
+	_known_folders.clear()
+	_enabled_known = true
+	var stack: Array[TreeItem] = []
+	if _folder_tree.get_root():
+		stack.append(_folder_tree.get_root())
+	while not stack.is_empty():
+		var item: TreeItem = stack.pop_back()
+		var meta = item.get_metadata(0)
+		if meta != null:
+			_known_folders[meta] = true   # it exists now; the next scan has seen it
+			if item.is_checked(0):
+				_enabled_folders[meta] = true
+		var child := item.get_first_child()
+		while child:
+			stack.append(child)
+			child = child.get_next()
+
+## Unchecking a folder removes its tracks from the LIBRARY, not merely from the visible
+## list. _paths feeds the play queue as well as the rows, so a track in an unchecked folder
+## must not be reachable with NEXT either -- which is why the filter lives here and not in
+## _refill(), which is only ever a view of _paths and is also what SEARCH filters.
+func _apply_folder_filter() -> void:
+	_paths.clear()
+	for path in _all_paths:
+		if _enabled_folders.has(path.get_base_dir()):
+			_paths.append(path)
+	_reindex()
+
+## Transient status text: the note sits in the status bar rather than a popup, so it
+## needs clearing or it would still be there ten minutes later.
+func _clear_note_later() -> void:
+	var keep := _note
+	await get_tree().create_timer(4.0).timeout
+	if _note == keep:
+		_note = ""
+
+## Only a ROOT can be removed. A subfolder is not something the library owns, it is just
+## something found on disk -- unchecking is how you exclude one, and removing it would only
+## have it reappear on the next scan.
+func _remove_folder() -> void:
+	var sel := _folder_tree.get_selected()
+	if not sel:
+		return
+	var gone: String = sel.get_metadata(0)
+	if not gone in _folders:
+		_note = "  //  SELECT A ROOT FOLDER TO REMOVE"
+		_clear_note_later()
+		return
+	_folders.erase(gone)
+	_save()
+	_rescan()
+	_note = "  //  REMOVED %s" % gone.get_file().to_upper()
+	_clear_note_later()
+
+func _save() -> void:
+	var cfg := ConfigFile.new()
+	cfg.set_value("library", "folders", _folders)
+	cfg.set_value("library", "enabled_folders", _enabled_folders.keys())
+	cfg.set_value("library", "known_folders", _known_folders.keys())
+	cfg.set_value("library", "sort", _sort)
+	cfg.set_value("library", "tbs", _tbs)
+	cfg.set_value("library", "track_labels", _labels)
+	cfg.set_value("library", "playlist", _playlist)
+	cfg.set_value("playlists", "list", _playlists)
+	cfg.set_value("playlists", "cues", _pl_cues)
+	cfg.set_value("cues", "tracks", _cues)
+	cfg.set_value("library", "shuffle", _engine.shuffle)
+	cfg.set_value("library", "repeat", int(_engine.repeat))
+	cfg.set_value("audio", "volume", _volume)
+	cfg.set_value("audio", "boost", _boost)
+	cfg.set_value("audio", "fade", _fade_on)
+	cfg.set_value("audio", "fade_ms", _fade_ms)
+	cfg.set_value("audio", "play_delay_ms", _delay_ms)
+	cfg.set_value("audio", "track_tempo", _director.track_tempo)
+	# never persist FULLSCREEN: it would boot into a UI with no visible way out
+	cfg.set_value("visual", "feed_size", _feed_prev if _feed == Feed.FULLSCREEN else _feed)
+	cfg.set_value("visual", "split_frac", _split_frac)
+	cfg.set_value("visual", "clock_12h", _clock_12h)
+	cfg.set_value("visual", "show_ms", _show_ms)
+	cfg.set_value("visual", "font", _font_name)
+	cfg.set_value("visual", "font_size", _font_size)
+	# erased first: deleting a gradient shortens the list, and a leftover user_grad_4
+	# would be read back on the next launch as a gradient that no longer exists
+	for gi in GRAD_MAX:
+		if cfg.has_section_key("visual", _grad_key(gi)):
+			cfg.erase_section_key("visual", _grad_key(gi))
+	for gi in _gradients.size():
+		cfg.set_value("visual", _grad_key(gi), Visualizer.to_hex_list(_gradients[gi]))
+	cfg.set_value("library", "setlist_b", _setlist_b)
+	cfg.set_value("secrets", "unlocked", ",".join(PackedStringArray(_unlocked)))
+	cfg.set_value("secrets", "endpoint", _license_endpoint)
+	cfg.set_value("visual", "cursor", _cursor_name)
+	cfg.set_value("visual", "cursor_scale", _cursor_scale)
+	cfg.set_value("visual", "cursor_hotspot", _cursor_hotspot)
+	cfg.set_value("visual", "intro_video", _intro_on)
+	cfg.set_value("visual", "max_fps", _max_fps)
+	cfg.set_value("visual", "layout", _layout)
+	cfg.set_value("visual", "skin", _skin)
+	cfg.set_value("eq", "state", _eq_decks[0].to_dict())
+	cfg.set_value("eq", "state_b", _eq_decks[1].to_dict())
+	cfg.set_value("audio", "crossfader", _crossfader)
+	cfg.set_value("audio", "deck", _engine.deck)
+	cfg.set_value("eq", "presets", _presets)
+	# one entry per parameter rather than a single blob, so [effects] stays readable and
+	# hand-editable in library.cfg like every other section
+	for i in 2:
+		var sect := "effects" if i == 0 else "effects_b"
+		for key in _eq_decks[i].fx:
+			cfg.set_value(sect, key, _eq_decks[i].fx[key])
+		for key in _eq_decks[i].fx_switch:
+			cfg.set_value(sect, key, _eq_decks[i].fx_switch[key])
+	cfg.set_value("stats", "total_seconds", _total_secs)
+	cfg.set_value("stats", "user_name", _user_name)
+	cfg.set_value("visual", "viz", {
+		"mode": int(_viz.mode), "color": _viz.color_index, "sens": _viz.sensitivity,
+		"tilt": _viz.tilt_db, "height": _viz.height_scale, "speed": _viz.speed})
+	cfg.save(_cfg)
+
+## Closing the window is the only way out of the app, and the odometer only flushes every
+## 30 s, so without this the last half-minute of every session is lost. This is the ONLY
+## exit write: _exit_tree() used to duplicate it, and both fired on a normal close.
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_CLOSE_REQUEST and is_node_ready():
+		_save()
+	# A drag begins somewhere and ends somewhere; Godot tells every Control about both
+	# but never says where. So the tab under the cursor is noted at the start, and at the
+	# end the cursor is asked again -- if the drag was not consumed by anything (the tab
+	# bar did not reorder it, no other Control took it) and the cursor is outside the tab
+	# dock, that is a tear-off.
+	elif what == NOTIFICATION_DRAG_BEGIN:
+		_drag_tab = _tab_under_cursor()
+	elif what == NOTIFICATION_DRAG_END:
+		var idx := _drag_tab
+		_drag_tab = -1
+		if idx < 0 or get_viewport().gui_is_drag_successful():
+			return
+		if not _tabs.get_global_rect().has_point(_tabs.get_global_mouse_position()):
+			_tear_off_tab(idx)
+
+# --- playback (decoding, metadata and preload live in AudioEngine) ---------
+## `i` indexes the ENGINE QUEUE, which is the visible list -- not _paths. The two are the
+## same array until a search narrows it, and bounds-checking against the wrong one is how
+## a filtered queue would load the wrong track.
+func _open(i: int) -> void:
+	if i < 0 or i >= _engine.queue.size():
+		return
+	_video.stream = null
+	if not _fade_on:
+		_stop()           # legacy behaviour: the outgoing track dies immediately
+	_busy = true
+	_note = "  //  LOADING %s" % _engine.queue[i].get_file()
+	_engine.request(i)
+
+func _on_track_ready(path: String, stream: AudioStream, _meta: Dictionary) -> void:
+	_busy = false
+	_note = ""
+	_current = path
+	if _fade_on and _audio.playing:
+		_crossfade(stream)
+	else:
+		_stop()
+		_audio.stream = stream  # already decoded on a worker, or handed over from preload
+		_audio.volume_db = ACTIVE_DB
+		_audio.play()
+	# the spectrum feed follows whichever player is live, and attach() resets the tempo
+	# lock for us -- it is per-track, and carrying it over would fight the new song
+	_director.attach(_audio)
+	_ticker.text = _engine.ticker_line(path)
+	_cue_overlay.queue_redraw()   # the new track's cue markers, not the old one's
+	# already cached by the worker that decoded the track: a dictionary read, no I/O
+	_key = _engine.metadata(path).get("key", {})
+	_refresh_fx()
+	var i := _paths.find(path)
+	if i >= 0 and i < _path_row.size() and _path_row[i] >= 0:
+		_tracks.select(_path_row[i])
+
+func _on_track_failed(path: String, reason: String) -> void:
+	_busy = false
+	_note = "  //  %s: %s" % [reason.to_upper(), path.get_file()]
+
+func _next() -> void:
+	_open(_engine.next_index())
+
+func _prev() -> void:
+	_open(_engine.prev_index())
+
+# --- backend switch: the only place audio vs video APIs differ -------------
+func _vid() -> bool: return _video.stream != null
+func _len() -> float: return _video.get_stream_length() if _vid() else (_audio.stream.get_length() if _audio.stream else 0.0)
+func _pos() -> float: return _video.stream_position if _vid() else _audio.get_playback_position()
+func _playing() -> bool: return _video.is_playing() if _vid() else _audio.playing
+func _paused() -> bool: return _video.paused if _vid() else _audio.stream_paused
+func _seek(t: float) -> void:
+	# ponytail: VideoStreamPlayer seeks to the nearest keyframe; exact only for audio.
+	if _vid(): _video.stream_position = t
+	else: _audio.seek(t)
+
+func _set_paused(v: bool) -> void:
+	if _vid(): _video.paused = v
+	else: _audio.stream_paused = v
+
+# --- transport ------------------------------------------------------------
+## Single play/pause control -- the button's label is derived from _state(), so it can
+## never disagree with what the audio is actually doing.
+func _toggle() -> void:
+	if _state() == "PLAYING":
+		_set_paused(true)
+	else:
+		_play()
+
+func _play() -> void:
+	_set_paused(false)
+	if _playing():
+		return
+	if _vid(): _video.play()
+	elif _audio.stream: _audio.play()
+
+func _stop() -> void:
+	if _fade_tween and _fade_tween.is_valid():
+		_fade_tween.kill()
+	_fading = false
+	_video.stop()
+	for pl in [_a, _b]:
+		pl.stop()
+		pl.stream_paused = false
+		pl.volume_db = ACTIVE_DB
+	_scrub.value = 0.0
+
+func _state() -> String:
+	# AudioStreamPlayer.playing goes false while stream_paused is set, so test paused first.
+	if _paused(): return "PAUSED"
+	return "PLAYING" if _playing() else "STOPPED"
+
+# --- scrub / volume: click-drag on a ProgressBar, no slider grabber art ----
+## Scrubbing now goes through the same _bar_drag predicate as every other bar in the
+## program. The old hand-rolled version tracked the button with its own flag and cleared
+## it on the release event -- which never arrives if the release lands outside the bar,
+## so _dragging latched on and a later hover kept scrubbing with nothing held down.
+##
+## The release is no longer handled here at all; _process polls the button instead, so an
+## off-bar release completes the seek exactly like an on-bar one.
+func _on_scrub_input(e: InputEvent) -> void:
+	# No cue handling here beyond MARK MODE: %CueOverlay takes marker presses first and
+	# passes everything else down.
+	#
+	# While MARK MODE is on, the bar does not seek AT ALL -- not on the press, and not on
+	# the drag that follows it. The press alone was already being swallowed, but any
+	# twitch with the button still down fell through to _bar_drag below, set _dragging,
+	# and _process seeked on release: dropping a marker moved the playhead nearly every
+	# time. One gesture cannot both mark and seek.
+	if _mark_mode:
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+			_add_cue(_ratio_at(e.position.x, _scrub.size.x) * _len())
+		return
+	if not _bar_drag(e, _scrub):
+		return
+	_dragging = true
+	_scrub.value = _ratio_at(e.position.x, _scrub.size.x) * 100.0
+
+func _on_vol_input(e: InputEvent) -> void:
+	if _bar_drag(e, _vol):
+		_volume = _ratio_at(e.position.x, _vol.size.x) * 100.0
+		_vol.value = _volume
+		_apply_volume()
+		_save_soon()
+
+# --- readout --------------------------------------------------------------
+func _process(delta: float) -> void:
+	var l := _len()
+	var p := _pos()
+	# End-of-drag is polled, not awaited: a release outside the bar is never delivered to
+	# its gui_input, and waiting for one is what let _dragging latch on permanently.
+	_drag_cue_step()   # a marker tab being dragged, polled like the scrub drag below
+	if _dragging and not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+		_dragging = false
+		if l > 0.0:
+			_seek(_scrub.value / 100.0 * l)
+	if not _dragging and l > 0.0:
+		_scrub.value = p / l * 100.0
+	_elapsed.text = _time_text(p)
+	_total.text = _time_text(l)
+	_clock.text = _clock_text()
+	_nosignal.visible = _state() == "STOPPED"
+	_nosignal.text = "[ LOADING ]" if _busy else "[ NO SIGNAL ]"
+	_session_secs += delta
+	_total_secs += delta
+	_reboot_armed = maxf(_reboot_armed - delta, 0.0)
+	if _reboot_armed <= 0.0 and %Reboot.text != "REBOOT":
+		%Reboot.text = "REBOOT"
+	# Measured from the delta this callback is handed, NOT from Performance.TIME_PROCESS.
+	# That monitor is not trustworthy here: sampled against the real frame time it
+	# reported 43.55 ms of "process time" inside an 18.06 ms frame, which cannot happen,
+	# and a percentage built on it read 377-999%. The delta is the frame, by definition.
+	# Smoothed at 0.08 because the raw value swings several ms frame to frame.
+	_perf_frame_ms = lerpf(_perf_frame_ms, delta * 1000.0, 0.08)
+	# OS.get_memory_info() is a syscall; twice a second is plenty for a readout a human
+	# is looking at, and per-frame would put it in the same budget it claims to measure.
+	if _session_secs >= _perf_at:
+		_perf_at = _session_secs + 0.5
+		_sample_perf()
+	# periodic flush so a crash or a kill loses at most half a minute of the odometer
+	if _session_secs >= _save_at:
+		_save_at = _session_secs + 30.0
+		_save()
+	var vp := get_viewport().get_visible_rect().size
+	if vp != _last_vp:
+		_last_vp = vp
+		_update_orientation()
+	# One trivial DisplayServer getter, polled because Godot exposes no "window changed
+	# screen" notification. The first reading is recorded and never acted on: at boot the
+	# window IS deliberately 72 px past the usable rect, because fullscreen covers the
+	# taskbar, and repairing that would drop the program out of fullscreen on startup.
+	var scr := DisplayServer.window_get_current_screen()
+	if _last_screen < 0:
+		_last_screen = scr
+	elif scr != _last_screen:
+		_last_screen = scr
+		_refit_window_to_screen()
+	_flash = maxf(_flash - delta, 0.0)
+	%Play.text = "PAUSE" if _state() == "PLAYING" else "PLAY"
+	var hover := "  //  %s" % _hover.call() if _hover.is_valid() else ""
+	_status.text = "STATE: %s  //  %s  //  ERR: %04d%s%s" % [
+		_state(), _bpm_readout(), 0 if _note.is_empty() else 1, _note, hover]
+	_stats.text = "\n".join([
+		"VERSION.%s" % VERSION,
+		"USER....%s" % (_user_name if _user_name else "-"),
+		"SOURCE..%s" % _src(),
+		"FORMAT..%s" % (_current.get_extension().to_upper() if _current else "PCM"),
+		"LENGTH..%s" % _time_text(l),
+		"TRKPOS..%s" % _time_text(p),
+		"REMAIN..%s" % _time_text(maxf(l - p, 0.0)),
+		"STATE...%s" % _state(),
+		"KEY.....%s" % _key_stat(),
+		"MOUSE...[H] %s" % ("HIDDEN" if _cursor_hidden else "SHOWN"),
+		"VOLUME..%03d%%" % int(_vol.value),
+		"LIBRARY.%d" % _paths.size(),
+		"SESSION.%s" % _hms(_session_secs),
+		"TOTAL...%s" % _hms(_total_secs),
+		"CPU.....%.1f MS/FRAME @ %d FPS" % [_perf_frame_ms,
+			int(Performance.get_monitor(Performance.TIME_FPS))],
+		"GPU.....%s" % _perf_gpu,
+		"RAM.....%s" % _perf_ram,
+	])
+
+## 24-hour is Time.get_time_string_from_system() as-is. 12-hour has to be assembled,
+## because that call has no format option -- and the two edge cases are the ones every
+## hand-rolled clock gets wrong: midnight is 12 AM, not 0, and noon is 12 PM, not 0.
+func _clock_text() -> String:
+	if not _clock_12h:
+		return Time.get_time_string_from_system()
+	var t := Time.get_time_dict_from_system()
+	var h: int = t["hour"]
+	var half := "AM" if h < 12 else "PM"
+	h = h % 12
+	if h == 0:
+		h = 12
+	return "%d:%02d:%02d %s" % [h, t["minute"], t["second"], half]
+
+## Self-check for the two hours that wrap. Asserted from _ready like the others.
+static func clock_test() -> bool:
+	var probe := func(hour: int) -> String:
+		var half := "AM" if hour < 12 else "PM"
+		var h: int = hour % 12
+		if h == 0:
+			h = 12
+		return "%d:00:00 %s" % [h, half]
+	return probe.call(0) == "12:00:00 AM" and probe.call(12) == "12:00:00 PM" \
+		and probe.call(13) == "1:00:00 PM" and probe.call(11) == "11:00:00 AM" \
+		and probe.call(23) == "11:00:00 PM"
+
+
+## Repairs the window after it is moved to another display.
+##
+## Measured on this three-monitor desk, every screen reserves 72 px for the taskbar:
+## 1920x1080 usable 1008, 1080x1920 usable 1848, 1646x1029 usable 957. The program boots
+## FULLSCREEN (window/size/mode=3), which covers the taskbar, so at rest nothing is
+## hidden. Shift+Win+Arrow moves it while leaving that mode in place, and the taskbar
+## then draws on top of the bottom 72 px -- exactly the status bar plus half the
+## transport deck, gone with nothing to say so.
+##
+## The repair is borderless + MAXIMIZED, and both halves were measured:
+##   - WINDOWED is unreachable from a fullscreen state in this build. Setting it reports
+##     EXCLUSIVE_FS back and window_set_size is refused outright.
+##   - Re-asserting FULLSCREEN on the new screen changes nothing; still 72 px under.
+##   - MAXIMIZED lands inside the usable rect on all three screens, portrait included.
+##   - BORDERLESS keeps the chromeless look the fullscreen boot has, so the repair is
+##     invisible apart from the taskbar no longer covering the transport.
+func _refit_window_to_screen() -> void:
+	var usable := DisplayServer.screen_get_usable_rect(
+		DisplayServer.window_get_current_screen())
+	var pos := DisplayServer.window_get_position()
+	var size := DisplayServer.window_get_size()
+	# Both axes. Only the vertical was checked before, which covered the taskbar case
+	# this exists for but missed the other half: a window moved to a NARROWER display
+	# overhangs the right edge without being any taller than the screen.
+	var inside_y: bool = pos.y >= usable.position.y \
+		and pos.y + size.y <= usable.position.y + usable.size.y
+	var inside_x: bool = pos.x >= usable.position.x \
+		and pos.x + size.x <= usable.position.x + usable.size.x
+	if inside_x and inside_y:
+		return   # already sitting inside the usable area; leave it alone
+	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
+	DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_MAXIMIZED)
+
+
+# --- performance readout ---------------------------------------------------
+## Samples the GPU and RAM figures. The CPU line is not built here -- it is the frame
+## time smoothed in _process, because Godot exposes no system-wide CPU percentage and
+## Performance.TIME_PROCESS proved untrustworthy (it reported 43 ms of process time
+## inside an 18 ms frame). What this panel shows is what can honestly be measured.
+func _sample_perf() -> void:
+	var vram := int(Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED))
+	var draws := int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME))
+	_perf_gpu = "%s VRAM  %d DRAWS" % [_bytes(vram), draws]
+	var mem: Dictionary = OS.get_memory_info()
+	# `physical` and `free` are real RAM. `available` is deliberately NOT used: on
+	# Windows it is the commit limit and reads 39 GB on a 16.9 GB machine, which looks
+	# like a bug to anyone who knows how much memory they have.
+	#
+	# Kept short deliberately: the STATS panel is a Label, so its widest line sets the
+	# tab's minimum width. The first draft read "114 MB APP  1.2 GB FREE OF 15.7 GB" and
+	# pushed that minimum to 672 px, past the 575 px sidebar floor, clipping the tab.
+	_perf_ram = "%s APP  %s/%s" % [
+		_bytes(OS.get_static_memory_usage()),
+		_bytes(int(mem.get("free", 0))),
+		_bytes(int(mem.get("physical", 0)))]
+
+static func _bytes(n: int) -> String:
+	if n >= 1073741824:
+		return "%.1f GB" % (float(n) / 1073741824.0)
+	if n >= 1048576:
+		return "%d MB" % (n / 1048576)
+	return "%d KB" % (n / 1024)
+
+func _src() -> String:
+	if _current:
+		return _current.get_file().to_upper()
+	var f := video_path.get_file()
+	return f.to_upper() if f else "DEMO_TONE.WAV"
+
+# ponytail: synthesized so the player runs with an empty library -- harmless once folders are added.
+func _demo_tone() -> AudioStreamWAV:
+	var sr := 22050
+	var buf := PackedByteArray()
+	buf.resize(sr * 16 * 2)
+	for i in sr * 16:
+		var t := float(i) / sr
+		var hz := 220.0 * pow(2.0, floor(fmod(t, 8.0)) / 12.0)
+		buf.encode_s16(i * 2, int(sin(TAU * hz * t) * (1.0 - fmod(t, 1.0)) * 0.3 * 32767.0))
+	var s := AudioStreamWAV.new()
+	s.format = AudioStreamWAV.FORMAT_16_BITS
+	s.mix_rate = sr
+	s.data = buf
+	return s
+
+# ponytail: mm:ss only -- rolls past 60 min as "61:04", add hours when a source needs it.
+static func _fmt(t: float) -> String:
+	return "%02d:%02d" % [int(t) / 60, int(t) % 60]
+
+## The one place a playback POSITION becomes text: the transport, the scrub hover, the
+## STATS column and every marker timestamp go through here, which is what makes SHOW MS
+## a single switch rather than a hunt for format strings.
+##
+## Durations that are not positions -- the library's TOTAL TIME, a track's LENGTH in
+## TRACK INFO -- deliberately do not: milliseconds on a 3-hour library total is noise.
+func _time_text(t: float) -> String:
+	if _show_ms:
+		return ts_text(t)
+	return _hms(t) if t >= 3600.0 else _fmt(t)
+
+static func _is_audio(f: String) -> bool:
+	return f.get_extension().to_lower() in EXTS
+
+static func _ratio_at(x: float, w: float) -> float:
+	return clampf(x / maxf(w, 1.0), 0.0, 1.0)
+
+## Left-click, or a drag with the left button still held. Every click-drag ProgressBar in
+## the program -- volume, visualizer, EQ DSP, boost, the FX rack -- asks this, so the
+## "click and drag also counts" rule is written once.
+##
+## `bar` is not optional paranoia. A Control that has not been laid out yet still receives
+## input, and _ratio_at() on a zero-width bar returns 0 for ANY x -- which silently writes
+## the minimum of the range into whatever parameter that bar owns. That is not theoretical:
+## it flattened a whole config section to its floor values during testing.
+static func _bar_drag(e: InputEvent, bar: Control) -> bool:
+	if bar.size.x < 2.0:
+		return false
+	if e is InputEventMouseMotion:
+		return (e.button_mask & MOUSE_BUTTON_MASK_LEFT) != 0
+	return e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT
+
+## Hover readout: while the pointer is on a fader, that control's mapped value is appended
+## to the status bar. No floating tooltip node, nothing to position, theme or time out --
+## the status line is rebuilt from scratch every frame in _process anyway, so the whole
+## feature costs one Callable call per frame.
+##
+## `text` is a Callable rather than a String because these values move while the pointer
+## is on them: a string captured at mouse_entered would freeze mid-drag, which is exactly
+## when a value readout is worth having.
+func _hover_note(c: Control, text: Callable) -> void:
+	c.mouse_entered.connect(func() -> void: _hover = text)
+	# only the control that owns the current readout may clear it -- moving onto a
+	# neighbouring fader delivers its mouse_entered BEFORE this one's mouse_exited,
+	# and an unguarded clear would blank the readout that just arrived
+	c.mouse_exited.connect(func() -> void:
+		if _hover == text:
+			_hover = Callable())
+
+
+# --- visualizer settings (VISUAL tab) -------------------------------------
+## SNAKE is last and only reachable once unlocked -- see _viz_mode_count().
+const VIZ_NAMES := ["SEGMENTS", "MIRROR", "WATERFALL", "GRID", "RADIAL", "MATRIX",
+	"TUNNEL", "CRUISE", "FIRE", "KALEIDO", "SNAKE"]
+
+func _setup_visual() -> void:
+	_viz.director = _director
+	Skins.apply(theme, self, _skin)
+	%Skin.text = "SKIN: %s" % _skin
+	%Skin.pressed.connect(func() -> void:
+		_skin = Skins.NAMES[(Skins.NAMES.find(_skin) + 1) % Skins.NAMES.size()]
+		Skins.apply(theme, self, _skin)
+		%Skin.text = "SKIN: %s" % _skin
+		_refill()  # folder headers carry the accent colour, so they need repainting
+		_save())
+	# clamped against the UNLOCKED count: losing the unlock must not boot into SNAKE
+	_apply_unlocks()
+	_viz.mode = clampi(_viz_cfg.get("mode", 0), 0, _viz_mode_count() - 1) as Visualizer.Mode
+	# PRESETS.size() is the rainbow slot, one past the last fixed colour
+	_viz.gradients = _gradients
+	# one slot per gradient past the rainbow, so a saved gradient selection survives
+	_viz.color_index = clampi(_viz_cfg.get("color", 0), 0,
+		_viz.PRESETS.size() + _gradients.size())
+	_viz.sensitivity = _viz_cfg.get("sens", 0.5)
+	_viz.tilt_db = _viz_cfg.get("tilt", 20.0)
+	_viz.height_scale = _viz_cfg.get("height", 0.62)
+	_viz.speed = _viz_cfg.get("speed", 0.5)
+	# the swatch row is rebuilt rather than inlined here: a gradient added or deleted
+	# renumbers every slot after it, and color_index IS a position in this row
+	_rebuild_color_row()
+	%VizMode.pressed.connect(func() -> void:
+		_viz.mode = ((_viz.mode + 1) % _viz_mode_count()) as Visualizer.Mode
+		_refresh_visual()
+		_save())
+	for bar in [%Sens, %Tilt, %Height, %Speed]:
+		bar.gui_input.connect(_on_viz_bar.bind(bar))
+		# TILT is the one of the four that is not a percentage -- it is a dB slope
+		_hover_note(bar, func() -> String: return "%s: %s" % [bar.name.to_upper(),
+			("%.1f DB" % _viz.tilt_db) if bar == %Tilt else "%d%%" % int(bar.value)])
+	_refresh_visual()
+
+func _refresh_visual() -> void:
+	%VizMode.text = "MODE: %s" % VIZ_NAMES[_viz.mode]
+	%Sens.value = _viz.sensitivity * 100.0
+	%Tilt.value = _viz.tilt_db / 40.0 * 100.0
+	%Height.value = _viz.height_scale * 100.0
+	%Speed.value = _viz.speed * 100.0
+
+func _on_viz_bar(e: InputEvent, bar: ProgressBar) -> void:
+	if not _bar_drag(e, bar):
+		return
+	var r := _ratio_at(e.position.x, bar.size.x)
+	bar.value = r * 100.0
+	if bar == %Sens: _viz.sensitivity = r
+	elif bar == %Tilt: _viz.tilt_db = r * 40.0
+	elif bar == %Speed: _viz.speed = r
+	else: _viz.height_scale = maxf(r, 0.2)
+	_save()
+
+
+## Wheel scrolling lands on whole rows instead of part-way through one.
+## ItemList in Godot 4.7 has NO fixed_item_height (only fixed_column_width and
+## fixed_icon_size), so the row height has to be measured off a real item.
+## A double-click gives a LIST row, which is neither a library index nor a queue index.
+func _on_row_activated(row: int) -> void:
+	if row >= 0 and row < _row_path.size() and _row_path[row] >= 0:
+		# row -> _paths index -> queue index. The last hop is not a no-op under a search:
+		# the queue holds only the matches, so a row's queue position is not its library one.
+		_open(_engine.queue.find(_paths[_row_path[row]]))
+
+func _on_list_scroll(e: InputEvent) -> void:
+	if not (e is InputEventMouseButton and e.pressed):
+		return
+	var dir := 0
+	if e.button_index == MOUSE_BUTTON_WHEEL_UP: dir = -1
+	elif e.button_index == MOUSE_BUTTON_WHEEL_DOWN: dir = 1
+	else: return
+	if _tracks.item_count == 0:
+		return
+	var step := _tracks.get_item_rect(0).size.y
+	if step <= 0.0:
+		return
+	var bar := _tracks.get_v_scroll_bar()
+	bar.value = snappedf(bar.value + dir * step * 3.0, step)
+	_tracks.accept_event()
+
+
+## Px437 is a codepage-437 bitmap font: no CJK glyphs at all, so the Japanese track
+## names would render as tofu. Chaining a SystemFont fallback keeps the pixel look for
+## everything it covers and quietly hands the rest to the OS.
+func _setup_pixel_font() -> void:
+	var px := theme.default_font
+	if not px:
+		return
+	var cjk := SystemFont.new()
+	cjk.font_names = PackedStringArray(["Yu Gothic UI", "Meiryo", "MS Gothic", "Segoe UI"])
+	cjk.antialiasing = TextServer.FONT_ANTIALIASING_NONE
+	cjk.subpixel_positioning = TextServer.SUBPIXEL_POSITIONING_DISABLED
+	px.fallbacks = [cjk]
+
+
+## Classic 12x19 arrow, built in code and nearest-scaled up. '#' is the black outline,
+## '.' the white fill, space transparent. Drawing it rather than shipping a PNG keeps
+## it one file and lets CURSOR_SCALE decide how chunky the pixels read.
+const CURSOR_SCALE := 3
+const CURSOR_ART := [
+	"#",
+	"##",
+	"#.#",
+	"#..#",
+	"#...#",
+	"#....#",
+	"#.....#",
+	"#......#",
+	"#.......#",
+	"#........#",
+	"#.....#####",
+	"#..#..#",
+	"#.# #..#",
+	"##  #..#",
+	"#    #..#",
+	"     #..#",
+	"      #..#",
+	"      #..#",
+	"       ##",
+]
+
+## Deliberately not persisted, for the same reason FULLSCREEN is not: booting into a
+## player with no visible pointer is a UI you have to guess your way out of. [H] is a
+## per-session thing you turn on to watch the visualizer clean.
+var _cursor_hidden := false
+
+## MOUSE_MODE_HIDDEN rather than CAPTURED: the pointer still moves, still hovers and
+## still clicks, it just stops being drawn. CAPTURED would lock it to the window and
+## break every fader in the rack.
+func _toggle_cursor() -> void:
+	_cursor_hidden = not _cursor_hidden
+	Input.mouse_mode = Input.MOUSE_MODE_HIDDEN if _cursor_hidden else Input.MOUSE_MODE_VISIBLE
+
+func _setup_cursor() -> void:
+	var w := 0
+	for row in CURSOR_ART:
+		w = maxi(w, row.length())
+	var img := Image.create(w * CURSOR_SCALE, CURSOR_ART.size() * CURSOR_SCALE, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0, 0, 0, 0))
+	for y in CURSOR_ART.size():
+		var row: String = CURSOR_ART[y]
+		for x in row.length():
+			if row[x] == " ":
+				continue
+			var col := Color.BLACK if row[x] == "#" else Color.WHITE
+			for dy in CURSOR_SCALE:
+				for dx in CURSOR_SCALE:
+					img.set_pixel(x * CURSOR_SCALE + dx, y * CURSOR_SCALE + dy, col)
+	var custom := _custom_cursor_image()
+	# The drawn arrow keeps its hotspot at the tip, which is pixel (0,0) of that bitmap.
+	# A user image is scaled and given the hotspot from the CURSOR window instead.
+	var shape := img
+	var hotspot := Vector2.ZERO
+	if custom:
+		# resized HERE rather than at the slider, so the stored hotspot fraction resolves
+		# against the size the OS is actually handed
+		var want := Vector2i(
+			clampi(int(roundf(custom.get_width() * _cursor_scale)), 1, ASSET_THUMB_PX * 2),
+			clampi(int(roundf(custom.get_height() * _cursor_scale)), 1, ASSET_THUMB_PX * 2))
+		if want != Vector2i(custom.get_width(), custom.get_height()):
+			custom.resize(want.x, want.y, Image.INTERPOLATE_NEAREST)
+		shape = custom
+		# clamped inside the bitmap: a hotspot outside it is rejected outright, and the
+		# program would silently keep whatever pointer it had
+		hotspot = Vector2(
+			clampf(shape.get_width() * _cursor_hotspot.x, 0.0, float(shape.get_width() - 1)),
+			clampf(shape.get_height() * _cursor_hotspot.y, 0.0, float(shape.get_height() - 1))).floor()
+	DisplayServer.cursor_set_custom_image(shape, DisplayServer.CURSOR_ARROW, hotspot)
+
+
+# --- EQUALIZER tab --------------------------------------------------------
+const EQ_MODES := ["OFF", "EZ EQ", "ADVANCED"]
+const EZ_LABELS := ["LOW", "MID", "HIGH"]
+
+func _setup_eq() -> void:
+	# One rack per deck, each on that deck's bus. The chain is identical; only the state
+	# differs, which is exactly what the DECK toggle swaps the UI over to.
+	for i in _eq_decks.size():
+		_eq_decks[i].setup(_engine.deck_bus(i))
+		_eq_decks[i].from_dict(_eq_cfg_decks[i])
+	_eq = _eq_decks[_engine.deck]
+	# the racks are inserted ahead of the analyser, which invalidates the handle the
+	# director cached in its own _ready (children are ready before their parent)
+	_director.rebind()
+	var cap := Equalizer.grabber_texture()
+	for i in EZ_LABELS.size():
+		_ez_faders.append(_make_fader(%EzPanel, EZ_LABELS[i], cap, _eq.ez_db[i]))
+	for i in Equalizer.LANES:
+		# label every fourth lane only; 16 stacked captions is unreadable at this width
+		var tag := _lane_hz(i) if i % 4 == 0 else ""
+		_adv_faders.append(_make_fader(%AdvPanel, tag, cap, _eq.lane_db[i]))
+	for i in _ez_faders.size():
+		_ez_faders[i].value_changed.connect(func(v: float) -> void: _eq.set_ez(i, v))
+		_hover_note(_ez_faders[i], func() -> String:
+			return "%s: %+.1f DB" % [EZ_LABELS[i], _eq.ez_db[i]])
+	for i in _adv_faders.size():
+		var f := _adv_faders[i]
+		# every lane names its own centre frequency here, including the three in four
+		# that have no printed caption -- that is the readout this tab never had
+		_hover_note(f, func() -> String:
+			return "%s HZ: %+.1f DB" % [_lane_hz(i), _eq.lane_db[i]])
+		f.drag_started.connect(func() -> void: _fader_base = _eq.lane_db.duplicate())
+		f.value_changed.connect(_on_lane_changed.bind(i))
+	%EqMode.pressed.connect(func() -> void:
+		_eq.set_mode(((_eq.mode + 1) % 3) as Equalizer.Mode)
+		_refresh_eq()
+		_save())
+	%EqAdapt.toggled.connect(func(on: bool) -> void:
+		_eq.adapt = on
+		_save())
+	# T-BASS and BBE are FX-rack controls only. Their rows used to be duplicated on this
+	# tab, which meant two widgets owning one value plus a refresh path to keep them
+	# honest; the rack's own faders drive Equalizer.set_dsp directly, so there is one
+	# source of truth. The rows are gone from player.tscn, not hidden or freed at load.
+	_setup_presets()
+	for e in _eq_decks:
+		e.changed.connect(_save_soon)
+	# With both fader panels hidden in OFF mode, and the T-BASS/BBE rows now gone, the
+	# tab collapsed to a lone button in a 29 px strip -- which reads as the equalizer
+	# having broken rather than being switched off. This says which it is.
+	_eq_off_note = Label.new()
+	_eq_off_note.name = "EqOffNote"
+	# Two short fixed lines, NOT one long autowrapped one. Autowrap made the label
+	# compute its height at its own minimum width (140 px) and demand 1636 px of it,
+	# which the tab then inherited. Each line is kept under ~22 characters so it also
+	# cannot widen the tab past the 575 px sidebar floor, the way the RAM readout did
+	# to STATS.
+	_eq_off_note.text = "[ EQUALIZER BYPASSED ]
+T-BASS / BBE ON FX TAB"
+	_eq_off_note.theme_type_variation = &"Green"
+	_eq_off_note.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	var eq_tab := %EqMode.get_parent().get_parent()
+	eq_tab.add_child(_eq_off_note)
+	eq_tab.move_child(_eq_off_note, 1)
+	%EqAdapt.button_pressed = _eq.adapt
+	_refresh_eq()
+
+## Lane centre frequencies, 32 Hz to 16 kHz spread logarithmically across the 16 lanes.
+func _lane_hz(i: int) -> String:
+	var hz := 32.0 * pow(500.0, float(i) / float(Equalizer.LANES - 1))
+	return "%dK" % int(hz / 1000.0) if hz >= 1000.0 else "%d" % int(hz)
+
+func _make_fader(parent: Control, tag: String, cap: ImageTexture, value: float) -> VSlider:
+	var lane := VBoxContainer.new()
+	lane.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	lane.add_theme_constant_override("separation", 2)
+	var f := VSlider.new()
+	f.min_value = Equalizer.GAIN_MIN
+	f.max_value = Equalizer.GAIN_MAX
+	f.step = 0.5
+	f.value = value
+	f.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	f.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	# generated cap: the stock grabber is a soft round dot that matches nothing else here,
+	# and a theme icon needs a real texture either way
+	f.add_theme_icon_override("grabber", cap)
+	f.add_theme_icon_override("grabber_highlight", cap)
+	lane.add_child(f)
+	var l := Label.new()
+	l.text = tag
+	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lane.add_child(l)
+	parent.add_child(lane)
+	return f
+
+## ADAPT rewrites every lane, so the other 15 sliders have to be pushed back without
+## re-entering this handler -- hence the sync guard rather than disconnecting signals.
+func _on_lane_changed(v: float, i: int) -> void:
+	if _fader_sync:
+		return
+	if _fader_base.size() != Equalizer.LANES:
+		_fader_base = _eq.lane_db.duplicate()
+	_eq.apply_lane(i, v, _fader_base)
+	if not _eq.adapt:
+		return
+	_fader_sync = true
+	for j in Equalizer.LANES:
+		if j != i:
+			_adv_faders[j].value = _eq.lane_db[j]
+	_fader_sync = false
+
+func _refresh_eq() -> void:
+	%EqMode.text = "EQ: %s" % EQ_MODES[_eq.mode]
+	if is_instance_valid(_eq_off_note):
+		_eq_off_note.visible = _eq.mode == Equalizer.Mode.OFF
+	%EzPanel.visible = _eq.mode == Equalizer.Mode.EZ
+	%AdvPanel.visible = _eq.mode == Equalizer.Mode.ADVANCED
+	%EqAdapt.visible = _eq.mode == Equalizer.Mode.ADVANCED
+	%PresetRow.visible = _eq.mode == Equalizer.Mode.ADVANCED
+	%NameRow.visible = _eq.mode == Equalizer.Mode.ADVANCED
+
+func _apply_volume() -> void:
+	AudioServer.set_bus_volume_db(0, linear_to_db(maxf(_volume, 0.01) / 100.0))
+
+## Continuous controls (EQ faders, the volume bar) change many times per second, and
+## writing library.cfg at that rate would hammer the disk. Every such control funnels
+## through here instead, so at most one write lands per 1.5 s no matter how many move.
+func _save_soon() -> void:
+	if has_meta("save_pending"):
+		return
+	set_meta("save_pending", true)
+	await get_tree().create_timer(1.5).timeout
+	remove_meta("save_pending")
+	_save()
+
+
+# --- uptime and factory reset ---------------------------------------------
+static func _hms(secs: float) -> String:
+	var s := int(secs)
+	var d := s / 86400
+	var h := (s % 86400) / 3600
+	return ("%dD %02d:%02d:%02d" % [d, h, (s % 3600) / 60, s % 60]) if d > 0 \
+		else ("%02d:%02d:%02d" % [h, (s % 3600) / 60, s % 60])
+
+## REBOOT is destructive -- it drops every library root -- so the first click only arms
+## it. A second click within four seconds commits; otherwise it disarms itself.
+func _on_reboot() -> void:
+	if _reboot_armed <= 0.0:
+		_reboot_armed = 4.0
+		%Reboot.text = "CONFIRM?"
+		return
+	_reboot_armed = 0.0
+	_stop()
+	_current = ""
+	_folders.clear()
+	_paths.clear()
+	_all_paths.clear()
+	_enabled_folders.clear()
+	_known_folders.clear()
+	_enabled_known = false   # next library starts all-on again
+	_tbs.clear()
+	_sort = 0
+	_skin = "WIN98"
+	_user_name = ""   # next launch asks for a name again
+	_eq.reset_all()
+	_presets.clear()
+	_init_presets()
+	_refresh_presets()
+	_viz.mode = 0                 # SEGMENTS
+	_viz.color_index = 0          # green
+	_viz.sensitivity = 0.5
+	_viz.tilt_db = 20.0
+	_viz.height_scale = 0.62
+	_viz.speed = 0.5
+	_boost = 0
+	_refresh_boost()
+	_engine.shuffle = false
+	_engine.repeat = AudioEngine.Repeat.ALL
+	_refresh_transport()
+	_director.track_tempo = false
+	_director.reset()
+	_refresh_beat()
+	_layout = 0
+	%Layout.selected = 0
+	_update_orientation()
+	_clock_12h = false
+	_refresh_clock_btn()
+	_intro_on = true
+	_refresh_intro_btn()
+	# The six that REBOOT used to walk straight past. Each needs its widget pushed back
+	# too, or the control keeps displaying the pre-reset value while the engine uses the
+	# new one -- a reset that lies about what it did is worse than one that skips.
+	_volume = VOLUME_DEFAULT
+	_vol.value = _volume
+	_apply_volume()
+	_fade_on = FADE_ON_DEFAULT
+	%Fade.text = "FADE: %s" % ("ON" if _fade_on else "OFF")
+	_fade_ms = FADE_MS_DEFAULT
+	%FadeMs.text = str(_fade_ms)
+	_delay_ms = DELAY_MS_DEFAULT
+	%DelayMs.text = str(_delay_ms)
+	_split_frac = SPLIT_FRAC_DEFAULT
+	_filter = ""
+	%Search.text = ""
+	_max_fps = FPS_DEFAULT
+	%MaxFps.text = str(FPS_DEFAULT)
+	Engine.max_fps = FPS_DEFAULT
+	_apply_feed(Feed.LARGE)
+	_audio.stream = _demo_tone()  # library is empty again, so the tone comes back
+	for i in Equalizer.LANES:
+		_adv_faders[i].value = 0.0
+	for f in _ez_faders:
+		f.value = 0.0
+	%EqAdapt.button_pressed = true
+	%Skin.text = "SKIN: WIN98"
+	Skins.apply(theme, self, _skin)
+	_refresh_eq()
+	_refresh_fx()   # reset_all() cleared the rack; pull the faders and LEDs back to it
+	_refresh_visual()
+	_rescan()
+	_save()
+	_note = "  //  REBOOTED TO DEFAULTS"
+	_clear_note_later()
+
+
+# --- TBS: the settings screen ----------------------------------------------
+func _setup_tbs() -> void:
+	# TBS is a settings screen and nothing else: the TO BE SORTED list, its REMOVE/CLEAR
+	# row, its count and the "-> TBS" button on the TRACKS tab are gone from player.tscn
+	# outright, rather than being built at load and freed a frame later.
+	#
+	# Anchored off %Layout because the old list used to be how this found the tab.
+	_tbs_home = %Layout.get_parent().get_parent()
+	_add_settings_rows()
+
+## Builds one settings row in the shape the scene's own rows use: a caption sized to
+## match its siblings so the controls line up in a column, then a control filling the
+## rest. Two callers now; a third would otherwise be a third copy of the same lines.
+##
+## Rows join _tbs_home before anything is torn off, so they travel to the detached
+## settings window with every other row and need no special handling there.
+func _add_setting_row(caption_text: String, row_name: String, after: Control) -> Button:
+	var row := HBoxContainer.new()
+	row.name = row_name
+	var caption := Label.new()
+	caption.text = caption_text
+	var sibling := after.get_child(0) as Control
+	if sibling:
+		caption.custom_minimum_size.x = sibling.size.x
+	row.add_child(caption)
+	var btn := Button.new()
+	btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(btn)
+	_tbs_home.add_child(row)
+	_tbs_home.move_child(row, after.get_index() + 1)
+	return btn
+
+## The two settings that are built in code rather than in player.tscn, added after
+## LAYOUT so they sit with the other display settings.
+func _add_settings_rows() -> void:
+	var layout_row: Control = %Layout.get_parent()
+	_clock_btn = _add_setting_row("CLOCK", "ClockRow", layout_row)
+	_clock_btn.pressed.connect(func() -> void:
+		_clock_12h = not _clock_12h
+		_refresh_clock_btn()
+		_save())
+	_refresh_clock_btn()
+
+	_font_btn = _add_setting_row("FONT", "FontRow", _clock_btn.get_parent())
+	_font_btn.pressed.connect(_cycle_font)
+	_refresh_font_btn()
+
+	# The two managers. FONT above still cycles what is already installed in one click,
+	# which is the fast path; these open the windows that can add, preview and size.
+	var fonts_btn := _add_setting_row("MANAGE", "FontsRow", _font_btn.get_parent())
+	fonts_btn.text = "[ FONTS ]"
+	fonts_btn.pressed.connect(_open_fonts_window)
+	_hover_note(fonts_btn, func() -> String:
+		return "ADD, PREVIEW AND SIZE FONTS  //  FILES LIVE IN %s" % FONT_DIR)
+
+	var grad_btn := _add_setting_row("MANAGE", "GradRow", fonts_btn.get_parent())
+	grad_btn.text = "[ GRADIENT ]"
+	grad_btn.pressed.connect(_open_gradient_window)
+	_hover_note(grad_btn, func() -> String:
+		return "BUILD VISUALIZER GRADIENTS  //  COPY AND PASTE THEM AS HEX LISTS")
+
+	var cursor_btn := _add_setting_row("MANAGE", "CursorRow", grad_btn.get_parent())
+	cursor_btn.text = "[ CURSOR ]"
+	cursor_btn.pressed.connect(_open_cursor_window)
+	_hover_note(cursor_btn, func() -> String:
+		return "ADD AND SCALE POINTERS  //  FILES LIVE IN %s" % CURSOR_DIR)
+
+	_show_ms_btn = _add_setting_row("SHOW MS", "ShowMsRow", cursor_btn.get_parent())
+	_show_ms_btn.toggle_mode = true
+	_show_ms_btn.button_pressed = _show_ms
+	_show_ms_btn.pressed.connect(func() -> void:
+		_show_ms = _show_ms_btn.button_pressed
+		_refresh_show_ms()
+		# every position readout is rebuilt from _time_text in _process, so the transport,
+		# the hover line and the STATS column follow on the next frame with nothing to
+		# push. The markers' TS strings live in a menu built at popup time. This is the
+		# only thing carrying stale text, and only because it is painted, not formatted.
+		_cue_overlay.queue_redraw()
+		_save())
+	_refresh_show_ms()
+
+	_intro_btn = _add_setting_row("INTRO VIDEO", "IntroRow", _show_ms_btn.get_parent())
+	_intro_btn.toggle_mode = true
+	_intro_btn.button_pressed = _intro_on
+	_intro_btn.pressed.connect(func() -> void:
+		_intro_on = _intro_btn.button_pressed
+		_refresh_intro_btn()
+		_save())
+	_refresh_intro_btn()
+
+## Same [*]/[ ] idiom the FX rack LEDs use -- a Button rather than a CheckBox, because
+## the theme styles Button and Skins repaints it, while a CheckBox would arrive with
+## stock Godot icons that no skin can touch.
+func _refresh_intro_btn() -> void:
+	if is_instance_valid(_intro_btn):
+		_intro_btn.text = "[*] ON  (VIDEO + BIOS)" if _intro_on else "[ ] OFF  (SKIP BOTH)"
+
+## The label doubles as a legend for the format it switches to, because "SHOW MS: ON"
+## says nothing about what the transport is about to look like.
+func _refresh_show_ms() -> void:
+	if is_instance_valid(_show_ms_btn):
+		_show_ms_btn.text = "[*] ON  (MM:SS:MS)" if _show_ms else "[ ] OFF  (MM:SS)"
+
+func _refresh_clock_btn() -> void:
+	if is_instance_valid(_clock_btn):
+		_clock_btn.text = "12 HOUR (AM/PM)" if _clock_12h else "24 HOUR (MILITARY)"
+
+# --- TBS detached window ---------------------------------------------------
+## The settings screen pops out into its own OS window, so it can sit on a second
+## monitor while the player keeps the main screen.
+##
+## This is a REAL OS window on all three platforms, and that is not automatic: Godot
+## embeds Window nodes inside the main viewport unless the root viewport says
+## otherwise. `display/window/subwindows/embed_subwindows=false` in project.godot is
+## what makes it native. There is no per-window override -- it is a root-viewport
+## property, so the setting is global and the FileDialog on the FOLDERS tab becomes a
+## native window too. That is the trade, and it reads better on every platform.
+## Sized for the whole settings screen: ten rows of controls, and room left over so a
+## torn-off copy is not a letterbox.
+const TBS_WIN_SIZE := Vector2i(640, 620)
+## The eight fixed rows need roughly 300 px; below this the list is squeezed to nothing.
+## Resizing is otherwise unrestricted -- the window is meant to be dragged to another
+## display and left there.
+const TBS_WIN_MIN := Vector2i(430, 470)
+
+var _tbs_home: Control          # the TBS tab: home for the rows while attached
+var _tbs_col: VBoxContainer     # the window-side column they live in while detached
+var _tbs_win: Window
+var _tbs_btn: Button
+
+## Moves ONE row between the tab and the detached window.
+##
+## Every row is moved individually and nothing is ever wrapped in a carrier container,
+## and that is the whole design constraint. Measured in the running app, crossing into
+## another Window:
+##
+##   reparent() called ON a node        -> its %UniqueName survives, both directions
+##   node carried inside a moved parent -> its %UniqueName is lost, permanently
+##
+## reparent() re-registers the node it is called on; a descendant just receives
+## EXIT_TREE, which releases the registration, and nothing puts it back. Move the rows
+## in a wrapper and all thirteen of %Fade %FadeMs %DelayMs %FeedSize %MaxFps %BeatTrack
+## %Boost %BoostLabel %Layout and the rest stop resolving,
+## which silently breaks _refresh_boost, _refresh_beat, _commit_max_fps, _apply_feed
+## and _on_reboot. So: one call per row, never a carrier.
+##
+## keep_global_transform is false: a Control's screen position means nothing once it is
+## inside a different window.
+static func _move_row(node: Node, to: Node) -> void:
+	node.reparent(to, false)
+
+func _setup_tbs_window() -> void:
+	# The TBS tab comes off the tab bar. Everything that was on it lives in the detached
+	# window now, and a tab holding nothing but a "detached" notice is a dead click.
+	#
+	# Hidden rather than deleted, deliberately: the node is where the rows go home to
+	# when the window is closed. Parking them on a hidden tab costs nothing and keeps
+	# every %UniqueName alive, whereas reparenting the tab itself somewhere else would
+	# carry all thirteen of them across and silently break the lot -- see _move_row.
+	_tabs.set_tab_hidden(_tabs.get_tab_idx_from_control(_tbs_home), true)
+
+	_tbs_btn = Button.new()
+	_tbs_btn.name = "TbsScreen"
+	_tbs_btn.pressed.connect(_open_tbs_window)
+	# directly above REBOOT, which is destructive and stays the last control on the tab
+	var stats_tab := %Reboot.get_parent()
+	stats_tab.add_child(_tbs_btn)
+	stats_tab.move_child(_tbs_btn, %Reboot.get_index())
+	_refresh_tbs_button()
+
+## Already open means raise it, never spawn a second. grab_focus() on a Window asks the
+## window manager to bring it forward, which is the only portable way to say "it is over
+## there" -- on macOS especially, a second instance would be the wrong answer.
+func _open_tbs_window() -> void:
+	if is_instance_valid(_tbs_win):
+		_tbs_win.grab_focus()
+		return
+
+	var win := Window.new()
+	win.name = "TbsWindow"
+	win.title = "SOUNDSCAPE // SETTINGS"
+	win.size = TBS_WIN_SIZE
+	win.min_size = TBS_WIN_MIN
+	win.unresizable = false
+	# Neither transient nor exclusive. A transient window is pinned above its parent and
+	# on macOS follows it between spaces; exclusive would block input to the player
+	# while it is open. Both defeat the purpose of a window you park and leave.
+	win.transient = false
+	win.exclusive = false
+	# The theme carries the IBM BIOS font and every stylebox in one property. Skins
+	# mutates those stylebox resources in place rather than rebuilding the theme, so the
+	# detached window follows a skin change with no extra wiring.
+	win.theme = theme
+	win.close_requested.connect(_close_tbs_window)
+	add_child(win)
+
+	# A Window paints no background of its own -- without this the panel floats on the
+	# viewport clear colour. Reusing the ROOT's stylebox INSTANCE rather than a copy is
+	# what keeps the chassis colour in step when the skin changes.
+	var chassis := PanelContainer.new()
+	chassis.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var root_sb: StyleBox = get("theme_override_styles/panel")
+	if root_sb:
+		chassis.add_theme_stylebox_override("panel", root_sb)
+	win.add_child(chassis)
+	var pad := MarginContainer.new()
+	for side in ["left", "top", "right", "bottom"]:
+		pad.add_theme_constant_override("margin_" + side, 6)
+	chassis.add_child(pad)
+	# leave a marker behind so the tab does not just lose a third of itself
+	_tbs_col = VBoxContainer.new()
+	_tbs_col.add_theme_constant_override("separation", 4)
+	pad.add_child(_tbs_col)
+	for row in _tbs_home.get_children():   # a snapshot, safe to reparent while iterating
+		_move_row(row, _tbs_col)
+
+	_tbs_win = win
+	win.show()
+	# Centred on the USABLE rect, not the raw screen rect: move_to_center() centres on
+	# the full display and lands 36 px low here, half the taskbar's height. The usable
+	# rect excludes the Windows taskbar, the macOS menu bar and Linux panels alike, and
+	# current_screen keeps it on the display the window actually opened on rather than
+	# flinging it back to the primary monitor.
+	var scr := DisplayServer.screen_get_usable_rect(win.current_screen)
+	win.position = scr.position + (scr.size - win.size) / 2
+	_refresh_tbs_button()
+
+## The window's own close button, and nothing else. Closing a sub-Window never reaches
+## the main window's NOTIFICATION_WM_CLOSE_REQUEST, so this cannot quit the application
+## -- but the panel has to come home BEFORE the window is freed, or queue_free() takes
+## the whole settings screen down with it.
+func _close_tbs_window() -> void:
+	if not is_instance_valid(_tbs_win):
+		return
+	for row in _tbs_col.get_children():
+		_move_row(row, _tbs_home)
+	_tbs_col = null
+	var win := _tbs_win
+	_tbs_win = null   # cleared first, so a re-entrant close_requested is a no-op
+	win.queue_free()
+	_refresh_tbs_button()
+
+func _refresh_tbs_button() -> void:
+	if is_instance_valid(_tbs_btn):
+		_tbs_btn.text = "[ TBS SCREEN * ]" if is_instance_valid(_tbs_win) else "[ TBS SCREEN ]"
+
+
+# --- tear-off tabs ---------------------------------------------------------
+## Any tab can be dragged out of the dock and becomes its own OS window; closing that
+## window puts it back where it was. Same native-window machinery as the settings screen,
+## and the same requirement on project.godot's embed_subwindows=false.
+## Preferred size on a landscape display, and on a portrait one. Both are only a
+## starting point: the real minimum comes from the panel itself, and the whole thing is
+## clamped to the screen it opens on.
+const TEAR_WIN_SIZE := Vector2i(620, 720)
+const TEAR_WIN_SIZE_V := Vector2i(560, 1000)
+## Padding inside a torn-off window, normal and compact. A narrow window spends its width
+## on content, not on chrome -- 12 px of horizontal inset is 3% of a 380 px window.
+const TEAR_PAD := 6
+const TEAR_PAD_TIGHT := 1
+## Below this width a torn-off window switches to the compact padding.
+const TEAR_TIGHT_BELOW := 520
+
+var _drag_tab := -1     # tab index the current drag started on, -1 when not dragging
+var _torn := {}         # panel Control -> {title, index, window}
+## Canonical tab order: Control -> position. A stored absolute index goes stale the
+## moment a SECOND tab is torn off, because the first one leaving shifted everything
+## after it -- restoring both then put EQ and FX back the wrong way round. Sorting the
+## whole bar against this map is order-independent, however many are out at once.
+## Every tab's canonical slot in Tabs. Keyed by the Control rather than by its NodePath
+## on purpose: a torn-off tab's path changes the moment it is reparented into its window,
+## which is exactly when the map still has to resolve, and a node reference survives that
+## move where a path does not.
+var _tab_home_indices := {}
+
+func _setup_tear_off() -> void:
+	# Godot's own reorder drag is what produces the drag event at all; without it a tab
+	# is not draggable and nothing below ever fires. Reordering inside the bar comes free.
+	_tabs.drag_to_rearrange_enabled = true
+	# a deliberate reorder becomes the new canonical order, so restoring a torn-off tab
+	# never undoes an arrangement the user chose
+	_tabs.active_tab_rearranged.connect(func(_to: int) -> void: _capture_tab_order())
+	# NOTE: the initial capture is NOT done here. This runs before _setup_fx builds the
+	# FX tab, so capturing now would leave FX out of the map and sort it to the end of
+	# the bar every time it was torn off and put back. _ready captures after _setup_fx.
+
+func _capture_tab_order() -> void:
+	# A torn-off panel is NOT in the container, so clearing the map wholesale drops it --
+	# and _restore_tab_order() sorts anything missing to 999, which is the far end of the
+	# bar. Reordering tabs while one was out therefore sent THAT one to the back when it
+	# docked, instead of home. The absent ones are kept, nudged half a slot ahead of
+	# whichever tab inherited their index, which is exactly the gap they left.
+	var absent := {}
+	for panel in _torn:
+		absent[panel] = float(_tab_home_indices.get(panel, _tabs.get_tab_count())) - 0.5
+	_tab_home_indices.clear()
+	for i in _tabs.get_tab_count():
+		_tab_home_indices[_tabs.get_tab_control(i)] = float(i)
+	_tab_home_indices.merge(absent)
+
+## Puts every attached tab back into canonical order. Torn-off panels are simply absent
+## from the container, so they need no special case -- they slot back in when they return.
+func _restore_tab_order() -> void:
+	var kids := _tabs.get_children()
+	# float, not int: a torn-off tab is parked on a half slot so it sorts back between the
+	# same two neighbours it left from, and int() would round that collision away again
+	kids.sort_custom(func(a: Node, b: Node) -> bool:
+		return float(_tab_home_indices.get(a, 999)) < float(_tab_home_indices.get(b, 999)))
+	for i in kids.size():
+		_tabs.move_child(kids[i], i)
+
+## Which tab the cursor is over, or -1. Asks the TabBar rather than doing the arithmetic,
+## so hidden tabs and variable-width titles are its problem and not ours.
+func _tab_under_cursor() -> int:
+	var bar := _tabs.get_tab_bar()
+	if not bar:
+		return -1
+	var local := bar.get_local_mouse_position()
+	if not Rect2(Vector2.ZERO, bar.size).has_point(local):
+		return -1
+	return bar.get_tab_idx_at_point(local)
+
+## Pulls one tab out of the dock into its own window.
+##
+## The panel is reparented directly, never wrapped in a carrier: measured, reparent()
+## keeps a moved node's whole subtree of %UniqueNames alive as long as that node has an
+## owner, and every tab in player.tscn does. The FX tab is built at runtime and has no
+## owner, which is why _restore_unique_names runs afterwards regardless -- it costs a
+## walk of one panel and removes the whole class of "this tab works, that one crashes".
+func _tear_off_tab(idx: int) -> void:
+	if idx < 0 or idx >= _tabs.get_tab_count():
+		return
+	var panel := _tabs.get_tab_control(idx)
+	if not panel or _torn.has(panel):
+		return
+
+	var title := _tabs.get_tab_title(idx)
+	var win := Window.new()
+	win.name = "Tear%s" % panel.name
+	win.title = "SOUNDSCAPE // %s" % title
+	win.unresizable = false
+	win.transient = false     # independent: it can live on another monitor
+	win.exclusive = false     # and must not block the player while it is open
+	win.theme = theme         # font + every stylebox, and Skins repaints it for free
+	add_child(win)
+
+	var chassis := PanelContainer.new()
+	chassis.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var root_sb: StyleBox = get("theme_override_styles/panel")
+	if root_sb:
+		chassis.add_theme_stylebox_override("panel", root_sb)
+	win.add_child(chassis)
+	var pad := MarginContainer.new()
+	chassis.add_child(pad)
+	# Window header: the title again, and the way back. Closing the window already
+	# re-docks the tab, but a window's X reads as "throw this away" -- a button that says
+	# DOCK is the one affordance that says the panel is going home rather than being lost.
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 4)
+	pad.add_child(col)
+	var head := HBoxContainer.new()
+	head.add_theme_constant_override("separation", 6)
+	col.add_child(head)
+	var caption := Label.new()
+	caption.text = "[ %s ]" % title
+	caption.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	caption.theme_type_variation = &"Green"
+	head.add_child(caption)
+	var dock := Button.new()
+	dock.text = "DOCK"
+	dock.pressed.connect(_reattach_tab.bind(panel))
+	head.add_child(dock)
+
+	# Measured with the panel still out: a container's combined minimum does not update
+	# until the frame after a child arrives, so asking the chassis afterwards returns
+	# only its own border and margins (12 px) and the floor comes out useless.
+	_tear_pad(pad, TEAR_WIN_SIZE.x)
+	var chrome: Vector2 = chassis.get_combined_minimum_size()
+
+	# reparenting out of a TabContainer removes the tab and its title outright
+	_torn[panel] = {"title": title, "index": idx, "window": win, "pad": pad}
+	panel.reparent(col, false)
+	_restore_unique_names(panel)
+	win.close_requested.connect(_reattach_tab.bind(panel))
+
+	# Size AFTER the panel is inside, because the numbers come from the panel. Measured,
+	# the tabs need 532 / 480 / 412 / 336 px of width -- a fixed 380 px floor let EQ be
+	# shrunk 152 px past what it can draw in, and the content simply clipped off the
+	# right edge with nothing to indicate it.
+	var scr := DisplayServer.screen_get_usable_rect(win.current_screen)
+	var portrait_screen: bool = scr.size.x < scr.size.y
+	# the header row is part of what the window has to fit, measured rather than assumed
+	_fit_tear_window(win, pad, panel.get_combined_minimum_size() + chrome
+		+ Vector2(0.0, head.get_combined_minimum_size().y + 4.0), portrait_screen)
+	win.show()
+	# re-fit whenever the user resizes it, so the padding follows the actual width
+	win.size_changed.connect(func() -> void:
+		if is_instance_valid(win):
+			_tear_pad(pad, win.size.x))
+	scr = DisplayServer.screen_get_usable_rect(win.current_screen)
+	win.position = scr.position + (scr.size - win.size) / 2
+
+## Gives a torn-off window a size and a floor that come from what it actually holds.
+##
+## `need` is the panel's own combined minimum plus the chassis chrome, both measured at
+## the call site rather than guessed -- the tabs really do want 532 / 480 / 412 / 336 px
+## of width, and the fixed 380 px floor this replaces let EQ be dragged 152 px narrower
+## than it can draw in, clipping its right-hand column away with no indication.
+##
+## On a portrait display the preferred shape is taller and narrower, and everything is
+## finally clamped to the usable rect so a window can never open larger than the screen
+## it lands on. That clamp is the whole vertical-monitor story: a 620x720 default is
+## fine on 1920x1080 and fine on 1080x1920, but not on a small vertical panel.
+func _fit_tear_window(win: Window, pad: MarginContainer, need: Vector2, portrait_screen: bool) -> void:
+	var want: Vector2i = TEAR_WIN_SIZE_V if portrait_screen else TEAR_WIN_SIZE
+	win.min_size = Vector2i(ceili(need.x), ceili(maxf(need.y, 240.0)))
+	var scr := DisplayServer.screen_get_usable_rect(win.current_screen)
+	# the floor wins over the screen clamp: a window smaller than its content is the bug
+	# being fixed, and a window slightly off a tiny screen is merely inconvenient
+	win.size = Vector2i(
+		clampi(want.x, win.min_size.x, maxi(scr.size.x - 40, win.min_size.x)),
+		clampi(want.y, win.min_size.y, maxi(scr.size.y - 60, win.min_size.y)))
+	_tear_pad(pad, win.size.x)
+
+## Compact padding on a narrow window: 6 px each side is invisible at 620 px wide and
+## costs 3% of the usable width at 380.
+static func _tear_pad(pad: MarginContainer, width: int) -> void:
+	var m: int = TEAR_PAD_TIGHT if width < TEAR_TIGHT_BELOW else TEAR_PAD
+	for side in ["left", "top", "right", "bottom"]:
+		pad.add_theme_constant_override("margin_" + side, m)
+
+
+## Closing a torn-off window puts its tab back. Closing a sub-Window never reaches the
+## main window's NOTIFICATION_WM_CLOSE_REQUEST, so this cannot quit the application --
+## but the panel has to be reparented home BEFORE the window is freed, or queue_free
+## takes the whole tab down with it.
+func _reattach_tab(panel: Control) -> void:
+	var rec: Dictionary = _torn.get(panel, {})
+	if rec.is_empty():
+		return
+	_torn.erase(panel)
+	panel.reparent(_tabs, false)
+	# straight to its canonical slot first, then the full re-sort so the tabs that never
+	# left keep their order too -- move_child alone puts this one right and nothing else
+	var home := int(_tab_home_indices.get(panel, rec.get("index", _tabs.get_child_count() - 1)))
+	_tabs.move_child(panel, clampi(home, 0, _tabs.get_child_count() - 1))
+	_restore_tab_order()
+	_restore_unique_names(panel)
+	# the tab title defaults to the node name; restore whatever it actually was
+	var back := _tabs.get_tab_idx_from_control(panel)
+	if back >= 0:
+		_tabs.set_tab_title(back, rec["title"])
+		_tabs.current_tab = back
+	var win: Window = rec["window"]
+	if is_instance_valid(win):
+		win.queue_free()
+
+## Re-registers %UniqueName on a moved subtree.
+##
+## Insurance, not ceremony. Measured: a reparented node keeps its descendants'
+## registrations when it has an owner and loses them when it does not, and a lost
+## registration fails silently -- %EqMode simply stops resolving and the next
+## _refresh_eq() call dies on a null. Toggling the flag re-registers, so doing it
+## unconditionally makes tear-off safe for scene tabs and runtime-built ones alike.
+static func _restore_unique_names(root: Node) -> void:
+	var stack: Array[Node] = [root]
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		if n.unique_name_in_owner:
+			n.unique_name_in_owner = false
+			n.unique_name_in_owner = true
+		for c in n.get_children():
+			stack.append(c)
+
+
+# --- crossfade -------------------------------------------------------------
+const ACTIVE_DB := 0.0
+const SILENT_DB := -80.0
+const FADE_MS_MIN := 100
+const FADE_MS_MAX := 10000
+const DELAY_MS_MIN := 0
+const DELAY_MS_MAX := 2000
+## The incoming ramp is never allowed to collapse to nothing: if PLAY DELAY is set at or
+## past FADE TIME the delay is pulled back so this much fade-in always survives, which is
+## what keeps an over-long delay from turning the transition into a hard cut.
+const MIN_FADE_IN_MS := 100
+
+func _setup_fade() -> void:
+	%Fade.pressed.connect(func() -> void:
+		_fade_on = not _fade_on
+		%Fade.text = "FADE: %s" % ("ON" if _fade_on else "OFF")
+		_save())
+	%FadeMs.text_submitted.connect(func(_s: String) -> void: _commit_fade_ms())
+	%FadeMs.focus_exited.connect(_commit_fade_ms)
+	%DelayMs.text_submitted.connect(func(_s: String) -> void: _commit_delay_ms())
+	%DelayMs.focus_exited.connect(_commit_delay_ms)
+	%Fade.text = "FADE: %s" % ("ON" if _fade_on else "OFF")
+	%FadeMs.text = str(_fade_ms)
+	%DelayMs.text = str(_delay_ms)
+
+## Clamped on commit rather than per keystroke, so typing "2" on the way to "2500"
+## does not get rewritten to the 100 ms floor under the cursor.
+func _commit_fade_ms() -> void:
+	_fade_ms = clampi(int(%FadeMs.text), FADE_MS_MIN, FADE_MS_MAX)
+	%FadeMs.text = str(_fade_ms)
+	%DelayMs.text = str(_delay_ms)
+	_save()
+
+## Equal-length ramps on two players. The active reference swaps up front so the
+## transport, scrub and spectrum follow the incoming track from the first frame.
+##
+## Selecting a third track mid-fade is safe with only two players: the still-fading
+## player becomes the new incoming one, its volume is reset explicitly, and the killed
+## tween's cleanup callback is simply never needed.
+func _crossfade(stream: AudioStream) -> void:
+	if _fade_tween and _fade_tween.is_valid():
+		_fade_tween.kill()
+	var outgoing := _audio
+	var incoming := _b if _audio == _a else _a
+	var deck_at_start := _engine.deck
+
+	# clamped so delay + fade-in always fits inside FADE TIME; both ramps therefore
+	# finish together and the whole transition still lasts exactly FADE TIME
+	var delay_ms: int = clampi(_delay_ms, DELAY_MS_MIN, maxi(_fade_ms - MIN_FADE_IN_MS, 0))
+	var fade_s := float(_fade_ms) / 1000.0
+	var delay_s := float(delay_ms) / 1000.0
+	var in_s: float = maxf(fade_s - delay_s, float(MIN_FADE_IN_MS) / 1000.0)
+
+	# armed but silent and NOT playing: starting it now would advance the playhead
+	# during the delay, so the track would be mid-intro by the time it is audible
+	incoming.stream = stream
+	incoming.volume_db = SILENT_DB
+	incoming.stream_paused = false
+	_fading = true
+
+	_fade_tween = create_tween().set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+	_fade_tween.set_parallel(true)
+	# T = 0: the outgoing track starts falling immediately, over the full fade time
+	_fade_tween.tween_property(outgoing, "volume_db", SILENT_DB, fade_s)
+	# T = PLAY DELAY: the incoming track starts, and only then begins its ramp
+	_fade_tween.tween_callback(func() -> void:
+		incoming.volume_db = SILENT_DB
+		incoming.play()
+		# The fade belongs to the deck it STARTED on -- which _switch_deck's own comment
+		# already says -- but this callback used to assign the global _audio unconditionally,
+		# so switching decks inside the PLAY DELAY window dragged the transport, the scrub bar
+		# and play/pause back to the deck you had just left while the UI still read DECK B.
+		# _deck_live is updated either way, or switching back would land on the outgoing
+		# player that the chain callback below is about to strip the stream from.
+		_deck_live[deck_at_start] = incoming
+		if _engine.deck == deck_at_start:
+			_audio = incoming          # transport and scrub hand over at the audible moment
+			_director.attach(_audio)).set_delay(delay_s)
+	_fade_tween.tween_property(incoming, "volume_db", ACTIVE_DB, in_s).set_delay(delay_s)
+	# chain() waits for every parallel step, so this is the true end of the transition
+	_fade_tween.chain().tween_callback(func() -> void:
+		outgoing.stop()
+		outgoing.volume_db = ACTIVE_DB
+		outgoing.stream = null
+		# only for the deck this fade belongs to: clearing it unconditionally would clear a
+		# fade the OTHER deck has since started, and a false _fading re-arms the
+		# finished -> _next() auto-advance in the middle of that deck's transition
+		if _engine.deck == deck_at_start:
+			_fading = false)
+
+func _commit_delay_ms() -> void:
+	_delay_ms = clampi(int(%DelayMs.text), DELAY_MS_MIN, DELAY_MS_MAX)
+	%DelayMs.text = str(_delay_ms)
+	_save()
+
+## Gradient chip for the rainbow option. A StyleBoxFlat holds a single colour, so the
+## swatch has to be a stretched texture to show what the mode actually does.
+func _rainbow_swatch() -> StyleBoxTexture:
+	var img := Image.create(32, 1, false, Image.FORMAT_RGBA8)
+	for x in 32:
+		img.set_pixel(x, 0, Color.from_hsv(float(x) / 32.0, 0.85, 1.0))
+	var sb := StyleBoxTexture.new()
+	sb.texture = ImageTexture.create_from_image(img)
+	return sb
+
+
+# --- VISUAL FEED SIZE ------------------------------------------------------
+enum Feed { LARGE, MEDIUM, SMALL, GONE, FULLSCREEN, CUSTOM }
+## CUSTOM is appended rather than slotted in beside the other sizes on purpose: the mode
+## is persisted as an integer, and inserting it earlier would silently reinterpret every
+## saved feed_size in every existing config.
+const FEED_NAMES := ["LARGE", "MEDIUM", "SMALL", "GONE", "FULLSCREEN", "CUSTOM"]
+## Left-column stretch against the sidebar's 1.0. GONE and FULLSCREEN are visibility
+## states rather than ratios, so their entries are never read.
+const FEED_RATIO := [3.0, 1.5, 0.5, 0.0, 0.0, 0.0]   # CUSTOM's entry is never read
+
+func _setup_feed() -> void:
+	# The divider only reports while the user is actually dragging it, which is exactly
+	# when CUSTOM is the active mode -- every other mode hides the dragger, so this can
+	# only fire on a deliberate resize.
+	%Workspace.dragged.connect(func(_offset: int) -> void:
+		if _feed != Feed.CUSTOM:
+			return
+		# stored from the resulting geometry rather than from the offset the signal
+		# carries, because that offset is only meaningful against this screen's size
+		var span: float = %Workspace.size.y if _portrait else %Workspace.size.x
+		var first: float = %LeftColumn.size.y if _portrait else %LeftColumn.size.x
+		if span > 1.0:
+			_split_frac = clampf(first / span, 0.05, 0.95)
+			_save_soon())
+	for i in FEED_NAMES.size():
+		%FeedSize.add_item(FEED_NAMES[i], i)
+	%FeedSize.item_selected.connect(func(i: int) -> void:
+		if i == Feed.FULLSCREEN and _feed != Feed.FULLSCREEN:
+			_feed_prev = _feed          # remembered so ESC has somewhere to return to
+		_apply_feed(i)
+		_save())
+	_apply_feed(_feed)
+
+func _apply_feed(mode: int) -> void:
+	_feed = mode
+	var full: bool = mode == Feed.FULLSCREEN
+	var gone: bool = mode == Feed.GONE
+	# the transport now sits in Main, not in the feed's column, so GONE can drop the
+	# whole column and hand the workspace to the sidebar without taking the deck with it
+	%LeftColumn.visible = not gone
+	%ScreenPanel.visible = true
+	%RightSidebar.visible = not full
+	%TopHeaderBar.visible = not full
+	%TickerBar.visible = not full
+	%StatusBar.visible = not full
+	%ScrubRow.visible = not full
+	%ControlDeck.visible = not full
+	# SplitContainer ignores size_flags_stretch_ratio -- it positions the divider from
+	# split_offset instead -- so the preset sizes are translated into an offset, and
+	# CUSTOM simply restores the one the user dragged to.
+	var custom: bool = mode == Feed.CUSTOM
+	# dragger_visibility only controls whether the grip is DRAWN. Measured: with
+	# DRAGGER_HIDDEN the divider still accepts the mouse (drag area mouse_filter
+	# STOP, dragging_enabled true) and can be dragged, which would pull a preset
+	# size off its ratio with no way to see what happened. dragging_enabled is the
+	# one that actually refuses the grab, so both are gated: drawn only in CUSTOM,
+	# and movable only in CUSTOM.
+	%Workspace.dragging_enabled = custom
+	%Workspace.dragger_visibility = SplitContainer.DRAGGER_VISIBLE if custom \
+		else SplitContainer.DRAGGER_HIDDEN
+	if custom:
+		_split_to_fraction(_split_frac)
+	elif not gone and not full:
+		var table: Array = FEED_RATIO_V if _portrait else FEED_RATIO
+		# a stretch ratio of r puts the divider at r/(r+1) of the span
+		var r: float = table[mode]
+		if r > 0.0:
+			_split_to_fraction(r / (r + 1.0))
+	# the 6px chassis inset would leave a border in fullscreen
+	for side in ["left", "top", "right", "bottom"]:
+		%Margin.add_theme_constant_override("margin_" + side, 0 if full else 6)
+	if %FeedSize.selected != mode:
+		%FeedSize.selected = mode
+
+## Puts the divider where a stretch ratio used to put it.
+##
+## split_offset is a delta from the container's own default split, and that default is
+## whatever the children's minimum sizes imply -- it is not zero and not the midpoint.
+## Rather than guess it, the current reading is inverted: the first child's size is
+## `default + offset` within the clamps, so `default = size - offset` and the offset
+## that lands the divider at `want` is `want - default`. Deferred because it needs a
+## laid-out size to measure, and re-run on every resize so a preset mode keeps its
+## proportion when the window changes.
+func _split_to_fraction(frac: float) -> void:
+	if frac <= 0.0 or frac >= 1.0:
+		return
+	_split_gen += 1
+	var gen := _split_gen
+	# Measured: the divider position is exactly `default + split_offset`, slope 1.0, with
+	# `default` fixed by the children's minimum sizes (1427 px at a 1908 px workspace).
+	# The catch is that `default` cannot simply be read, because offset 0 is ALREADY
+	# clamped -- the sidebar is pinned at its 575 px floor there and reads 1325, a
+	# 102 px lie. So this solves for it instead: with slope 1 the fixed-point iteration
+	# lands exactly in one correction when the target is reachable, and stops itself the
+	# moment the offset stops changing, which is what a clamped mode like LARGE does.
+	for _pass in 4:
+		# two frames per pass: the container re-sorts a frame after the offset is set,
+		# and reading before it has is what made the first attempt land short
+		await get_tree().process_frame
+		await get_tree().process_frame
+		if gen != _split_gen or not is_instance_valid(%Workspace):
+			return   # a newer feed size superseded this one; drop it rather than fight
+		var span: float = %Workspace.size.y if _portrait else %Workspace.size.x
+		if span <= 1.0:
+			return
+		var first: float = %LeftColumn.size.y if _portrait else %LeftColumn.size.x
+		var want: float = span * frac
+		var default_pos: float = first - float(%Workspace.split_offset)
+		var next_off := int(roundf(want - default_pos))
+		if next_off == %Workspace.split_offset:
+			return   # converged, or pinned against a minimum size and cannot go further
+		%Workspace.split_offset = next_off
+
+## ESC only means anything in FULLSCREEN, so the event is left alone otherwise -- the
+## boot screen and any future dialog keep their own handling. SPACE toggles play/pause,
+## H hides the pointer and F11 toggles the OS window; a focused LineEdit/etc consumes the
+## keypress before it ever reaches here, so typing into the search box is unaffected.
+##
+## ESC does whichever kind of "full screen" is currently on. The two are separate and
+## stack: Feed.FULLSCREEN hides the program's own chrome, the window mode fills the
+## monitor. ESC unwinds the chrome first, because that is the one the user most recently
+## chose in almost every case.
+func _unhandled_input(event: InputEvent) -> void:
+	var k := event as InputEventKey
+	if not k or not k.pressed:
+		return
+	# Held keys arrive again every OS repeat interval. Dropped here rather than in the
+	# cue-jump branch alone, because every shortcut below is a one-shot or a toggle: a
+	# held SPACE flickered play/pause at the repeat rate, a held jump key re-seeked the
+	# track dozens of times a second and backed up a queue of seeks behind the mix.
+	if k.is_echo():
+		return
+	# Fed BEFORE the shortcuts below and deliberately NOT consuming the event, so a letter
+	# can drive its shortcut and advance a code in the same press. A focused LineEdit has
+	# already eaten the key long before this point, which is what keeps SEARCH typing out
+	# of the buffer -- see the note on LOCAL_CODES.
+	var ch := OS.get_keycode_string(k.keycode)
+	if ch.length() == 1 and ch >= "A" and ch <= "Z":
+		_push_code_key(ch)
+	if k.keycode == KEY_SPACE:
+		_toggle()
+		get_viewport().set_input_as_handled()
+		return
+	if k.keycode == KEY_H:
+		_toggle_cursor()
+		get_viewport().set_input_as_handled()
+		return
+	if k.keycode == KEY_F11:
+		_toggle_window_fullscreen()
+		get_viewport().set_input_as_handled()
+		return
+	if k.keycode == KEY_F1:
+		_toggle_simple_mode()
+		get_viewport().set_input_as_handled()
+		return
+	# Cue jump keys come AFTER the transport keys, so a marker can never shadow one, and
+	# they are only live while a track is loaded. A focused LineEdit eats the keypress
+	# before _unhandled_input ever sees it, so typing a search term cannot jump anything.
+	if not _current.is_empty() and _jump_to_key(OS.get_keycode_string(k.keycode)):
+		get_viewport().set_input_as_handled()
+		return
+	if k.keycode == KEY_ESCAPE:
+		if _feed == Feed.FULLSCREEN:
+			_toggle_simple_mode()
+			get_viewport().set_input_as_handled()
+		elif _window_is_fullscreen():
+			_toggle_window_fullscreen()
+			get_viewport().set_input_as_handled()
+
+
+## SIMPLE MODE (F1): all chrome off, the feed at 100%.
+##
+## No new state and no second hide/show path -- Feed.FULLSCREEN already drops the
+## sidebar, header, ticker, scrub row, transport and status bar, zeroes the 6 px chassis
+## inset and hands the workspace to the visualizer. Coming back out re-runs the previous
+## feed size, which re-solves the divider from the stored FRACTION, so the split lands
+## where it was at whatever size the window is now. F1 and ESC are the same toggle; F1
+## also gets you in, which is the only thing that was missing.
+func _toggle_simple_mode() -> void:
+	if _feed == Feed.FULLSCREEN:
+		# a config saved while already in FULLSCREEN has no earlier size to return to
+		_apply_feed(Feed.LARGE if _feed_prev == Feed.FULLSCREEN else _feed_prev)
+	else:
+		_feed_prev = _feed
+		_apply_feed(Feed.FULLSCREEN)
+	_save()
+
+
+# --- OS window fullscreen ---------------------------------------------------
+## Both modes count. Requesting WINDOWED from the boot fullscreen state reports
+## EXCLUSIVE_FULLSCREEN back on this build, so a check for the one flag alone would
+## decide the window was already windowed and refuse to leave.
+func _window_is_fullscreen() -> bool:
+	var m := DisplayServer.window_get_mode()
+	return m == DisplayServer.WINDOW_MODE_FULLSCREEN \
+		or m == DisplayServer.WINDOW_MODE_EXCLUSIVE_FULLSCREEN
+
+func _toggle_window_fullscreen() -> void:
+	if _window_is_fullscreen():
+		_leave_window_fullscreen()
+	else:
+		_enter_window_fullscreen()
+
+func _enter_window_fullscreen() -> void:
+	# remember where to come back to, before the mode change overwrites it
+	_windowed_rect = Rect2i(DisplayServer.window_get_position(), DisplayServer.window_get_size())
+	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, false)
+	DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
+	_relayout_for_window()
+
+## Leaving is the awkward direction, and the fallback is not defensive padding.
+##
+## Measured on this build: setting WINDOWED directly from the boot fullscreen state does
+## nothing -- window_get_mode reports EXCLUSIVE_FULLSCREEN straight back and
+## window_set_size is refused outright. Going through MAXIMIZED first is what actually
+## releases it. If even that does not take, the window is left borderless MAXIMIZED,
+## which fills the monitor minus the taskbar and looks identical to the fullscreen boot;
+## that is a far better outcome than a window stuck fullscreen with no way out.
+func _leave_window_fullscreen() -> void:
+	DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, false)
+	DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_MAXIMIZED)
+	await get_tree().process_frame
+	DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
+	await get_tree().process_frame
+	if _window_is_fullscreen():
+		# the release did not take; borderless maximised is the honest second best
+		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
+		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_MAXIMIZED)
+	elif _windowed_rect.size.x > 0:
+		DisplayServer.window_set_size(_windowed_rect.size)
+		DisplayServer.window_set_position(_windowed_rect.position)
+		await get_tree().process_frame
+		_refit_window_to_screen()   # in case the remembered rect no longer fits
+	_relayout_for_window()
+
+## One full layout re-evaluation. _update_orientation re-reads the viewport, re-picks
+## portrait vs landscape, recomputes the sidebar's responsive floor and re-applies the
+## feed size -- which in turn re-solves the split from its stored FRACTION rather than a
+## stale pixel offset, so the divider lands proportionally right at the new size. The
+## SubViewport follows on its own: stretch_shrink resizes it from the container, measured
+## at 476x259 / 511x259 / 476x268 across these three monitors.
+##
+## Deferred by a frame because the window has not finished resizing when the mode change
+## returns, and measuring the viewport before it settles is what produces a layout fitted
+## to the old geometry.
+func _relayout_for_window() -> void:
+	await get_tree().process_frame
+	await get_tree().process_frame
+	# keep the screen poll in step, so a deliberate toggle is not mistaken for a monitor
+	# move and repaired into borderless maximised a frame later
+	_last_screen = DisplayServer.window_get_current_screen()
+	_last_vp = Vector2.ZERO      # force _update_orientation to run even if vp is unchanged
+	_update_orientation()
+
+
+# --- MAX FRAMERATE ---------------------------------------------------------
+const FPS_MIN := 10
+const FPS_MAX := 240
+## The shipped cap. Was 30 and spelled out in four separate places -- the variable's
+## initialiser, the config fallback, and twice in the factory reset -- which is three
+## chances for them to drift apart. One constant now, so changing it changes all of them.
+const FPS_DEFAULT := 60
+
+func _setup_fps() -> void:
+	%MaxFps.text_submitted.connect(func(_s: String) -> void: _commit_max_fps())
+	%MaxFps.focus_exited.connect(_commit_max_fps)
+	%MaxFps.text = str(_max_fps)
+	Engine.max_fps = _max_fps
+
+## Clamped on commit, same as the fade fields: rewriting per keystroke would fight the
+## cursor while you type. Applied straight to Engine.max_fps, which caps the whole app.
+func _commit_max_fps() -> void:
+	_max_fps = clampi(int(%MaxFps.text), FPS_MIN, FPS_MAX)
+	%MaxFps.text = str(_max_fps)
+	Engine.max_fps = _max_fps
+	_save()
+
+
+
+
+# --- user EQ preset slots --------------------------------------------------
+## Eight empty slots the user fills themselves. Nothing ships preloaded: a slot is a
+## name plus a captured curve, and an unused one loads nothing when selected.
+const EQ_SLOTS := 8
+
+func _init_presets() -> void:
+	# Shape-checked, not merely counted. A hand-edited or truncated `presets=` can hold a
+	# String, or a Dictionary missing members, and all six places that read a slot assume
+	# name/lanes/used are present -- _refresh_presets typed its local as Dictionary and threw
+	# there, which aborted the rest of _ready. Normalised once here, the single place that
+	# already owns preset shape, rather than guarded at each reader.
+	for i in _presets.size():
+		var d: Variant = _presets[i]
+		var nm: Variant = d.get("name") if d is Dictionary else null
+		var ln: Variant = d.get("lanes") if d is Dictionary else null
+		var us: Variant = d.get("used") if d is Dictionary else null
+		_presets[i] = {
+			"name": nm if nm is String else "CUSTOM %d" % (i + 1),
+			"lanes": ln if ln is Array else [],
+			"used": us if us is bool else false,
+		}
+	while _presets.size() < EQ_SLOTS:
+		_presets.append({"name": "CUSTOM %d" % (_presets.size() + 1), "lanes": [], "used": false})
+	_presets.resize(EQ_SLOTS)
+
+func _setup_presets() -> void:
+	_init_presets()
+	%EqPreset.item_selected.connect(_load_preset)
+	%EqPresetSave.pressed.connect(_store_preset)
+	%EqPresetName.text_submitted.connect(func(_s: String) -> void: _rename_preset())
+	%EqPresetName.focus_exited.connect(_rename_preset)
+	# uppercase as you type. Setting `text` in code does not re-emit text_changed, so
+	# there is no recursion, but it does reset the caret -- hence saving the column.
+	%EqPresetName.text_changed.connect(func(s: String) -> void:
+		var up := s.to_upper()
+		if up != s:
+			var col: int = %EqPresetName.caret_column
+			%EqPresetName.text = up
+			%EqPresetName.caret_column = col)
+	_refresh_presets()
+
+## Rebuilt rather than patched in place: the list is eight items, and one code path
+## means a rename, a save and a REBOOT all render identically.
+func _refresh_presets() -> void:
+	var keep: int = maxi(%EqPreset.selected, 0)
+	%EqPreset.clear()
+	for i in _presets.size():
+		var slot: Dictionary = _presets[i]
+		# a trailing dot marks a slot that holds a curve, so empty ones read as empty
+		%EqPreset.add_item(("%s ." % slot["name"]) if slot["used"] else slot["name"], i)
+	%EqPreset.selected = clampi(keep, 0, _presets.size() - 1)
+	%EqPresetName.text = _presets[%EqPreset.selected]["name"]
+
+func _load_preset(i: int) -> void:
+	if i < 0 or i >= _presets.size():
+		return
+	var slot: Dictionary = _presets[i]
+	# the dropdown moves itself when the user picks an item, but not when this is
+	# called in code -- and a stale selection makes SAVE and rename hit the wrong slot
+	if %EqPreset.selected != i:
+		%EqPreset.selected = i
+	%EqPresetName.text = slot["name"]
+	if not slot["used"]:
+		return                       # empty slot: selecting it just parks you there
+	_eq.set_lanes(slot["lanes"])
+	# sync guard up, or each fader write bounces back through _on_lane_changed
+	_fader_sync = true
+	for j in Equalizer.LANES:
+		_adv_faders[j].value = _eq.lane_db[j]
+	_fader_sync = false
+	_fader_base = _eq.lane_db.duplicate()
+	_note = "  //  LOADED %s" % slot["name"].to_upper()
+	_clear_note_later()
+
+func _store_preset() -> void:
+	var i: int = maxi(%EqPreset.selected, 0)
+	_presets[i] = {"name": _presets[i]["name"], "lanes": Array(_eq.lane_db), "used": true}
+	_refresh_presets()
+	_save()
+	_note = "  //  SAVED %s" % _presets[i]["name"].to_upper()
+	_clear_note_later()
+
+func _rename_preset() -> void:
+	var i: int = maxi(%EqPreset.selected, 0)
+	var want: String = %EqPresetName.text.strip_edges().to_upper()
+	if want.is_empty():
+		want = "CUSTOM %d" % (i + 1)   # never leave a slot with no label at all
+	_presets[i]["name"] = want
+	_refresh_presets()
+	_save()
+
+
+# --- logo intro ------------------------------------------------------------
+## Plays before the BIOS screen, then hands over. Godot 4 has no H.264 decoder, so the
+## source MP4 was transcoded to Ogg Theora (intro.ogv) -- VideoStreamPlayer will not
+## take an .mp4 at all, silently or otherwise.
+func _start_intro() -> void:
+	# Off means BOTH are skipped -- no video and no POST -- straight into the player.
+	# %Boot is visible = false in the scene and only shows itself when begin() is called,
+	# so not calling it is the whole of "skip the BIOS".
+	if not _intro_on:
+		%Intro.visible = false
+		return
+	if not %IntroVid.stream:
+		_begin_boot()
+		return
+	%Intro.visible = true
+	%IntroVid.finished.connect(_begin_boot, CONNECT_ONE_SHOT)
+	%IntroVid.play()
+
+func _begin_boot() -> void:
+	if not %Intro.visible:
+		return                      # already handed over; a skip and the end can race
+	%IntroVid.stop()
+	%Intro.visible = false
+	%Boot.begin(_user_name, _paths.size())
+
+## Any key or click skips the logo. Handled here rather than in boot.gd because the
+## boot screen has not been handed control yet.
+func _input(event: InputEvent) -> void:
+	if not %Intro.visible:
+		return
+	var skip: bool = (event is InputEventKey and event.pressed) or (event is InputEventMouseButton and event.pressed)
+	if skip:
+		_begin_boot()
+		get_viewport().set_input_as_handled()
+
+
+# --- volume booster --------------------------------------------------------
+func _setup_boost() -> void:
+	%Boost.gui_input.connect(_on_boost_bar)
+	_hover_note(%Boost, func() -> String: return "VOLUME BOOST: %d  //  +%.1f DB" % [
+		_boost, _boost_gain()])
+	_refresh_boost()
+	_eq.set_boost(_boost_gain())
+
+## The dial reads 0-100; the engine still wants dB. 0 maps to unity, so the bottom of
+## the slider is genuinely no boost rather than a small permanent one.
+func _boost_gain() -> float:
+	return float(_boost) / 100.0 * Equalizer.BOOST_MAX
+
+## Same click-drag ProgressBar the volume, sensitivity and DSP controls use, so the
+## booster reads as part of the same panel rather than a lone text field.
+func _on_boost_bar(e: InputEvent) -> void:
+	if not _bar_drag(e, %Boost):
+		return
+	_boost = clampi(int(roundf(_ratio_at(e.position.x, %Boost.size.x) * 100.0)), 0, 100)
+	_refresh_boost()
+	_eq.set_boost(_boost_gain())
+	_save_soon()
+
+func _refresh_boost() -> void:
+	%Boost.value = float(_boost)
+	%BoostLabel.text = "VOLUME BOOST: %d" % _boost
+
+
+# --- responsive orientation ------------------------------------------------
+## Portrait proportions for the same five feed sizes. The sidebar is always 1.0, so
+## LARGE reads as 45/55 -- visualizer on top, tab dock filling the rest beneath it.
+const FEED_RATIO_V := [0.82, 0.54, 0.30, 0.0, 0.0, 0.0]
+## Anything squarer than this counts as portrait. 1.1 rather than 1.0 so a near-square
+## window commits to one layout instead of flickering between the two on tiny resizes.
+const PORTRAIT_BELOW := 1.1
+const LAYOUT_NAMES := ["AUTO-DETECT", "FORCE LANDSCAPE", "FORCE PORTRAIT"]
+
+func _setup_layout() -> void:
+	for i in LAYOUT_NAMES.size():
+		%Layout.add_item(LAYOUT_NAMES[i], i)
+	%Layout.selected = _layout
+	%Layout.item_selected.connect(func(i: int) -> void:
+		_layout = i
+		_update_orientation()
+		_save())
+	get_viewport().size_changed.connect(_update_orientation)
+	_update_orientation()
+
+## Picks the axis and re-applies the feed size, which is what actually sets the split.
+## Runs on every viewport resize, so dragging a window across the threshold restructures
+## the UI live rather than only at startup.
+func _update_orientation() -> void:
+	var vp := get_viewport().get_visible_rect().size
+	var aspect: float = vp.x / maxf(vp.y, 1.0)
+	var want: bool = aspect < PORTRAIT_BELOW
+	if _layout == 1:
+		want = false
+	elif _layout == 2:
+		want = true
+	_portrait = want
+	# The 575 px floor keeps the tab dock usable beside the feed, but stacked it is a
+	# horizontal floor on the WHOLE window -- anything narrower would overflow. In
+	# landscape it is also capped at half the viewport: on a narrow-but-still-landscape
+	# window (a 700 px wide one is aspect 1.13, so not portrait) an unconditional 575
+	# leaves the visualizer 125 px and pushes the layout past the window edge.
+	%RightSidebar.custom_minimum_size.x = 0.0 if _portrait \
+		else minf(SIDEBAR_MIN_X, vp.x * 0.5)
+	%Workspace.vertical = _portrait
+	_apply_feed(_feed)   # re-runs _split_to_fraction, so presets stay proportional
+
+
+## SHUF and RPT are persisted now, so their captions have to be derived from the engine
+## rather than toggled in place -- the .tscn defaults would otherwise lie after a reload.
+func _refresh_transport() -> void:
+	%Shuffle.text = "SHUF:%s" % ("ON" if _engine.shuffle else "OFF")
+	%Repeat.text = "RPT:%s" % ["OFF", "ALL", "ONE"][_engine.repeat]
+
+
+## The tempo fit sweeps ~560 candidate periods every 0.5 s on the main thread, so it stays
+## off unless asked for -- and AudioDirector._process returns before any of that work when
+## it is off, which is what keeps the readout free. Saying "BPM: OFF" is honest; the old
+## permanent "-- BPM" read as a tracker that was running and failing. The [#] ticker is
+## only meaningful while the beat clock is live, so it is dropped entirely when it is not.
+func _bpm_readout() -> String:
+	if not _director.track_tempo:
+		return "BPM: OFF"
+	var tick := "[#]" if _flash > 0.0 else "[ ]"
+	if _director.bpm <= 0.0:
+		return "%s BPM: ----" % tick     # tracking, but not locked yet
+	return "%s %.1f BPM" % [tick, _director.bpm]
+
+
+# --- beat tracking ---------------------------------------------------------
+## Width the tab dock needs to stay usable beside the visualizer. Only applied in
+## landscape; see _update_orientation().
+const SIDEBAR_MIN_X := 575.0
+
+## The tempo fit is the one genuinely expensive thing in this program -- ~560 candidate
+## periods swept against every onset in a 10 s history, every 0.5 s, on the main thread --
+## and nothing but the status readout consumes it. So it ships off and this is the switch,
+## rather than a cost every user pays for a number most will never look at.
+func _setup_beat() -> void:
+	%BeatTrack.pressed.connect(func() -> void:
+		_director.track_tempo = not _director.track_tempo
+		# drop the old lock either way: stale on resume, and a stale BPM would otherwise
+		# sit in the status bar after switching off
+		_director.reset()
+		_refresh_beat()
+		_save())
+	_refresh_beat()
+
+func _refresh_beat() -> void:
+	%BeatTrack.text = "ON" if _director.track_tempo else "OFF"
+
+
+# --- FX tab: the DSP rack --------------------------------------------------
+## Built in code rather than in player.tscn. Every module is the same header + bars
+## shape, so one loop draws all four and a new knob is one line in Equalizer.FX_SPEC
+## instead of fifteen lines of scene text with a hand-picked unique_id.
+##
+## Nothing here constructs a StyleBox. Plain PanelContainer/Label/ProgressBar/Button
+## inherit the theme from player.tscn, and because Skins recolours those shared
+## sub-resources in place, the rack repaints with every skin for free -- a locally
+## created stylebox would be the one panel that stayed WIN98 grey on TERMINAL.
+##   [title, toggle key or "" for none, [FX_SPEC keys...]]
+const FX_RACK := [
+	["[ REVERB UNIT ]", "rev_on", ["rev_room", "rev_damp", "rev_wet"]],
+	["[ ECHO / DELAY ]", "dly_on", ["dly_ms", "dly_fb", "dly_wet"]],
+	["[ DJ FILTER DECK ]", "", ["cut", "res", "tape"]],
+	["[ KEY SHIFT ]", "", ["key_semi"]],
+]
+## Hardware drive faders. T-BASS and BBE own their values outright now -- the duplicate
+## rows on the EQ tab are gone, so these are the only controls for them. DRIVE is still a
+## second view of the VOLUME BOOST on the settings screen, kept honest by _refresh_fx()
+## running off Equalizer.changed.
+const FX_DRIVE := ["T-BASS", "BBE", "DRIVE"]
+
+var _fx_cfg_decks := [{}, {}]   # deck -> saved [effects] block
+var _fx_bars := {}      # row key -> ProgressBar   (FX_SPEC keys and FX_DRIVE names)
+var _fx_vals := {}      # row key -> Label, the right-hand readout
+var _fx_leds := {}      # toggle key -> Button
+var _key_lbl: Label     # the ORIGINAL -> CURRENT readout
+var _key := {}          # _current's key TAG: {"text": String, "pc": int, "minor": bool}
+
+func _setup_fx() -> void:
+	for i in _eq_decks.size():
+		_eq_decks[i].fx_from_dict(_fx_cfg_decks[i])
+	var tab := VBoxContainer.new()
+	tab.name = "FX"
+	tab.add_theme_constant_override("separation", 4)
+	_tabs.add_child(tab)
+	_tabs.move_child(tab, 4)  # sit beside EQ rather than after STATS
+
+	var bypass := Button.new()
+	bypass.toggle_mode = true
+	bypass.button_pressed = _eq.fx_bypassed()
+	bypass.pressed.connect(func() -> void:
+		_eq.set_fx_on("bypass", bypass.button_pressed)
+		_refresh_fx()
+		_save())
+	tab.add_child(bypass)
+	_fx_leds["bypass"] = bypass
+
+	for module in FX_RACK:
+		var body := _fx_module(tab, module[0], module[1])
+		for key in module[2]:
+			_fx_row(body, key, Equalizer.FX_SPEC[key][0], _on_fx_bar.bind(key))
+		if module[0] == "[ KEY SHIFT ]":
+			_key_row(body)
+	var drive := _fx_module(tab, "[ HARDWARE DRIVE ]", "")
+	for tag in FX_DRIVE:
+		_fx_row(drive, tag, tag, _on_fx_drive.bind(tag))
+	_refresh_fx()
+	# one refresh per frame off the same dirty flag the bus update uses, which is what
+	# keeps the DRIVE fader and the boost dial from ever drifting apart
+	_eq.changed.connect(_refresh_fx)
+
+## A rack module: 1 px bordered panel, header row with an optional LED toggle, then rows.
+## The LED is the toggle button itself -- Button/pressed already paints with the skin's
+## accent colour, so an active module lights up without a second node to keep in sync.
+func _fx_module(parent: Control, title: String, toggle_key: String) -> VBoxContainer:
+	var panel := PanelContainer.new()
+	parent.add_child(panel)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 3)
+	panel.add_child(col)
+	var head := HBoxContainer.new()
+	col.add_child(head)
+	var caption := Label.new()
+	caption.text = title
+	caption.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	head.add_child(caption)
+	if not toggle_key.is_empty():
+		var led := Button.new()
+		led.toggle_mode = true
+		led.button_pressed = _eq.fx_switch[toggle_key]
+		led.pressed.connect(func() -> void:
+			_eq.set_fx_on(toggle_key, led.button_pressed)
+			_refresh_fx()
+			_save())
+		head.add_child(led)
+		_fx_leds[toggle_key] = led
+	return col
+
+## One rack row: caption, click-drag bar, value readout. ProgressBar rather than HSlider
+## for the same reason the scrub and volume controls are -- a real slider needs a grabber
+## texture, and a texture is the one thing Skins cannot recolour.
+##
+## The bar and its readout are both filed under `key`, which is an FX_SPEC key for the
+## effect modules and a plain caption for the drive faders. One map, so _refresh_fx has
+## one way to reach any row.
+func _fx_row(parent: Control, key: String, caption: String, handler: Callable) -> void:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+	parent.add_child(row)
+	var l := Label.new()
+	l.text = caption
+	l.custom_minimum_size.x = 124   # fits TAPE SPEED and RESONANCE without touching the bar
+	row.add_child(l)
+	var bar := ProgressBar.new()
+	bar.custom_minimum_size.y = 14
+	bar.show_percentage = false
+	bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	bar.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	bar.gui_input.connect(handler)
+	row.add_child(bar)
+	var val := Label.new()
+	val.custom_minimum_size.x = 72
+	val.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	val.theme_type_variation = &"Green"
+	row.add_child(val)
+	_fx_bars[key] = bar
+	_fx_vals[key] = val
+	# reads the row's own readout label rather than re-deriving the value from FX_SPEC:
+	# _refresh_fx already maps every rack parameter to its printed form (MS, ST, LP/HP,
+	# per cent), so there is one mapping, not a second one that can drift from it
+	_hover_note(bar, func() -> String: return "%s: %s" % [caption, val.text])
+
+func _on_fx_bar(e: InputEvent, key: String) -> void:
+	var spec: Array = Equalizer.FX_SPEC[key]
+	# double-click puts any rack fader back on its spec default. It is the only way to
+	# hit exactly 0 semitones on KEY SHIFT, and it costs nothing to give every other bar.
+	if e is InputEventMouseButton and e.double_click:
+		_eq.set_fx(key, spec[3])
+		_refresh_fx()
+		_save_soon()
+		return
+	if not _bar_drag(e, _fx_bars[key]):
+		return
+	var r := _ratio_at(e.position.x, _fx_bars[key].size.x)
+	# snap CUTOFF to true centre near the middle: the dead zone is only 8% of the bar,
+	# and hitting it by pixel while sweeping is not something a hand can do
+	if key == "cut" and absf(r - 0.5) < 0.06:
+		r = 0.5
+	var v := lerpf(spec[1], spec[2], r)
+	if key == "key_semi":
+		v = roundf(v)   # semitones are integers; a bar that lands on +3.4 is not a key
+	_eq.set_fx(key, v)
+	_refresh_fx()
+	_save_soon()
+
+## The drive faders write through to the controls that already own these values, so
+## there is still exactly one source of truth per parameter.
+func _on_fx_drive(e: InputEvent, tag: String) -> void:
+	if not _bar_drag(e, _fx_bars[tag]):
+		return
+	var r := _ratio_at(e.position.x, _fx_bars[tag].size.x)
+	if tag == "DRIVE":
+		_boost = clampi(int(roundf(r * 100.0)), 0, 100)
+		_refresh_boost()
+		_eq.set_boost(_boost_gain())
+	else:
+		_eq.set_dsp("tbass" if tag == "T-BASS" else "bbe", r)
+	_refresh_fx()
+	_save_soon()
+
+func _refresh_fx() -> void:
+	if _fx_bars.is_empty():
+		return
+	var off := _eq.fx_bypassed()
+	_fx_leds["bypass"].text = "FX BYPASS [*]" if off else "FX BYPASS [ ]"
+	for key in Equalizer.FX_SPEC:
+		var spec: Array = Equalizer.FX_SPEC[key]
+		_fx_bars[key].value = inverse_lerp(spec[1], spec[2], _eq.fx[key]) * 100.0
+		_fx_vals[key].text = "--" if off else _fx_text(key)
+	for key in ["rev_on", "dly_on"]:
+		var on: bool = _eq.fx_switch[key]
+		_fx_leds[key].button_pressed = on
+		_fx_leds[key].text = "[*] ON" if on else "[ ] OFF"
+	if _key_lbl:
+		_key_lbl.text = _key_text()
+	# BYPASS deliberately does not reach the drive stage: T-BASS, BBE and the booster are
+	# the hardware colour of the signal, not spatial effects, so they stay lit and live.
+	for pair in [["T-BASS", _eq.tbass * 100.0], ["BBE", _eq.bbe * 100.0], ["DRIVE", float(_boost)]]:
+		_fx_bars[pair[0]].value = pair[1]
+		_fx_vals[pair[0]].text = "%d%%" % int(roundf(pair[1]))
+
+func _fx_text(key: String) -> String:
+	var v: float = _eq.fx[key]
+	if key == "dly_ms":
+		return "%d MS" % int(v)
+	if key == "tape":
+		return "%.2fx" % v
+	if key == "key_semi":
+		return "%+d ST" % int(roundf(v))
+	if key == "cut":
+		var cut: Array = _eq.cut_state()
+		if cut[0] == 0:
+			return "BYPASS"
+		return "%s %s" % ["LP" if cut[0] == -1 else "HP", _hz(cut[1])]
+	var spec: Array = Equalizer.FX_SPEC[key]
+	return "%d%%" % int(roundf(inverse_lerp(spec[1], spec[2], v) * 100.0))
+
+# --- key readout -----------------------------------------------------------
+## One label under the KEY SHIFT fader. It is the readout for that fader, which is why
+## it lives inside the module rather than in a rack panel of its own.
+##
+## No MATCH KEY button and no KEY LOCK toggle: both were auto-triggers that wrote to the
+## bus from outside a deliberate fader move, and neither is worth a class of bug that
+## only shows up as a click in the middle of a mix.
+func _key_row(parent: Control) -> void:
+	_key_lbl = Label.new()
+	_key_lbl.theme_type_variation = &"Green"
+	parent.add_child(_key_lbl)
+
+## "ORIGINAL: 8A (Am) -> CURRENT: 10A (Bm)". Collapses to the original alone at 0
+## semitones -- an arrow pointing back at the same key is noise. A tag that would not
+## parse still shows, with the shift beside it rather than folded into it: transposing
+## a string we did not understand would be inventing data.
+func _key_text() -> String:
+	var semi := int(roundf(_eq.fx["key_semi"]))
+	var orig: String = str(_key.get("text", ""))
+	if orig.is_empty():
+		return "KEY: --" if semi == 0 else "KEY: --  //  %+d ST" % semi
+	if semi == 0:
+		return "ORIGINAL: %s" % orig
+	if int(_key.get("pc", -1)) < 0:
+		return "ORIGINAL: %s  //  %+d ST" % [orig, semi]
+	return "ORIGINAL: %s -> CURRENT: %s" % [orig,
+		AudioEngine.key_label(AudioEngine.key_shifted(_key["pc"], semi), _key["minor"])]
+
+## Short form for the STATS column, which has no room for the arrow.
+func _key_stat() -> String:
+	var t: String = str(_key.get("text", ""))
+	if t.is_empty():
+		return "--"
+	var semi := int(roundf(_eq.fx["key_semi"]))
+	if semi == 0 or int(_key.get("pc", -1)) < 0:
+		return t
+	return AudioEngine.key_label(AudioEngine.key_shifted(_key["pc"], semi), _key["minor"])
+
+static func _hz(hz: float) -> String:
+	return "%.1fK" % (hz / 1000.0) if hz >= 1000.0 else "%d" % int(hz)
+
+
+# --- playlists, cue markers and the context menu ---------------------------
+## All three ride machinery that is already here. A playlist is a second filter over the
+## same visible list SEARCH filters, so the queue, the track count and the TOTAL TIME
+## readout all scope themselves -- `_refill` stays the single place that decides what is
+## playable. Cue markers are painted onto the existing scrub ProgressBar through its
+## `draw` signal rather than an overlay node, so they inherit its geometry for free and
+## there is nothing to keep in sync when the window resizes.
+##
+## Stored in library.cfg as one Dictionary per key rather than one key per track, because
+## ConfigFile would otherwise need every absolute path quoted as a section key:
+##
+##   [playlists] list   = { NAME: [path, ...] }
+##   [playlists] cues   = { NAME: { path: [cue, ...] } }    playlist-scoped cues
+##   [cues]      tracks = { path: [cue, ...] }              globally-scoped cues
+##   [library]   track_labels = { path: NAME }              RENAME TAG overrides
+##   cue = { "id": int, "time": float, "label": String, "color": String,
+##           "key": String, "shape": String }
+##   -- "key" is present only once one is assigned; "shape" defaults to "square"
+##
+## The track's path is the dictionary KEY rather than a "path" field inside each record:
+## the lookup runs every time the bar repaints, which is every frame while a track plays,
+## and a hash hit beats scanning a list of records for a matching field.
+##
+## Every write here goes through _save_soon() -- the 1.5 s debounce the EQ faders and the
+## volume bar already use -- except the two that must not be able to disagree with the
+## disk (a new playlist, a deleted file), which call _save() outright.
+func _setup_menus() -> void:
+	%Tracks.item_clicked.connect(_on_item_clicked)
+	%Menu.id_pressed.connect(_on_menu_id)
+	%PlMenu.id_pressed.connect(_on_menu_id)
+	var shapes := PopupMenu.new()
+	shapes.name = "ShapeMenu"
+	%Menu.add_child(shapes)
+	shapes.owner = self
+	shapes.unique_name_in_owner = true   # %ShapeMenu
+	shapes.id_pressed.connect(_on_menu_id)
+	%Ask.confirmed.connect(func() -> void:
+		if _ask_cb.is_valid():
+			_ask_cb.call(%AskLine.text.strip_edges()))
+	# Enter in the field is the same as pressing OK, which is what a rename prompt has to
+	# do -- without it the dialog is a text box you cannot finish from the keyboard
+	%Ask.register_text_enter(%AskLine)
+	_ask_cancel = %Ask.add_cancel_button("CANCEL")
+	# RMB on the picker acts on the playlist it is showing. The picker IS the sidebar's
+	# playlist control, and PopupMenu gives no per-item right-click signal to hang this
+	# off inside the drop-down, so the button itself is where it goes.
+	%Playlist.gui_input.connect(func(e: InputEvent) -> void:
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_RIGHT:
+			_popup_playlist_menu())
+	%Playlist.item_selected.connect(func(i: int) -> void:
+		_playlist = "" if i == 0 else %Playlist.get_item_text(i)
+		_refill()
+		_write_in()
+		_cue_overlay.queue_redraw()   # playlist-scoped cues come and go with the scope
+		_save_soon())
+	# MARK MODE is deliberately not persisted. It changes what a click on the scrub bar
+	# does, and booting into a player whose scrub bar silently refuses to seek is a bug
+	# report, not a restored preference.
+	%Mark.toggled.connect(func(on: bool) -> void:
+		_mark_mode = on
+		%Mark.text = "MARK:ON" if on else "MARK:OFF")
+	_hover_note(%Mark, func() -> String:
+		return "MARK MODE: CLICK THE BAR TO DROP A CUE THERE  //  SEEKING IS OFF" if _mark_mode \
+			else "MARK MODE: OFF")
+	_setup_cue_overlay()
+	_refresh_playlists()
+
+## Cue markers get their own canvas item. Nothing is painted into %Scrub any more.
+##
+## The overlay is a child of %Scrub with full-rect anchors rather than a sibling in the
+## ScrubRow HBox: a sibling would claim layout space and push the bar around, while a
+## child of a non-container Control is positioned by its anchors alone and follows the
+## bar's rect through every resize and orientation flip for free. It has no draw of its
+## own beyond the markers, so the ProgressBar's fill is untouched geometry.
+##
+## MOUSE_FILTER_PASS is what keeps the bar usable: the overlay sees each press first, and
+## anything that is not a marker is left unaccepted and continues to %Scrub, which still
+## seeks and still drops markers in MARK MODE exactly as before.
+##
+## The top edge is lifted by one tab height so the caps sit ABOVE the bar instead of
+## inside the green fill -- that is the part that read as the fill being "split". Set
+## offset_top back to 0 to put them inside the bar again.
+func _setup_cue_overlay() -> void:
+	_cue_overlay = Control.new()
+	_cue_overlay.name = "CueOverlay"
+	_cue_overlay.mouse_filter = Control.MOUSE_FILTER_PASS
+	_scrub.add_child(_cue_overlay)
+	_cue_overlay.owner = self
+	_cue_overlay.unique_name_in_owner = true   # %CueOverlay
+	# anchors AND offsets: set_anchors_preset alone keeps the node's current rect, which
+	# for a Control created a line earlier is 0x0 -- measured, that produced a 6 px tall
+	# overlay sitting above an untouched bar, with every marker clipped out of existence
+	_cue_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_cue_overlay.offset_top = -CUE_TAB.y
+	_cue_overlay.draw.connect(_draw_cues)
+	_cue_overlay.gui_input.connect(_on_overlay_input)
+	# the ProgressBar used to repaint every frame as its value changed, which hid the
+	# fact that markers need a repaint of their own; an overlay only redraws when asked
+	_cue_overlay.resized.connect(_cue_overlay.queue_redraw)
+
+## Rebuilt rather than patched: playlists are a handful of entries, and this runs on a
+## config load or a playlist being created, not per frame.
+func _refresh_playlists() -> void:
+	%Playlist.clear()
+	%Playlist.add_item("ALL TRACKS")
+	for name in _playlists:
+		%Playlist.add_item(name)
+	# index 0 is ALL TRACKS, so a playlist sits one past its position in the dictionary
+	var at := _playlists.keys().find(_playlist)
+	%Playlist.selected = at + 1 if at >= 0 else 0
+
+# --- context menu ----------------------------------------------------------
+## Two open-ended ranges at the top, everything fixed below them: a playlist is
+## PL_FIRST + its index, a palette colour is COLOR_FIRST + its index.
+const PL_FIRST := 100
+const COLOR_FIRST := 200
+const SHAPE_FIRST := 300
+## Tab handle shapes, in menu order. The stored value is the lowercase name, so a config
+## written before shapes existed reads back as "square" through the default.
+const SHAPES := ["square", "circle", "triangle"]
+const MENU_NEW_PL := 1
+const MENU_RENAME := 2
+const MENU_UNFILE := 3
+const MENU_INFO := 4
+const MENU_DELETE := 5
+const MENU_CUE_GLOBAL := 6
+const MENU_CUE_LOCAL := 7
+const MENU_CUE_DELETE := 8
+const MENU_CUE_HEX := 9
+const MENU_CUE_KEY := 10
+const MENU_PL_DELETE := 11
+const MENU_CUE_TS := 12
+const MENU_DECK_B := 13
+
+## RMB anywhere on a row. `item_clicked` hands back the row index, so there is no
+## hit-testing to do and no gui_input handler to write; `allow_rmb_select` in the scene is
+## what makes the row highlight under the cursor, so the menu visibly belongs to a track.
+func _on_item_clicked(row: int, _at: Vector2, button: int) -> void:
+	if button != MOUSE_BUTTON_RIGHT:
+		return
+	if row < 0 or row >= _row_path.size() or _row_path[row] < 0:
+		return   # a FOLDER-mode header row is not a track
+	_popup_track_menu(_paths[_row_path[row]])
+
+func _popup_track_menu(path: String) -> void:
+	_menu_ctx = {"kind": "track", "path": path}
+	%PlMenu.clear()
+	for i in _playlists.size():
+		%PlMenu.add_item(_playlists.keys()[i], PL_FIRST + i)
+	%PlMenu.add_separator()
+	%PlMenu.add_item("+ NEW PLAYLIST", MENU_NEW_PL)
+	%Menu.clear()
+	%Menu.add_submenu_node_item("ADD TO PLAYLIST", %PlMenu)
+	%Menu.add_item("RENAME TAG", MENU_RENAME)
+	# offered only where it can do something, and it is the only way back out of a
+	# mis-click on ADD TO PLAYLIST
+	if not _playlist.is_empty() and path in _playlists.get(_playlist, []):
+		%Menu.add_item("REMOVE FROM %s" % _playlist, MENU_UNFILE)
+	%Menu.add_item("ADD TO DECK B SETLIST", MENU_DECK_B)
+	%Menu.add_item("TRACK INFO", MENU_INFO)
+	%Menu.add_separator()
+	%Menu.add_item("DELETE FROM DISK", MENU_DELETE)
+	_popup_at_mouse()
+
+## The marker editor. Same single PopupMenu node as the track menu, rebuilt -- and the
+## same submenu node too, since a menu can only be in one place at a time anyway.
+##
+## SCOPE is two checkable items rather than one toggling line: with a radio mark you can
+## see which scope the marker is in without clicking anything, where a toggle labelled
+## with its own action always reads ambiguously ("does that say what it IS, or what it
+## will DO?").
+func _popup_cue_menu(cue: Dictionary) -> void:
+	_menu_ctx = {"kind": "cue", "cue": cue}
+	var local := _cue_is_local(cue)
+	%PlMenu.clear()
+	for i in _viz.PRESETS.size():
+		# the visualizer's palette, which is the one set of colours this program already
+		# owns -- a second palette would be a second thing to keep looking right per skin
+		%PlMenu.add_icon_item(_swatch(_viz.PRESETS[i]),
+			(_viz.PRESETS[i] as Color).to_html(false).to_upper(), COLOR_FIRST + i)
+	%PlMenu.add_separator()
+	%PlMenu.add_item("CUSTOM HEX...", MENU_CUE_HEX)
+	%ShapeMenu.clear()
+	for i in SHAPES.size():
+		%ShapeMenu.add_radio_check_item((SHAPES[i] as String).to_upper(), SHAPE_FIRST + i)
+		%ShapeMenu.set_item_checked(i, str(cue.get("shape", "square")) == SHAPES[i])
+	%Menu.clear()
+	# the timestamp leads: it is the one thing about a marker you read as often as you
+	# change it, and it doubles as the edit field
+	%Menu.add_item("TS %s" % _time_text(float(cue["time"])), MENU_CUE_TS)
+	%Menu.add_separator()
+	%Menu.add_icon_item(_swatch(Color(str(cue["color"]))), "SELECT COLOR", -1)
+	%Menu.set_item_submenu_node(%Menu.item_count - 1, %PlMenu)
+	%Menu.add_item("CHANGE SHAPE", -1)
+	%Menu.set_item_submenu_node(%Menu.item_count - 1, %ShapeMenu)
+	var key := str(cue.get("key", ""))
+	%Menu.add_item("ASSIGN KEYBIND%s" % ("" if key.is_empty() else "  [%s]" % key),
+		MENU_CUE_KEY)
+	%Menu.add_separator()
+	%Menu.add_radio_check_item("SCOPE: TRACK GLOBAL", MENU_CUE_GLOBAL)
+	%Menu.set_item_checked(%Menu.item_count - 1, not local)
+	%Menu.add_radio_check_item("SCOPE: PLAYLIST ONLY", MENU_CUE_LOCAL)
+	%Menu.set_item_checked(%Menu.item_count - 1, local)
+	%Menu.add_separator()
+	%Menu.add_item("DELETE MARKER", MENU_CUE_DELETE)
+	_popup_at_mouse()
+
+## Which store this marker lives in. Read rather than remembered: the scope IS where the
+## cue is, and a second copy of that fact in the cue record could disagree with it.
+func _cue_is_local(cue: Dictionary) -> bool:
+	if _playlist.is_empty():
+		return false
+	return cue in ((_pl_cues.get(_playlist, {}) as Dictionary).get(_current, []) as Array)
+
+## A 12 px colour chip for a menu item. Cached per colour, because a menu rebuild would
+## otherwise allocate a texture per swatch every time a marker is clicked.
+func _swatch(c: Color) -> ImageTexture:
+	var key := c.to_html(false)
+	if not _swatch_cache.has(key):
+		var img := Image.create(12, 12, false, Image.FORMAT_RGBA8)
+		img.fill(c)
+		_swatch_cache[key] = ImageTexture.create_from_image(img)
+	return _swatch_cache[key]
+
+## RMB on the playlist picker. ALL TRACKS is not a playlist and has nothing to delete,
+## so the menu simply does not open there.
+func _popup_playlist_menu() -> void:
+	if _playlist.is_empty():
+		return
+	_menu_ctx = {"kind": "playlist", "playlist": _playlist}
+	%Menu.clear()
+	%Menu.add_item("DELETE PLAYLIST %s" % _playlist, MENU_PL_DELETE)
+	_popup_at_mouse()
+
+## Dropping a playlist also drops every cue that was scoped to it -- those cues exist
+## nowhere else, which is why this one asks first. Tracks are untouched: a playlist is a
+## view of the library, never a container for it.
+func _delete_playlist(name: String) -> void:
+	_playlists.erase(name)
+	_pl_cues.erase(name)
+	if _playlist == name:
+		_playlist = ""      # back to ALL TRACKS rather than a scope that no longer exists
+	_refresh_playlists()
+	_refill()
+	_cue_overlay.queue_redraw()
+	_note = "  //  DELETED PLAYLIST %s" % name
+	_clear_note_later()
+	_save_soon()
+
+## Screen coordinates, not viewport ones: this project runs with embed_subwindows off,
+## so a popup is a real OS window and positions itself against the desktop.
+func _popup_at_mouse() -> void:
+	%Menu.popup(Rect2i(DisplayServer.mouse_get_position(), Vector2i.ZERO))
+
+func _on_menu_id(id: int) -> void:
+	var path: String = _menu_ctx.get("path", "")
+	var cue: Dictionary = _menu_ctx.get("cue", {})
+	if id >= SHAPE_FIRST:
+		cue["shape"] = SHAPES[id - SHAPE_FIRST]
+		_cue_overlay.queue_redraw()
+		_save_soon()
+	elif id >= COLOR_FIRST:
+		_set_cue_color(cue, (_viz.PRESETS[id - COLOR_FIRST] as Color).to_html(false))
+	elif id >= PL_FIRST:
+		_file_track(_playlists.keys()[id - PL_FIRST], path)
+	elif id == MENU_DECK_B:
+		_add_to_setlist(path)
+	elif id == MENU_NEW_PL:
+		_ask("NEW PLAYLIST", "PLAYLIST %d" % (_playlists.size() + 1),
+			func(name: String) -> void:
+				if name.is_empty() or _playlists.has(name):
+					return
+				_playlists[name] = []
+				_refresh_playlists()
+				_file_track(name, path)
+				_save())
+	elif id == MENU_RENAME:
+		_ask("RENAME TAG", _labels.get(path, path.get_file()), func(name: String) -> void:
+			if name.is_empty():
+				_labels.erase(path)   # cleared back to the filename on disk
+			else:
+				_labels[path] = name
+			_reindex()   # the row text and the search haystack are both built there
+			_save_soon())
+	elif id == MENU_UNFILE:
+		(_playlists[_playlist] as Array).erase(path)
+		_refill()
+		_save_soon()
+	elif id == MENU_INFO:
+		_show_info(path)
+	elif id == MENU_DELETE:
+		_delete_track(path)
+	elif id == MENU_CUE_GLOBAL:
+		_move_cue(cue, false)
+	elif id == MENU_CUE_LOCAL:
+		_move_cue(cue, true)
+	elif id == MENU_CUE_DELETE:
+		_delete_cue(cue)
+	elif id == MENU_CUE_HEX:
+		_ask("MARKER COLOUR (HEX)", str(cue["color"]), func(hex: String) -> void:
+			if not Color.html_is_valid(hex):
+				_note = "  //  NOT A COLOUR: %s" % hex
+				_clear_note_later()
+				return
+			_set_cue_color(cue, Color(hex).to_html(false)))
+	elif id == MENU_CUE_TS:
+		# full precision in the FIELD whatever SHOW MS says: the menu label is a readout
+		# and may round, but an editor prefilled with "01:42" would quietly throw away
+		# the 250 ms the marker actually holds the moment the user pressed OK
+		_ask("MARKER TIMESTAMP (MM:SS:MS)", ts_text(float(cue["time"])),
+			func(raw: String) -> void:
+				var t := ts_parse(raw)
+				if t < 0.0:
+					_note = "  //  NOT A TIMESTAMP: %s" % raw
+					_clear_note_later()
+					return
+				# clamped to the track, and playback is not touched: retiming a marker is
+				# an edit to the marker, not a seek
+				cue["time"] = clampf(t, 0.0, _len())
+				_note = "  //  %s -> %s" % [cue["label"], _time_text(float(cue["time"]))]
+				_clear_note_later()
+				_cue_overlay.queue_redraw()
+				_save_soon(), 12)
+	elif id == MENU_CUE_KEY:
+		_ask("JUMP KEY FOR %s" % cue["label"], str(cue.get("key", "")),
+			func(raw: String) -> void: _set_cue_key(cue, raw), 1)
+	elif id == MENU_PL_DELETE:
+		_confirm("DELETE PLAYLIST %s\nAND ITS %d CUE SETS?" % [_menu_ctx.get("playlist", ""),
+			(_pl_cues.get(_menu_ctx.get("playlist", ""), {}) as Dictionary).size()],
+			_delete_playlist.bind(_menu_ctx.get("playlist", "")))
+
+func _file_track(name: String, path: String) -> void:
+	var list: Array = _playlists.get(name, [])
+	if path in list:
+		_note = "  //  ALREADY IN %s" % name
+	else:
+		list.append(path)
+		_playlists[name] = list
+		_note = "  //  FILED UNDER %s" % name
+	_clear_note_later()
+	_refill()   # the track may have just entered the active scope
+	_save_soon()
+
+## One dialog for every prompt in the program: NEW PLAYLIST and RENAME TAG both want a
+## line of text, and TRACK INFO wants the same box with the field hidden. A second dialog
+## node would be a second thing to theme and a second thing to position.
+## `max_len` of 0 is LineEdit's "no limit"; the keybind prompt passes 1, so a jump key
+## cannot be typed as a word and then silently truncated to its first letter.
+func _ask(prompt: String, initial: String, cb: Callable, max_len := 0) -> void:
+	_ask_cb = cb
+	%Ask.title = prompt
+	%Ask.dialog_text = ""
+	%AskLine.visible = true
+	_ask_cancel.visible = false
+	%AskLine.max_length = max_len
+	%AskLine.text = initial
+	%Ask.popup_centered()
+	%AskLine.grab_focus()
+	%AskLine.select_all()
+
+## The same dialog with the field hidden and a CANCEL button showing. Used where an
+## action cannot be undone and the config is the only copy of what it destroys.
+func _confirm(text: String, cb: Callable) -> void:
+	_ask_cb = func(_s: String) -> void: cb.call()
+	%Ask.title = "CONFIRM"
+	%Ask.dialog_text = text
+	%AskLine.visible = false
+	_ask_cancel.visible = true
+	%Ask.popup_centered()
+
+func _show_info(path: String) -> void:
+	# cached when the track has played or been swept, and probed on the spot otherwise --
+	# a deliberate exception to the no-inline-probe rule, because this is one file, asked
+	# for by name, and the answer is the whole point of the menu item
+	var m := _engine.metadata(path)
+	var secs := float(m.get("duration", 0.0))
+	var key_txt := str(m["key"]["text"])
+	_ask_cb = Callable()
+	%AskLine.visible = false
+	_ask_cancel.visible = false
+	%Ask.title = "TRACK INFO"
+	%Ask.dialog_text = "\n".join([
+		path.get_file(), "",
+		"TITLE...%s" % m["title"],
+		"ARTIST..%s" % (m["artist"] if m["artist"] else "-"),
+		"ALBUM...%s" % (m["album"] if m["album"] else "-"),
+		"KEY.....%s" % (key_txt if key_txt else "-"),
+		"LENGTH..%s" % (_fmt(secs) if secs > 0.0 else "-"),
+		"FORMAT..%s %d HZ %d BIT %s" % [m["codec"], m["sample_rate"], m["bits"],
+			"STEREO" if m["channels"] >= 2 else "MONO"],
+		"CUES....%d" % _cues_for(path).size(),
+		"", path,
+	])
+	%Ask.popup_centered()
+
+## DELETE FROM DISK goes to the recycle bin, not to oblivion.
+##
+## OS.move_to_trash is the whole feature: one stdlib call, the same thing the file
+## manager on this machine does, and recoverable. A raw DirAccess.remove() would be the
+## same number of lines and would let a mis-click in a context menu -- one item away from
+## RENAME TAG -- permanently destroy someone's music.
+func _delete_track(path: String) -> void:
+	var err := OS.move_to_trash(ProjectSettings.globalize_path(path))
+	if err != OK:
+		_note = "  //  COULD NOT DELETE %s (%d)" % [path.get_file(), err]
+		_clear_note_later()
+		return
+	# the file is gone, so every reference to it is dead weight that would be re-saved
+	# forever otherwise
+	_cues.erase(path)
+	_labels.erase(path)
+	for name in _playlists:
+		(_playlists[name] as Array).erase(path)
+	for name in _pl_cues:
+		(_pl_cues[name] as Dictionary).erase(path)
+	_note = "  //  MOVED TO RECYCLE BIN: %s" % path.get_file()
+	_clear_note_later()
+	_save()      # the disk has already changed; the config must not be able to disagree
+	_rescan()
+
+# --- cue markers -----------------------------------------------------------
+## Half-width of a marker's click target, in pixels. A 2 px line is not something a hand
+## can hit, so the hit box is the line plus four pixels either side.
+const CUE_GRAB := 5.0
+
+## Everything drawn and clickable for this track: the track's own cues, plus the ones
+## scoped to the playlist that is currently active. A cue lives in exactly one of the
+## two, which is what makes the scope menu a move rather than a copy.
+func _cues_for(path: String) -> Array:
+	var out: Array = (_cues.get(path, []) as Array).duplicate()
+	if not _playlist.is_empty():
+		out.append_array((_pl_cues.get(_playlist, {}) as Dictionary).get(path, []))
+	return out
+
+static func cue_x(t: float, length: float, w: float) -> float:
+	return clampf(t / maxf(length, 0.001), 0.0, 1.0) * w
+
+static func next_cue_id(cues: Array) -> int:
+	var top := 0
+	for c in cues:
+		top = maxi(top, int(c["id"]))
+	return top + 1
+
+## MM:SS:MS, the last field in milliseconds -- "01:42:250" is 1 min 42.25 s. Minutes are
+## not wrapped into hours: a track is minutes long, and 73:20:000 is easier to read on a
+## marker than 01:13:20:000.
+static func ts_text(t: float) -> String:
+	var ms := int(roundf(maxf(t, 0.0) * 1000.0))
+	return "%02d:%02d:%03d" % [ms / 60000, (ms / 1000) % 60, ms % 1000]
+
+## The inverse, returning -1.0 for anything that will not parse -- the caller shows the
+## note rather than silently moving a marker somewhere the user did not ask for.
+##
+## Accepts MM:SS and MM:SS:MS. A third field of three digits or more is read as true
+## milliseconds ("01:42:500"), two or fewer as hundredths, because both spellings turn up
+## the moment anyone types a timestamp by hand.
+static func ts_parse(raw: String) -> float:
+	var parts := raw.strip_edges().split(":", false)
+	if parts.size() < 2 or parts.size() > 3:
+		return -1.0
+	for p in parts:
+		if not (p as String).is_valid_int():
+			return -1.0
+	var secs := float(int(parts[0]) * 60 + int(parts[1]))
+	if parts.size() == 3:
+		var frac: String = parts[2]
+		secs += float(int(frac)) / (1000.0 if frac.length() >= 3 else 100.0)
+	return secs
+
+static func ts_test() -> bool:
+	return ts_text(102.25) == "01:42:250" and ts_text(0.0) == "00:00:000" \
+		and ts_text(3661.0) == "61:01:000" \
+		and is_equal_approx(ts_parse("01:42:250"), 102.25) \
+		and is_equal_approx(ts_parse("00:30"), 30.0) \
+		and is_equal_approx(ts_parse("01:42:50"), 102.5)   \
+		and is_equal_approx(ts_parse(ts_text(217.33)), 217.33) \
+		and ts_parse("nope") < 0.0 and ts_parse("1:2:3:4") < 0.0 and ts_parse("") < 0.0
+
+static func key_test() -> bool:
+	var a := {"key": "Q", "time": 102.25}
+	var b := {"time": 8.0}
+	return norm_key("q") == "Q" and norm_key("7") == "7" and norm_key("") == "" \
+		and norm_key(" ") == "SPACE" and norm_key("esc") == "ESC" and norm_key("-") == "?" \
+		and norm_key("qq") == "?" \
+		and key_reserved(norm_key("h")) and key_reserved(norm_key("m")) \
+		and key_reserved("SPACE") and key_reserved("F11") and not key_reserved("Q") \
+		and is_equal_approx(float(key_conflict([a, b], b, "Q").get("time", 0.0)), 102.25) \
+		and key_conflict([a, b], b, "Z").is_empty() \
+		and key_conflict([a], a, "Q").is_empty()   # a marker never collides with itself
+
+static func cue_test() -> bool:
+	var cues: Array = [{"id": 1, "time": 30.0}, {"id": 4, "time": 90.0}]
+	return next_cue_id(cues) == 5 and next_cue_id([]) == 1 \
+		and is_equal_approx(cue_x(30.0, 120.0, 400.0), 100.0) \
+		and is_equal_approx(cue_x(999.0, 120.0, 400.0), 400.0) \
+		and is_equal_approx(cue_x(0.0, 0.0, 400.0), 0.0) \
+		and on_tab(Vector2(100.0, 2.0), 100.0) \
+		and on_tab(Vector2(104.0, 5.0), 100.0) \
+		and not on_tab(Vector2(100.0, 12.0), 100.0) \
+		and not on_tab(Vector2(112.0, 2.0), 100.0) \
+		and Color.html_is_valid("d84445") and not Color.html_is_valid("nope")
+		# keys moved out to key_test() when the rules grew past "is it a letter"
+
+## The tab is the marker's handle: the line is 2 px and nothing can reliably hit 2 px,
+## so the clickable part is a wider cap at the top. Drawn INSIDE the bar rather than
+## above it -- the scrub bar is 16 px tall in a tight HBox, and a cap that overhung the
+## top would paint over the workspace above it.
+const CUE_TAB := Vector2(9.0, 6.0)
+
+## Painted on %CueOverlay, never on %Scrub. X is the position the marker's time maps to
+## across the overlay's own width -- the same width the bar has, but measured on the node
+## doing the drawing, so nothing here can be confused with the bar's internal fill rect.
+##
+## The overlay's top CUE_TAB.y pixels are the cap strip above the bar; the line starts
+## where the bar does and runs to the bottom.
+func _draw_cues() -> void:
+	var length := _len()
+	if _current.is_empty() or length <= 0.0:
+		return
+	var w := _cue_overlay.size.x
+	var top := CUE_TAB.y
+	for c in _cues_for(_current):
+		var col := Color(str(c["color"]))
+		var x := cue_x(float(c["time"]), length, w)
+		_cue_overlay.draw_rect(Rect2(x - 1.0, top, 2.0, _cue_overlay.size.y - top), col)
+		# the handle. Its footprint is the same CUE_TAB box whatever the shape, so the
+		# hit test stays one rectangle and a triangle is no harder to grab than a square.
+		match str(c.get("shape", "square")):
+			"circle":
+				_cue_overlay.draw_circle(Vector2(x, top * 0.5), top * 0.5, col)
+			"triangle":
+				_cue_overlay.draw_colored_polygon(PackedVector2Array([
+					Vector2(x - CUE_TAB.x * 0.5, 0.0),
+					Vector2(x + CUE_TAB.x * 0.5, 0.0),
+					Vector2(x, CUE_TAB.y)]), col)
+			_:
+				_cue_overlay.draw_rect(Rect2(x - CUE_TAB.x * 0.5, 0.0, CUE_TAB.x, CUE_TAB.y), col)
+	# no label or keybind is painted into the strip: rendered and measured, a character
+	# that small is a smudge. The hover readout says all of it in the status bar, where
+	# there is room for words.
+
+## The cue under a click, or {} -- returned by reference, so the caller can hand the same
+## Dictionary to the scope and delete paths and have them find it in whichever store it
+## actually lives in.
+func _cue_at(x: float) -> Dictionary:
+	var length := _len()
+	if _current.is_empty() or length <= 0.0:
+		return {}
+	var best := {}
+	var best_dx := CUE_GRAB
+	for c in _cues_for(_current):
+		var dx: float = absf(cue_x(float(c["time"]), length, _cue_overlay.size.x) - x)
+		if dx <= best_dx:
+			best_dx = dx
+			best = c
+	return best
+
+## Was the click on a marker's TAB, as opposed to its line? The tab is the handle that
+## opens the edit menu, so it has to be separable from the rest of the marker -- a plain
+## click on the line still belongs to the bar (seek, or drop a cue in MARK MODE).
+static func on_tab(pos: Vector2, x: float) -> bool:
+	return pos.y <= CUE_TAB.y and absf(pos.x - x) <= CUE_TAB.x * 0.5
+
+func _tab_at(pos: Vector2) -> Dictionary:
+	var cue := _cue_at(pos.x)
+	if cue.is_empty():
+		return {}
+	return cue if on_tab(pos, cue_x(float(cue["time"]), _len(), _cue_overlay.size.x)) else {}
+
+## Marker input, in overlay coordinates. Anything that is not a marker is left
+## unaccepted, and MOUSE_FILTER_PASS hands it straight down to %Scrub -- which is why
+## seeking, dragging and MARK MODE still behave as if the overlay were not there.
+func _on_overlay_input(e: InputEvent) -> void:
+	if not (e is InputEventMouseButton) or not e.pressed:
+		return
+	var hit := _cue_at(e.position.x)
+	if hit.is_empty():
+		return
+	if e.button_index == MOUSE_BUTTON_RIGHT:
+		_popup_cue_menu(hit)
+	elif e.button_index == MOUSE_BUTTON_LEFT and e.shift_pressed:
+		_audition(hit)
+	elif e.button_index == MOUSE_BUTTON_LEFT and not _tab_at(e.position).is_empty():
+		# a press on the tab ARMS a drag; the menu opens on release, and only if the
+		# pointer never moved. That is what makes one handle do both jobs -- click to
+		# edit, drag to reposition -- without a modifier to remember.
+		_drag_cue = hit
+		_drag_from_x = e.position.x
+		_drag_moved = false
+	else:
+		return   # on the line, not the tab: it belongs to the bar underneath
+	_cue_overlay.accept_event()
+
+## Runs from _process while a tab is held. The release is POLLED rather than awaited for
+## the same reason the scrub drag polls it: a button released off the control never
+## reaches its gui_input, and a marker latched to the mouse forever is worse than a
+## scrub bar that is.
+##
+## Dragging writes straight to the cue's time and repaints the overlay. It never seeks --
+## the track keeps playing under the marker being moved, which is the whole point of
+## being able to place one behind the playhead.
+func _drag_cue_step() -> void:
+	if _drag_cue.is_empty():
+		return
+	if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+		var x := _cue_overlay.get_local_mouse_position().x
+		if absf(x - _drag_from_x) > DRAG_SLOP:
+			_drag_moved = true
+		if _drag_moved and _len() > 0.0:
+			_drag_cue["time"] = _ratio_at(x, _cue_overlay.size.x) * _len()
+			_note = "  //  %s -> %s" % [_drag_cue["label"], _time_text(float(_drag_cue["time"]))]
+			_cue_overlay.queue_redraw()
+		return
+	var cue := _drag_cue
+	var moved := _drag_moved
+	_drag_cue = {}
+	_drag_moved = false
+	if moved:
+		_clear_note_later()
+		_save_soon()
+	else:
+		_popup_cue_menu(cue)   # a click, not a drag
+
+## How far the pointer may wander before a click counts as a drag. Two pixels: a hand
+## clicking a 9 px tab moves one or two, and treating that as a drag would nudge markers
+## every time the menu was opened.
+const DRAG_SLOP := 2.0
+
+## `at` is a position in the track, in seconds -- the caller decides where. MARK MODE
+## passes the time under the CLICK rather than the playhead: marking is as often "that
+## bit I just heard" as "this instant", and a marker that can only land on the playhead
+## cannot be placed behind it at all. Nothing in here touches playback.
+##
+## It is filed into whichever scope is active, because that is the scope you are working
+## in. The RMB menu moves it afterwards.
+func _add_cue(at: float) -> void:
+	if _current.is_empty() or _len() <= 0.0:
+		_note = "  //  NOTHING PLAYING TO MARK"
+		_clear_note_later()
+		return
+	var store := _cue_store(not _playlist.is_empty())
+	var list: Array = store.get(_current, [])
+	var cue := {
+		"id": next_cue_id(_cues_for(_current)),
+		"time": clampf(at, 0.0, _len()),
+		"shape": "square",
+		"label": "CUE %d" % (_cues_for(_current).size() + 1),
+		# the skin accent, captured at creation: markers read against every scheme, and a
+		# cue keeps the colour it was born with even after the skin changes
+		"color": theme.get_color("font_color", "Green").to_html(false),
+	}
+	list.append(cue)
+	store[_current] = list
+	_note = "  //  %s @ %s" % [cue["label"], _time_text(float(cue["time"]))]
+	_clear_note_later()
+	_cue_overlay.queue_redraw()
+	_save_soon()
+
+## The dictionary a cue of the given scope lives in, created on demand. Playlist scope
+## with no playlist selected has nowhere to go, and the caller says so rather than
+## silently writing the cue somewhere the user cannot see it.
+func _cue_store(playlist_scope: bool) -> Dictionary:
+	if not playlist_scope:
+		return _cues
+	if not _pl_cues.has(_playlist):
+		_pl_cues[_playlist] = {}
+	return _pl_cues[_playlist]
+
+func _move_cue(cue: Dictionary, to_playlist: bool) -> void:
+	if to_playlist and _playlist.is_empty():
+		_note = "  //  NO PLAYLIST SELECTED"
+		_clear_note_later()
+		return
+	_pull_cue(cue)
+	var store := _cue_store(to_playlist)
+	var list: Array = store.get(_current, [])
+	list.append(cue)
+	store[_current] = list
+	_note = "  //  %s -> %s" % [cue["label"], _playlist if to_playlist else "ALL TRACKS"]
+	_clear_note_later()
+	_cue_overlay.queue_redraw()
+	_save_soon()
+
+func _set_cue_color(cue: Dictionary, hex: String) -> void:
+	cue["color"] = hex
+	_cue_overlay.queue_redraw()
+	_save_soon()
+
+## Keys are stored as the printable name Godot itself gives a keycode ("A", "7"), which
+## is what makes the lookup in _unhandled_input a dictionary-free string compare.
+##
+## The reserved transport keys are refused rather than silently accepted: they are
+## handled earlier in _unhandled_input, so a marker bound to one would simply never fire
+## and the setting would look broken rather than rejected.
+## Keys the program keeps for itself. H, SPACE, F1, F11 and ESC are live transport
+## shortcuts today; M is held back for MARK MODE, which is a toggle that wants a key
+## sooner or later. Reserving one costs nothing and un-reserving it later breaks nobody,
+## where handing it out and taking it back breaks whoever bound it.
+const CUE_KEYS_RESERVED := ["SPACE", "H", "M", "F1", "F11", "ESC"]
+
+## "" clears the binding, "?" is not a usable key at all, anything else is the key's
+## normalised name. A typed space comes back as SPACE rather than as a clear: someone
+## pressing the space bar in that field is asking for the key, not emptying the field.
+##
+## Multi-character names (ESC, F11) only arrive from a hand-edited config -- the prompt
+## is capped at one character -- but they are recognised rather than mangled into "E".
+static func norm_key(raw: String) -> String:
+	var k := raw.strip_edges().to_upper()
+	if k.is_empty():
+		return "SPACE" if raw.contains(" ") else ""
+	if k.length() > 1:
+		return k if k in CUE_KEYS_RESERVED else "?"
+	return k if (k >= "A" and k <= "Z") or (k >= "0" and k <= "9") else "?"
+
+static func key_reserved(k: String) -> bool:
+	return k in CUE_KEYS_RESERVED
+
+## The marker already holding `k` on this track, or {}. Pure, so the collision rule can
+## be checked without a library, a track or a bar to click on.
+static func key_conflict(cues: Array, cue: Dictionary, k: String) -> Dictionary:
+	for other in cues:
+		if other != cue and str(other.get("key", "")) == k:
+			return other
+	return {}
+
+## Three refusals and one assignment. Nothing here overwrites an existing binding: a key
+## that is already spoken for is reported back with the timestamp of the marker holding
+## it, so the answer to "why did my key stop working" is on screen at the moment it would
+## otherwise have been taken away.
+func _set_cue_key(cue: Dictionary, raw: String) -> void:
+	var k := norm_key(raw)
+	if k == "?":
+		_note = "  //  %s IS NOT AN AVAILABLE JUMP KEY" % raw.strip_edges().to_upper()
+		_clear_note_later()
+		return
+	if key_reserved(k):
+		_note = "  //  KEYBIND RESERVED BY SYSTEM"
+		_clear_note_later()
+		return
+	var clash := key_conflict(_cues_for(_current), cue, k) if not k.is_empty() else {}
+	if not clash.is_empty():
+		# full precision here whatever SHOW MS says: this names a specific marker, and
+		# two markers a fifth of a second apart must not read as the same one
+		_note = "  //  KEYBIND ASSIGNED TO [TS %s]" % ts_text(float(clash["time"]))
+		_clear_note_later()
+		return
+	if k.is_empty():
+		cue.erase("key")
+	else:
+		cue["key"] = k
+	_note = "  //  %s -> %s" % [cue["label"], k if k else "NO KEY"]
+	_clear_note_later()
+	_cue_overlay.queue_redraw()
+	_save_soon()
+
+## The jump itself. Seeks only -- it is meant to be used while a track is playing, and a
+## key that also started playback would turn a mis-hit into a surprise.
+func _jump_to_key(k: String) -> bool:
+	for c in _cues_for(_current):
+		if str(c.get("key", "")) == k:
+			_seek(float(c["time"]))
+			_note = "  //  JUMP %s @ %s" % [c["label"], _time_text(float(c["time"]))]
+			_clear_note_later()
+			return true
+	return false
+
+func _delete_cue(cue: Dictionary) -> void:
+	_pull_cue(cue)
+	_note = "  //  DELETED %s" % cue["label"]
+	_clear_note_later()
+	_cue_overlay.queue_redraw()
+	_save_soon()
+
+## Takes a cue out of whichever store holds it. Dictionaries are reference types in
+## GDScript, so erase() finds the instance the menu was opened on without an id search.
+##
+## An emptied list is dropped rather than left behind: without that, every track that
+## ever held a cue keeps a `path: []` entry in library.cfg forever, and the file grows
+## with tracks that have nothing to say.
+func _pull_cue(cue: Dictionary) -> void:
+	(_cues.get(_current, []) as Array).erase(cue)
+	if (_cues.get(_current, []) as Array).is_empty():
+		_cues.erase(_current)
+	for name in _pl_cues:
+		var d := _pl_cues[name] as Dictionary
+		(d.get(_current, []) as Array).erase(cue)
+		if (d.get(_current, []) as Array).is_empty():
+			d.erase(_current)
+
+## A 500 ms taste of a cue: seek, play, pause. The generation counter is what keeps a
+## second audition from being cut short by the first one's timer -- shift-clicking along
+## a row of markers is the normal way to use this, and without it every preview after the
+## first would be truncated by whatever was already counting down.
+func _audition(cue: Dictionary) -> void:
+	if not _audio.stream and not _vid():
+		return
+	_audition_gen += 1
+	var gen := _audition_gen
+	_seek(float(cue["time"]))
+	_play()
+	_note = "  //  AUDITION %s @ %s" % [cue["label"], _time_text(float(cue["time"]))]
+	_clear_note_later()
+	await get_tree().create_timer(0.5).timeout
+	if gen == _audition_gen and _playing():
+		_set_paused(true)
+
+# --- decks ------------------------------------------------------------------
+## Deck A and deck B are two mixer channels, each with its own bus, its own EQ/FX rack
+## and its own pair of players. The pair matters: a deck needs two players to cross-fade
+## between consecutive tracks, so each deck gets the engine's primary plus one of the two
+## players already in player.tscn as its spare.
+##
+## What "switching decks" does is re-point `_a`, `_b`, `_audio`, `_current` and `_eq` at
+## the other deck's set. Every piece of transport code downstream was already written
+## against those, so the scrub bar, the fade, the cue markers and the whole rack became
+## deck-aware without being touched.
+##
+## The deck you leave keeps playing. That is the entire point of two decks, and it is why
+## _stop() -- which walks `[_a, _b]` -- only ever stops the deck you are looking at.
+func _setup_decks() -> void:
+	%AudioA.bus = _engine.deck_bus(0)
+	%AudioB.bus = _engine.deck_bus(1)
+	_deck_pair[0] = [_engine.deck_player(0), %AudioA]
+	_deck_pair[1] = [_engine.deck_player(1), %AudioB]
+	for i in _deck_pair.size():
+		for pl: AudioStreamPlayer in _deck_pair[i]:
+			# the outgoing player of a crossfade must not trigger auto-advance, and
+			# neither must the deck nobody is driving
+			pl.finished.connect(func() -> void:
+				if pl == _audio and not _fading:
+					_next())
+	_engine.set_crossfader(_crossfader)
+	_bind_deck(_engine.deck)
+	_setup_deck_ui()
+
+## The two controls, built here rather than in player.tscn so the whole deck feature is
+## one file. They go at the head of the transport, where a mixer's channel select and
+## crossfader belong.
+func _setup_deck_ui() -> void:
+	_deck_btn = Button.new()
+	_deck_btn.pressed.connect(func() -> void: _switch_deck(1 - _engine.deck))
+	%ControlDeck.add_child(_deck_btn)
+	%ControlDeck.move_child(_deck_btn, 0)
+	_hover_note(_deck_btn, func() -> String:
+		return "PLAYING INTO %s  //  CLICK FOR %s  //  THE OTHER DECK KEEPS PLAYING" % [
+			AudioEngine.DECK_NAMES[_engine.deck], AudioEngine.DECK_NAMES[1 - _engine.deck]])
+
+	var panel := PanelContainer.new()
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+	panel.add_child(row)
+	var cap := Label.new()
+	cap.text = "A/B"
+	row.add_child(cap)
+	_xfade = ProgressBar.new()
+	_xfade.custom_minimum_size = Vector2(90, 14)
+	_xfade.show_percentage = false
+	_xfade.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_xfade.gui_input.connect(func(e: InputEvent) -> void:
+		if not _bar_drag(e, _xfade):
+			return
+		_set_crossfader(_ratio_at(e.position.x, _xfade.size.x)))
+	row.add_child(_xfade)
+	%ControlDeck.add_child(panel)
+	%ControlDeck.move_child(panel, 1)
+	_hover_note(_xfade, func() -> String:
+		return "CROSSFADER: %s  //  %s %+.1f DB  //  %s %+.1f DB" % [
+			("A" if _crossfader < 0.02 else ("B" if _crossfader > 0.98 else "%d%%" % int(_crossfader * 100.0))),
+			AudioEngine.DECK_NAMES[0], AudioEngine.deck_gain_db(1.0 - _crossfader),
+			AudioEngine.DECK_NAMES[1], AudioEngine.deck_gain_db(_crossfader)])
+	_refresh_deck_ui()
+
+func _set_crossfader(x: float) -> void:
+	_crossfader = clampf(x, 0.0, 1.0)
+	_engine.set_crossfader(_crossfader)
+	_refresh_deck_ui()
+	_save_soon()
+
+func _refresh_deck_ui() -> void:
+	if is_instance_valid(_deck_btn):
+		# both names always on the button, the live one bracketed: a label that shows only
+		# the current deck reads as a command to switch to it
+		_deck_btn.text = "[A] B" if _engine.deck == 0 else "A [B]"
+	if is_instance_valid(_xfade):
+		_xfade.value = _crossfader * 100.0
+
+## Parks the deck being left and binds everything to the one being entered.
+func _switch_deck(which: int) -> void:
+	if which == _engine.deck:
+		return
+	_deck_cur[_engine.deck] = _current
+	_deck_live[_engine.deck] = _audio
+	# a fade that is mid-flight belongs to the deck being parked; let it finish on its own
+	# players rather than dragging the tween across the switch
+	_engine.set_deck(which)
+	_bind_deck(which)
+	_note = "  //  %s" % AudioEngine.DECK_NAMES[which]
+	_clear_note_later()
+	_save_soon()
+
+func _bind_deck(which: int) -> void:
+	_a = _deck_pair[which][0]
+	_b = _deck_pair[which][1]
+	_audio = _deck_live[which] if _deck_live[which] else _a
+	_current = _deck_cur[which]
+	_fading = false
+	_eq = _eq_decks[which] if _eq_decks.size() > which else _eq
+	if _eq:
+		# DRIVE is a global colour control rather than a channel strip, so it follows you
+		# onto whichever deck you are driving
+		_eq.set_boost(_boost_gain())
+	_director.attach(_audio)
+	_refresh_deck_ui()
+	if not _fx_bars.is_empty():
+		_refresh_eq()
+		_refresh_fx()    # the single rack, repopulated from this deck's state
+	if not _current.is_empty():
+		_key = _engine.metadata(_current).get("key", {})
+		_ticker.text = _engine.ticker_line(_current)
+	if is_instance_valid(_cue_overlay):
+		_cue_overlay.queue_redraw()
+	if not _index.is_empty():
+		_refill()        # selection and queue anchor follow the deck's own track
+
+# --- runtime assets: fonts, cursors, and the write-in ------------------------
+## Fonts and cursors are read from beside library.cfg rather than compiled in, so a
+## skinned copy of the program does not need a rebuild:
+##
+##   user://fonts/*.ttf,*.otf   picked from the TBS settings screen
+##   user://cursors/arrow.png   replaces the drawn 12x19 arrow, hotspot at its top-left
+##
+## user:// rather than res://: an exported build's res:// is inside the pck and cannot be
+## added to, which would make this a feature that only works in the editor.
+const FONT_DIR := "user://fonts"
+const CURSOR_DIR := "user://cursors"
+const FONT_EXTS := ["ttf", "otf", "woff", "woff2"]
+
+var _fonts: Array[String] = []   # display names; "" is the built-in pixel font
+var _font_name := ""
+var _font_btn: Button
+
+func _scan_fonts() -> void:
+	_fonts = [""]
+	# created rather than merely tolerated: an empty folder sitting next to library.cfg
+	# is the only documentation anyone needs for where a font goes, and get_files_at on
+	# a missing directory pushes an error every time the list is rescanned
+	if not DirAccess.dir_exists_absolute(FONT_DIR):
+		DirAccess.make_dir_recursive_absolute(FONT_DIR)
+		DirAccess.make_dir_recursive_absolute(CURSOR_DIR)
+	for f in DirAccess.get_files_at(FONT_DIR):
+		if f.get_extension().to_lower() in FONT_EXTS:
+			_fonts.append(f)
+
+## Swaps the theme's default font. Everything in the program draws with the theme, so a
+## font change needs no per-node work -- and the CJK fallback chain is rebuilt straight
+## after, or Japanese tags would turn into boxes the moment anyone picked a Latin font.
+## sfnt / OTTO / ttcf / true, plus WOFF and WOFF2 for anything hand-dropped in the folder.
+const FONT_MAGIC := [0x00010000, 0x4F54544F, 0x74746366, 0x74727565, 0x774F4646, 0x774F4632]
+const PNG_MAGIC := 0x89504E47
+
+## Big-endian magic number from the head of a file, or -1 if it cannot be read. Four bytes
+## and no error output, which is the whole point -- see load_font_file.
+static func _magic32(path: String) -> int:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if not f:
+		return -1
+	if f.get_length() < 8:
+		f.close()
+		return -1
+	f.big_endian = true
+	var m := f.get_32()
+	f.close()
+	return m
+
+## The ONE place a font file becomes a FontFile, because validating one is not obvious:
+## load_dynamic_font() returns OK for ANY file. FreeType does not look at the data until
+## something asks it to rasterise, so a text file renamed .ttf sails straight through the
+## error code and only fails later -- as console spam, with every glyph silently missing
+## and the whole UI stuck on a font that cannot draw. The sfnt magic is the real test.
+## Returns null for anything that will not render.
+static func load_font_file(path: String) -> FontFile:
+	if not (_magic32(path) in FONT_MAGIC):
+		return null
+	var f := FontFile.new()
+	return f if f.load_dynamic_font(path) == OK else null
+
+static func png_is_valid(path: String) -> bool:
+	return _magic32(path) == PNG_MAGIC
+
+func _apply_font(file_name: String) -> void:
+	_font_name = file_name
+	if file_name.is_empty():
+		theme.default_font = _builtin_font
+	else:
+		var f := load_font_file(FONT_DIR.path_join(file_name))
+		if not f:
+			push_warning("font %s would not load" % file_name)
+			_font_name = ""
+			theme.default_font = _builtin_font
+		else:
+			theme.default_font = f
+	_setup_pixel_font()   # re-attach the fallbacks to whatever is now in place
+	_refresh_font_btn()
+
+func _refresh_font_btn() -> void:
+	if is_instance_valid(_font_btn):
+		_font_btn.text = "PX437 (BUILT-IN)" if _font_name.is_empty() else _font_name.to_upper()
+
+func _cycle_font() -> void:
+	_scan_fonts()
+	var at := _fonts.find(_font_name)
+	_apply_font(_fonts[(at + 1) % _fonts.size()] if at >= 0 else "")
+	_save()
+
+## A PNG in user://cursors wins over the drawn arrow. DisplayServer rather than
+## Input.set_custom_mouse_cursor: it is the call that actually owns the shape, and it
+## takes the image directly, so a user bitmap needs no ImageTexture round trip.
+## "" keeps the documented arrow.png behaviour, so a cursor dropped into the folder by
+## hand still works with nothing selected in the manager.
+func _custom_cursor_image() -> Image:
+	var file := _cursor_name if not _cursor_name.is_empty() else "arrow.png"
+	var path := CURSOR_DIR.path_join(file)
+	if not png_is_valid(path):
+		return null   # missing or not a PNG; the drawn arrow stands in
+	var img := Image.load_from_file(path)
+	if not img:
+		push_warning("cursors/%s would not load" % file)
+		return null
+	return img
+
+
+# --- FONTS / CURSOR manager windows ------------------------------------------
+## Two windows off the VISUAL tab, both the same shape: ADD FILE, a list, a control strip
+## and a status line. ADD FILE COPIES the chosen file into user://fonts or user://cursors
+## rather than remembering where the user browsed to -- _scan_fonts() already reads those
+## directories, the asset survives its original being moved or deleted, and an exported
+## build's res:// cannot be written to at all.
+const CURSOR_EXTS := ["png"]
+const FONT_SIZE_MIN := 8
+const FONT_SIZE_MAX := 28
+const FONT_SIZE_DEFAULT := 16   # matches player.tscn's theme default_font_size
+## Preview cap, and half the ceiling a scaled cursor is clamped to. Windows refuses a
+## cursor bitmap past 256 px, and a pointer anywhere near that is already absurd.
+const ASSET_THUMB_PX := 128
+const CURSOR_SCALE_MIN := 0.5
+const CURSOR_SCALE_MAX := 4.0
+const ASSET_WIN_SIZE := Vector2i(560, 520)
+const ASSET_OK := Color(0.35, 0.95, 0.45)
+const ASSET_ERR := Color(1.0, 0.33, 0.33)
+
+var _font_size := FONT_SIZE_DEFAULT
+var _cursor_name := ""                # file inside CURSOR_DIR; "" is the drawn arrow
+var _cursor_scale := 1.0
+## Stored as a FRACTION of the image rather than in pixels, so moving the size slider
+## does not drag the click point out from under the tip.
+var _cursor_hotspot := Vector2.ZERO
+var _asset_wins := {}                 # title -> Window, so a second press refocuses
+
+## The theme's default size, so every Label, Button and list row follows from one write --
+## the same reason _apply_font swaps theme.default_font instead of walking nodes.
+func _apply_font_size(px: int) -> void:
+	_font_size = clampi(px, FONT_SIZE_MIN, FONT_SIZE_MAX)
+	theme.default_font_size = _font_size
+
+## Long edge capped, aspect preserved. Pure, so the cap rule is checkable without a file.
+static func thumb_size(w: int, h: int, cap: int) -> Vector2i:
+	var long_edge := maxi(w, h)
+	if long_edge <= cap or long_edge <= 0:
+		return Vector2i(maxi(w, 1), maxi(h, 1))
+	var k := float(cap) / float(long_edge)
+	return Vector2i(maxi(int(w * k), 1), maxi(int(h * k), 1))
+
+static func asset_test() -> bool:
+	return thumb_size(32, 32, 128) == Vector2i(32, 32) \
+		and thumb_size(512, 256, 128) == Vector2i(128, 64) \
+		and thumb_size(256, 512, 128) == Vector2i(64, 128) \
+		and thumb_size(4000, 1, 128) == Vector2i(128, 1) \
+		and thumb_size(0, 0, 128) == Vector2i(1, 1)
+
+## Dead centre of the PRIMARY display, not of whatever screen the player happens to sit
+## on: a manager window that opens away on a second monitor reads as not having opened.
+func _centre_on_primary(win: Window) -> void:
+	var s := DisplayServer.get_primary_screen()
+	var usable := DisplayServer.screen_get_usable_rect(s)
+	win.current_screen = s
+	# a headless or otherwise degenerate screen reports a zero rect, and centring against
+	# it would place the window at negative coordinates, i.e. nowhere the user can reach
+	if usable.size.x <= 0 or usable.size.y <= 0:
+		return
+	win.size = Vector2i(mini(win.size.x, maxi(usable.size.x - 40, 320)),
+		mini(win.size.y, maxi(usable.size.y - 60, 240)))
+	win.position = usable.position + (usable.size - win.size) / 2
+
+## A second press brings the open window forward instead of stacking a duplicate.
+func _refocus_asset(title: String) -> bool:
+	var win: Window = _asset_wins.get(title)
+	if is_instance_valid(win):
+		win.grab_focus()
+		return true
+	_asset_wins.erase(title)   # it was closed; the stale key would block reopening
+	return false
+
+func _asset_status(label: Label, ok: bool, what: String) -> void:
+	label.text = "SUCCESSFULLY ADDED %s" % what if ok else "ERROR: CHECK FILE"
+	label.add_theme_color_override("font_color", ASSET_OK if ok else ASSET_ERR)
+
+## Validated BEFORE the copy, so an unreadable file never lands in the directory and never
+## has to be swept back out. Returns the installed file name, or "" on any failure at all
+## -- every caller turns that one empty string into the red status line.
+func _install_asset(src: String, dir: String, exts: Array, as_font: bool) -> String:
+	if src.is_empty() or not (src.get_extension().to_lower() in exts):
+		return ""
+	if not FileAccess.file_exists(src):
+		return ""
+	# magic-checked rather than handed straight to the loader: a bad file is a normal
+	# thing for a user to pick, and it should turn into a red status line, not four lines
+	# of engine error in the console
+	if as_font:
+		if load_font_file(src) == null:
+			return ""
+	elif not png_is_valid(src) or Image.load_from_file(src) == null:
+		return ""
+	var bytes := FileAccess.get_file_as_bytes(src)
+	if bytes.is_empty():
+		return ""
+	if not DirAccess.dir_exists_absolute(dir):
+		DirAccess.make_dir_recursive_absolute(dir)
+	var out := FileAccess.open(dir.path_join(src.get_file()), FileAccess.WRITE)
+	if not out:
+		return ""
+	out.store_buffer(bytes)
+	out.close()
+	return src.get_file()
+
+## Shared chassis. Both managers are the same window, so the frame is built once here and
+## each one fills in its own list and control strip.
+## Returns {window, list, controls, status, dialog}.
+func _asset_window(title: String, filters: PackedStringArray) -> Dictionary:
+	var win := Window.new()
+	win.name = "Mgr%s" % title
+	win.title = "SOUNDSCAPE // %s" % title
+	win.transient = false     # independent: it can live on another monitor
+	win.exclusive = false     # and must not block the player while it is open
+	win.theme = theme         # font + every stylebox, and Skins repaints it for free
+	win.size = ASSET_WIN_SIZE
+	win.min_size = Vector2i(420, 360)
+	add_child(win)
+	_asset_wins[title] = win
+	win.close_requested.connect(func() -> void:
+		_asset_wins.erase(title)
+		win.queue_free())
+
+	var chassis := PanelContainer.new()
+	chassis.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var root_sb: StyleBox = get("theme_override_styles/panel")
+	if root_sb:
+		chassis.add_theme_stylebox_override("panel", root_sb)
+	win.add_child(chassis)
+	var pad := MarginContainer.new()
+	for side in ["left", "top", "right", "bottom"]:
+		pad.add_theme_constant_override("margin_" + side, 10)
+	chassis.add_child(pad)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 6)
+	pad.add_child(col)
+
+	var head := Label.new()
+	head.text = "[ %s ]" % title
+	head.theme_type_variation = &"Green"
+	col.add_child(head)
+
+	# native picker, like the FOLDERS dialog -- and a child of this window, so closing the
+	# manager takes its dialog down with it rather than leaving one orphaned.
+	# No filters means the manager has nothing to load from disk (the gradient editor), so
+	# it gets neither the row nor the dialog rather than a button that cannot do anything.
+	var fd: FileDialog = null
+	if not filters.is_empty():
+		fd = FileDialog.new()
+		fd.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+		fd.access = FileDialog.ACCESS_FILESYSTEM
+		fd.use_native_dialog = true
+		fd.filters = filters
+		win.add_child(fd)
+		var add := Button.new()
+		add.text = "ADD FILE"
+		add.pressed.connect(func() -> void: fd.popup_centered(Vector2i(760, 520)))
+		col.add_child(add)
+
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	col.add_child(scroll)
+	var list := VBoxContainer.new()
+	list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	list.add_theme_constant_override("separation", 2)
+	scroll.add_child(list)
+
+	var controls := VBoxContainer.new()
+	controls.add_theme_constant_override("separation", 4)
+	col.add_child(controls)
+
+	var status := Label.new()
+	status.clip_text = true
+	status.theme_type_variation = &"Green"
+	col.add_child(status)
+
+	_centre_on_primary(win)
+	win.show()
+	return {"window": win, "list": list, "controls": controls, "status": status, "dialog": fd}
+
+## A labelled drag bar -- the same ProgressBar + _bar_drag control the crossfader and every
+## FX fader use, rather than an HSlider the theme has no styles for and which would be the
+## one widget in the program that did not match.
+##
+## `on_change` is handed the readout Label as an argument rather than capturing it: a
+## GDScript lambda captures by VALUE at creation, so a label assigned from this function's
+## return value would still be null inside the closure.
+func _asset_slider(parent: Control, caption: String, value: float, on_change: Callable) -> Label:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+	parent.add_child(row)
+	var cap := Label.new()
+	cap.text = caption
+	cap.custom_minimum_size.x = 108
+	row.add_child(cap)
+	var bar := ProgressBar.new()
+	bar.show_percentage = false
+	bar.custom_minimum_size = Vector2(140, 14)
+	bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	bar.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	bar.value = clampf(value, 0.0, 1.0) * 100.0
+	row.add_child(bar)
+	var read := Label.new()
+	read.custom_minimum_size.x = 64
+	row.add_child(read)
+	bar.gui_input.connect(func(e: InputEvent) -> void:
+		if not _bar_drag(e, bar):
+			return
+		var t := _ratio_at(e.position.x, bar.size.x)
+		bar.value = t * 100.0
+		on_change.call(t, read))
+	return read
+
+# --- FONTS -------------------------------------------------------------------
+func _open_fonts_window() -> void:
+	if _refocus_asset("FONTS"):
+		return
+	var w := _asset_window("FONTS", PackedStringArray(["*.ttf,*.otf ; FONT FILES"]))
+	var status: Label = w["status"]
+	var list: Control = w["list"]
+	_fill_font_list(list, status)
+	(w["dialog"] as FileDialog).file_selected.connect(func(path: String) -> void:
+		var added := _install_asset(path, FONT_DIR, FONT_EXTS, true)
+		_asset_status(status, not added.is_empty(), "FONT")
+		if not added.is_empty():
+			_apply_font(added)
+			_save()
+		_fill_font_list(list, status))
+	var read := _asset_slider(w["controls"], "FONT SIZE",
+		float(_font_size - FONT_SIZE_MIN) / float(FONT_SIZE_MAX - FONT_SIZE_MIN),
+		func(t: float, label: Label) -> void:
+			_apply_font_size(FONT_SIZE_MIN + int(roundf(t * float(FONT_SIZE_MAX - FONT_SIZE_MIN))))
+			label.text = "%d PX" % _font_size
+			_save_soon())
+	read.text = "%d PX" % _font_size
+
+## One Button per font, each drawn IN that font. ItemList has no per-item font in Godot 4
+## -- there is no set_item_font -- so the list is Buttons in a VBox, which are themed,
+## clickable, and take a font override each.
+func _fill_font_list(list: Control, status: Label) -> void:
+	for c in list.get_children():
+		c.queue_free()
+	_scan_fonts()
+	for font_name in _fonts:
+		var b := Button.new()
+		b.alignment = HORIZONTAL_ALIGNMENT_LEFT
+		b.toggle_mode = true
+		b.button_pressed = font_name == _font_name
+		if font_name.is_empty():
+			b.text = "PX437 (BUILT-IN)"
+		else:
+			b.text = font_name
+			var f := load_font_file(FONT_DIR.path_join(font_name))
+			if f:
+				b.add_theme_font_override("font", f)
+			else:
+				# left visible rather than hidden: a font that will not load is something
+				# the user put there on purpose, and silently omitting it reads as the
+				# ADD having failed
+				b.text = "%s  (UNREADABLE)" % font_name
+				b.disabled = true
+		list.add_child(b)
+		b.pressed.connect(func() -> void:
+			_apply_font(font_name)
+			# _apply_font resets _font_name to "" when the load fails, so this comparison
+			# IS the success test -- no second attempt at reading the file
+			_asset_status(status, _font_name == font_name, "FONT")
+			_save()
+			_fill_font_list(list, status))
+
+# --- CURSOR ------------------------------------------------------------------
+func _open_cursor_window() -> void:
+	if _refocus_asset("CURSOR"):
+		return
+	var w := _asset_window("CURSOR", PackedStringArray(["*.png ; CURSOR IMAGES"]))
+	var status: Label = w["status"]
+	var list: Control = w["list"]
+	_fill_cursor_list(list, status)
+	(w["dialog"] as FileDialog).file_selected.connect(func(path: String) -> void:
+		var added := _install_asset(path, CURSOR_DIR, CURSOR_EXTS, false)
+		_asset_status(status, not added.is_empty(), "CURSOR")
+		if not added.is_empty():
+			_cursor_name = added
+			_setup_cursor()
+			_save()
+		_fill_cursor_list(list, status))
+	var size_read := _asset_slider(w["controls"], "CURSOR SIZE",
+		(_cursor_scale - CURSOR_SCALE_MIN) / (CURSOR_SCALE_MAX - CURSOR_SCALE_MIN),
+		func(t: float, label: Label) -> void:
+			_cursor_scale = lerpf(CURSOR_SCALE_MIN, CURSOR_SCALE_MAX, t)
+			label.text = "%.2fx" % _cursor_scale
+			_setup_cursor()
+			_save_soon())
+	size_read.text = "%.2fx" % _cursor_scale
+	var hx := _asset_slider(w["controls"], "HOTSPOT X", _cursor_hotspot.x,
+		func(t: float, label: Label) -> void:
+			_cursor_hotspot.x = t
+			label.text = "%d%%" % int(t * 100.0)
+			_setup_cursor()
+			_save_soon())
+	hx.text = "%d%%" % int(_cursor_hotspot.x * 100.0)
+	var hy := _asset_slider(w["controls"], "HOTSPOT Y", _cursor_hotspot.y,
+		func(t: float, label: Label) -> void:
+			_cursor_hotspot.y = t
+			label.text = "%d%%" % int(t * 100.0)
+			_setup_cursor()
+			_save_soon())
+	hy.text = "%d%%" % int(_cursor_hotspot.y * 100.0)
+
+func _fill_cursor_list(list: Control, status: Label) -> void:
+	for c in list.get_children():
+		c.queue_free()
+	var names: Array[String] = [""]
+	if not DirAccess.dir_exists_absolute(CURSOR_DIR):
+		DirAccess.make_dir_recursive_absolute(CURSOR_DIR)
+	for f in DirAccess.get_files_at(CURSOR_DIR):
+		if f.get_extension().to_lower() in CURSOR_EXTS:
+			names.append(f)
+	for cur_name in names:
+		var b := Button.new()
+		b.alignment = HORIZONTAL_ALIGNMENT_LEFT
+		b.toggle_mode = true
+		b.button_pressed = cur_name == _cursor_name
+		if cur_name.is_empty():
+			b.text = "BUILT-IN ARROW"
+		else:
+			b.text = cur_name
+			var tex := _thumb(CURSOR_DIR.path_join(cur_name))
+			if tex:
+				b.icon = tex
+			else:
+				b.text = "%s  (UNREADABLE)" % cur_name
+				b.disabled = true
+		list.add_child(b)
+		b.pressed.connect(func() -> void:
+			_cursor_name = cur_name
+			_setup_cursor()
+			# the built-in arrow is always a valid choice, so only a named file can fail
+			_asset_status(status, cur_name.is_empty()
+				or _custom_cursor_image() != null, "CURSOR")
+			_save()
+			_fill_cursor_list(list, status))
+
+## Preview capped at ASSET_THUMB_PX on the long edge. A cursor PNG is usually tiny, but
+## nothing stops someone adding a 4K image, and a button icon at that size would push the
+## window off the screen.
+func _thumb(path: String) -> ImageTexture:
+	if not png_is_valid(path):
+		return null
+	var img := Image.load_from_file(path)
+	if not img or img.is_empty():
+		return null
+	var want := thumb_size(img.get_width(), img.get_height(), ASSET_THUMB_PX)
+	if want != Vector2i(img.get_width(), img.get_height()):
+		img.resize(want.x, want.y, Image.INTERPOLATE_NEAREST)
+	return ImageTexture.create_from_image(img)
+
+
+# --- gradients ---------------------------------------------------------------
+## User colour gradients for the visualizer, stored in library.cfg as hex lists:
+##
+##   [visual]
+##   user_grad_1="000000,ff0055,00ffcc,ffffff"
+##
+## That string is also exactly what COPY and PASTE move through the clipboard, so a
+## gradient can be shared by pasting one line into a chat window. Parsing and sampling
+## live in visualizer.gd, which is the thing that has to draw them.
+const GRAD_MAX := 12          # swatch row is one line; past this it wraps and reads as noise
+const GRAD_STOPS_MAX := 8
+var _gradients: Array = []    # Array[PackedColorArray]
+
+func _grad_key(i: int) -> String:
+	return "user_grad_%d" % (i + 1)
+
+## 32x1 strip stretched across the swatch, the same trick _rainbow_swatch uses -- a
+## StyleBoxFlat holds one colour, so anything with more than one has to be a texture.
+func _gradient_swatch(stops: PackedColorArray) -> StyleBoxTexture:
+	var img := Image.create(32, 1, false, Image.FORMAT_RGBA8)
+	for x in 32:
+		img.set_pixel(x, 0, _viz.sample(stops, float(x) / 31.0))
+	var sb := StyleBoxTexture.new()
+	sb.texture = ImageTexture.create_from_image(img)
+	return sb
+
+## Swatches for the VISUAL tab: the fixed presets, the rainbow, then one per gradient.
+## Rebuilt wholesale rather than patched, because adding or deleting a gradient renumbers
+## every slot after it and color_index is a position in this row.
+func _rebuild_color_row() -> void:
+	for c in %ColorRow.get_children():
+		# removed as well as freed: queue_free alone leaves the old swatches in the child
+		# list until the end of the frame, and color_index IS a position in this row
+		%ColorRow.remove_child(c)
+		c.queue_free()
+	_viz.gradients = _gradients
+	var fixed: int = _viz.PRESETS.size()
+	for i in fixed + 1 + _gradients.size():
+		var b := Button.new()
+		b.custom_minimum_size = Vector2(0, 18)
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		var sb: StyleBox
+		if i < fixed:
+			var flat := StyleBoxFlat.new()
+			flat.bg_color = _viz.PRESETS[i]
+			flat.border_color = Color(0, 0, 0)
+			flat.set_border_width_all(1)
+			sb = flat
+		elif i == fixed:
+			sb = _rainbow_swatch()
+		else:
+			sb = _gradient_swatch(_gradients[i - fixed - 1])
+		b.add_theme_stylebox_override("normal", sb)
+		b.add_theme_stylebox_override("hover", sb)
+		b.add_theme_stylebox_override("pressed", sb)
+		b.pressed.connect(func() -> void:
+			_viz.color_index = i
+			_save())
+		%ColorRow.add_child(b)
+
+func _open_gradient_window() -> void:
+	if _refocus_asset("GRADIENT"):
+		return
+	# no filters: this manager has nothing to load from disk, so _asset_window skips the
+	# ADD FILE row and its dialog entirely
+	var w := _asset_window("GRADIENT", PackedStringArray())
+	var status: Label = w["status"]
+	var list: Control = w["list"]
+	var controls: Control = w["controls"]
+
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+	controls.add_child(row)
+	for spec in [["NEW", "new"], ["COPY", "copy"], ["PASTE", "paste"], ["DELETE", "del"]]:
+		var b := Button.new()
+		b.text = spec[0]
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		var what: String = spec[1]
+		b.pressed.connect(func() -> void: _gradient_action(what, list, status))
+		row.add_child(b)
+	_hover_note(row, func() -> String:
+		return "COPY / PASTE MOVE A GRADIENT AS ONE HEX LINE VIA THE CLIPBOARD")
+	_fill_gradient_list(list, status)
+
+## The four buttons, kept in one place so adding a fifth is one entry in the table above
+## rather than another closure wired at construction time.
+func _gradient_action(what: String, list: Control, status: Label) -> void:
+	var sel: int = _viz.gradient_index()
+	match what:
+		"new":
+			if _gradients.size() >= GRAD_MAX:
+				_grad_status(status, false, "LIMIT %d GRADIENTS" % GRAD_MAX)
+				return
+			_gradients.append(_viz.parse_hex_list("000000,ff0055,00ffcc,ffffff"))
+			_viz.color_index = _viz.PRESETS.size() + _gradients.size()
+			_grad_status(status, true, "NEW GRADIENT")
+		"copy":
+			if sel < 0 or sel >= _gradients.size():
+				_grad_status(status, false, "SELECT A GRADIENT FIRST")
+				return
+			DisplayServer.clipboard_set(_viz.to_hex_list(_gradients[sel]))
+			_grad_status(status, true, "COPIED TO CLIPBOARD")
+		"paste":
+			var stops: PackedColorArray = _viz.parse_hex_list(DisplayServer.clipboard_get())
+			# a clipboard holding a URL or a sentence parses to nothing, and that is the
+			# case worth reporting -- silently creating an empty gradient reads as a crash
+			if stops.size() < 2:
+				_grad_status(status, false, "CLIPBOARD HAS NO HEX LIST")
+				return
+			if _gradients.size() >= GRAD_MAX:
+				_grad_status(status, false, "LIMIT %d GRADIENTS" % GRAD_MAX)
+				return
+			_gradients.append(stops)
+			_viz.color_index = _viz.PRESETS.size() + _gradients.size()
+			_grad_status(status, true, "PASTED %d STOPS" % stops.size())
+		"del":
+			if sel < 0 or sel >= _gradients.size():
+				_grad_status(status, false, "SELECT A GRADIENT FIRST")
+				return
+			_gradients.remove_at(sel)
+			# the deleted slot took every later index down with it, so fall back to the
+			# rainbow rather than leaving color_index pointing past the end
+			_viz.color_index = _viz.PRESETS.size()
+			_grad_status(status, true, "DELETED")
+	_after_gradient_change(list, status)
+
+func _grad_status(label: Label, ok: bool, msg: String) -> void:
+	label.text = msg
+	label.add_theme_color_override("font_color", ASSET_OK if ok else ASSET_ERR)
+
+func _after_gradient_change(list: Control, status: Label) -> void:
+	_viz.gradients = _gradients
+	_rebuild_color_row()
+	_fill_gradient_list(list, status)
+	_viz.queue_redraw()
+	_save()
+
+## One row per gradient: the swatch, its hex string, and a ColorPickerButton per stop.
+## ColorPickerButton rather than a hand-rolled picker -- it is the engine's own control,
+## it already themes, and a custom one would be a colour wheel to maintain for no gain.
+func _fill_gradient_list(list: Control, status: Label) -> void:
+	for c in list.get_children():
+		c.queue_free()
+	if _gradients.is_empty():
+		var empty := Label.new()
+		empty.text = "NO GRADIENTS YET  //  PRESS NEW, OR PASTE A HEX LIST"
+		list.add_child(empty)
+		return
+	for gi in _gradients.size():
+		var stops: PackedColorArray = _gradients[gi]
+		var box := VBoxContainer.new()
+		box.add_theme_constant_override("separation", 2)
+		list.add_child(box)
+
+		var head := HBoxContainer.new()
+		head.add_theme_constant_override("separation", 6)
+		box.add_child(head)
+		var pick := Button.new()
+		pick.toggle_mode = true
+		pick.button_pressed = _viz.gradient_index() == gi
+		pick.custom_minimum_size = Vector2(90, 18)
+		var sb := _gradient_swatch(stops)
+		for st in ["normal", "hover", "pressed"]:
+			pick.add_theme_stylebox_override(st, sb)
+		pick.pressed.connect(func() -> void:
+			_viz.color_index = _viz.PRESETS.size() + 1 + gi
+			_grad_status(status, true, "GRADIENT %d SELECTED" % (gi + 1))
+			_after_gradient_change(list, status))
+		head.add_child(pick)
+		var hexes := Label.new()
+		hexes.text = _viz.to_hex_list(stops)
+		hexes.clip_text = true
+		hexes.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		head.add_child(hexes)
+
+		var stop_row := HBoxContainer.new()
+		stop_row.add_theme_constant_override("separation", 3)
+		box.add_child(stop_row)
+		for si in stops.size():
+			var cp := ColorPickerButton.new()
+			cp.custom_minimum_size = Vector2(30, 18)
+			cp.color = stops[si]
+			cp.edit_alpha = false
+			# color_changed fires continuously while the wheel is dragged, so the save is
+			# debounced -- _after_gradient_change would otherwise write library.cfg at
+			# mouse-move rate
+			cp.color_changed.connect(func(c: Color) -> void:
+				var g: PackedColorArray = _gradients[gi]
+				g[si] = c
+				_gradients[gi] = g
+				_viz.gradients = _gradients
+				hexes.text = _viz.to_hex_list(g)
+				for st in ["normal", "hover", "pressed"]:
+					pick.add_theme_stylebox_override(st, _gradient_swatch(g))
+				_viz.queue_redraw()
+				_save_soon())
+			stop_row.add_child(cp)
+		var plus := Button.new()
+		plus.text = "+"
+		plus.disabled = stops.size() >= GRAD_STOPS_MAX
+		plus.pressed.connect(func() -> void:
+			var g: PackedColorArray = _gradients[gi]
+			g.append(g[g.size() - 1])   # duplicate the last stop: a visible, editable start
+			_gradients[gi] = g
+			_after_gradient_change(list, status))
+		stop_row.add_child(plus)
+		var minus := Button.new()
+		minus.text = "-"
+		minus.disabled = stops.size() <= 2   # two is the fewest that is still a gradient
+		minus.pressed.connect(func() -> void:
+			var g: PackedColorArray = _gradients[gi]
+			g.remove_at(g.size() - 1)
+			_gradients[gi] = g
+			_after_gradient_change(list, status))
+		stop_row.add_child(minus)
+
+# --- terminal write-in -------------------------------------------------------
+## Rows type themselves in, top to bottom, when the list is rebuilt wholesale.
+##
+## ONLY the rows actually on screen are touched. A library of several thousand tracks has
+## a few dozen visible rows and the rest are pure cost: every set_item_text on an unseen
+## row is a string allocation and a redraw request for something nobody can see. The
+## visible span is read from the scroll bar, so what "visible" means is whatever the user
+## has actually scrolled to.
+##
+## One Tween drives the whole block rather than one per row: N tweens is N interpolators
+## and N callbacks a frame, where this is one of each regardless of how many rows are up.
+##
+## It runs on a wholesale reload -- a rescan, a re-sort, a playlist change, a tab switch --
+## and deliberately NOT on every _refill(). Search filters the list on each keystroke, and
+## an animation there would restart mid-word on every letter typed.
+const WRITE_IN_SECS := 0.18
+const WRITE_IN_STAGGER := 0.55   # fraction of the run spent starting rows, not filling
+const WRITE_IN_MAX := 96
+
+var _write_tween: Tween
+var _write_rows := PackedInt32Array()
+var _write_full := PackedStringArray()
+
+func _write_in() -> void:
+	if _write_tween and _write_tween.is_valid():
+		_write_tween.kill()
+		_write_restore()
+	if not _tracks.is_visible_in_tree() or _tracks.item_count == 0:
+		return
+	_write_rows.clear()
+	_write_full.clear()
+	var scroll := _tracks.get_v_scroll_bar()
+	var top: float = scroll.value if scroll else 0.0
+	for i in _tracks.item_count:
+		# get_item_rect is in CONTENT coordinates -- measured: item 0 still reports y=2
+		# after scrolling to 200 -- so the scroll offset has to be subtracted here rather
+		# than assumed away
+		var r := _tracks.get_item_rect(i)
+		if not row_visible(r.position.y, r.size.y, top, _tracks.size.y):
+			continue                      # off screen: never touched
+		_write_rows.append(i)
+		_write_full.append(_tracks.get_item_text(i))
+		if _write_rows.size() >= WRITE_IN_MAX:
+			break
+	if _write_rows.is_empty():
+		return
+	for k in _write_rows.size():
+		_tracks.set_item_text(_write_rows[k], "")
+	_write_tween = create_tween()
+	_write_tween.tween_method(_write_step, 0.0, 1.0, WRITE_IN_SECS)
+	_write_tween.tween_callback(_write_restore)
+
+## Does a row at `y` (content space) fall inside the view? Pure, so the one rule the
+## whole optimisation rests on is checkable without a list, a window or a scroll bar.
+static func row_visible(y: float, h: float, scroll: float, view_h: float) -> bool:
+	return y + h >= scroll and y <= scroll + view_h
+
+static func write_in_test() -> bool:
+	return row_visible(0.0, 20.0, 0.0, 800.0) 		and row_visible(795.0, 20.0, 0.0, 800.0) 		and row_visible(-5.0, 20.0, 0.0, 800.0) 		and not row_visible(900.0, 20.0, 0.0, 800.0) 		and not row_visible(100.0, 20.0, 400.0, 800.0) 		and row_visible(1000.0, 20.0, 400.0, 800.0)
+
+## Drops a running write-in WITHOUT restoring it, for the case where the list itself is
+## about to be rebuilt. _write_in() kills-and-restores instead, because there the rows it
+## is holding still exist and still need their text back.
+func _write_cancel() -> void:
+	if _write_tween and _write_tween.is_valid():
+		_write_tween.kill()
+	_write_rows.clear()
+	_write_full.clear()
+
+func _write_step(t: float) -> void:
+	var n := _write_rows.size()
+	for k in n:
+		# the tween indexes a list it does not own, so the bound is re-checked every step
+		# rather than trusted from arming time -- same guard _write_restore already has
+		if _write_rows[k] >= _tracks.item_count:
+			continue
+		# each row starts a little after the one above it, so the block fills downward
+		var start := float(k) / float(n) * WRITE_IN_STAGGER
+		var local := clampf((t - start) / maxf(1.0 - WRITE_IN_STAGGER, 0.01), 0.0, 1.0)
+		var full: String = _write_full[k]
+		_tracks.set_item_text(_write_rows[k], full.substr(0, int(ceilf(full.length() * local))))
+
+## Always runs, tween finished or killed: a row left holding a truncated string would
+## look like the library had lost half its filenames.
+func _write_restore() -> void:
+	for k in _write_rows.size():
+		if _write_rows[k] < _tracks.item_count:
+			_tracks.set_item_text(_write_rows[k], _write_full[k])
+	_write_rows.clear()
+	_write_full.clear()
+
+
+# --- cheat codes and unlocks --------------------------------------------------
+## The last CODE_LEN letter keys.
+##
+## This buffer lives in _unhandled_input, and that IS why typing in SEARCH cannot fire a
+## code: a focused LineEdit consumes the key before _unhandled_input is ever reached, so
+## the buffer never sees it. That is Godot's input routing rather than a guard written
+## here -- which is exactly why code_test() and the headless typing test pin it, because
+## the property is invisible in this file and moving the buffer to _input() would break
+## it silently, mid-search-term.
+const CODE_LEN := 10
+## Matched on the TAIL of the buffer, so a mistyped prefix does not have to be cleared
+## before a correct code will register.
+const LOCAL_CODES := {"SNAKE": "snake", "REDEEM": "redeem"}
+var _keys := ""
+var _unlocked: Array[String] = []
+
+## Pure, so the matcher is testable without a window or a keyboard.
+static func code_tail(buffer: String, ch: String, cap: int) -> String:
+	var s := buffer + ch
+	return s if s.length() <= cap else s.substr(s.length() - cap)
+
+static func code_test() -> bool:
+	var b := ""
+	for ch in "XYSNAKE":
+		b = code_tail(b, ch, CODE_LEN)
+	if not b.ends_with("SNAKE"):
+		return false
+	for i in 50:                      # never grows past the cap, however much is typed
+		b = code_tail(b, "Q", CODE_LEN)
+	return b == "QQQQQQQQQQ" and code_tail("", "A", CODE_LEN) == "A" \
+		and code_tail("SNAK", "E", CODE_LEN).ends_with("SNAKE")
+
+func _push_code_key(ch: String) -> void:
+	_keys = code_tail(_keys, ch, CODE_LEN)
+	for code in LOCAL_CODES:
+		if _keys.ends_with(code):
+			_keys = ""
+			_unlock(str(LOCAL_CODES[code]))
+			return
+
+func _unlock(what: String) -> void:
+	if what == "redeem":
+		_ask("REDEEM CODE", "", func(code: String) -> void: _redeem_code(code), 32)
+		return
+	if not (what in _unlocked):
+		_unlocked.append(what)
+	_apply_unlocks()
+	if what == "snake":
+		_viz.mode = Visualizer.Mode.SNAKE
+		_viz.snake_reset()
+		_note = "  //  SNAKE UNLOCKED"
+	_clear_note_later()
+	_refresh_visual()
+	_save()
+
+func _apply_unlocks() -> void:
+	_viz.snake_unlocked = "snake" in _unlocked
+
+## SNAKE sits one past the end of the normal cycle until it is unlocked, so the VIZ MODE
+## button cannot land on it by accident.
+func _viz_mode_count() -> int:
+	return VIZ_NAMES.size() if _viz.snake_unlocked else VIZ_NAMES.size() - 1
+
+# --- server codes --------------------------------------------------------------
+## DORMANT unless an endpoint is configured. There is no SOUNDSCAPE server: `endpoint`
+## under [secrets] in library.cfg is empty by default and nothing is sent anywhere until
+## it is filled in. That is deliberate rather than unfinished -- redemption posts the
+## user's NAME, and a build that quietly phoned home the first time somebody typed a word
+## would be the wrong default whatever the endpoint eventually turns out to be.
+##
+## WHAT THE TOKEN IS WORTH, plainly: license.dat gates modes that run on THIS machine, and
+## the key below ships inside the binary. It stops a hand-written license.dat and stops
+## the file being copied between users unmodified. It does not stop anybody willing to
+## open the executable, and it should not be read as DRM.
+const LICENSE_PATH := "user://license.dat"
+const LICENSE_KEY := "SOUNDSCAPE-v1-token"
+var _license_endpoint := ""
+var _http: HTTPRequest
+
+func _redeem_code(code: String) -> void:
+	var c := code.strip_edges().to_upper()
+	if c.is_empty():
+		return
+	if _license_endpoint.is_empty():
+		_note = "  //  NO REDEMPTION SERVER CONFIGURED"
+		_clear_note_later()
+		return
+	if not is_instance_valid(_http):
+		_http = HTTPRequest.new()
+		add_child(_http)
+		_http.request_completed.connect(_on_redeem_reply)
+	var body := JSON.stringify({"user_id": _user_name, "code": c})
+	var err := _http.request(_license_endpoint, ["Content-Type: application/json"],
+		HTTPClient.METHOD_POST, body)
+	_note = "  //  REDEEMING..." if err == OK else "  //  REDEEM FAILED: NO CONNECTION"
+	_clear_note_later()
+
+func _on_redeem_reply(_result: int, status: int, _headers: PackedStringArray,
+		body: PackedByteArray) -> void:
+	if status != 200:
+		_note = "  //  CODE REJECTED (HTTP %d)" % status
+		_clear_note_later()
+		return
+	var reply: Variant = JSON.parse_string(body.get_string_from_utf8())
+	var unlocks: Array = reply.get("unlocks", []) if reply is Dictionary else []
+	for u in unlocks:
+		if not (str(u) in _unlocked):
+			_unlocked.append(str(u))
+	_write_license()
+	_apply_unlocks()
+	_note = "  //  UNLOCKED: %s" % ",".join(PackedStringArray(_unlocked)).to_upper()
+	_clear_note_later()
+	_refresh_visual()
+	_save()
+
+## "<user>|<unlocks>|<signature>". SIGNED rather than encrypted, and the distinction is
+## the point: the job is to detect a file that was edited or carried over from another
+## machine, which a signature does in one line -- where a cipher would only hide the same
+## text behind a key that ships in the same binary.
+func _write_license() -> void:
+	var payload := "%s|%s" % [_user_name, ",".join(PackedStringArray(_unlocked))]
+	var f := FileAccess.open(LICENSE_PATH, FileAccess.WRITE)
+	if not f:
+		push_warning("could not write %s" % LICENSE_PATH)
+		return
+	f.store_line("%s|%s" % [payload, license_sig(payload)])
+	f.close()
+
+static func license_sig(payload: String) -> String:
+	return Marshalls.raw_to_base64(Crypto.new().hmac_digest(HashingContext.HASH_SHA256,
+		LICENSE_KEY.to_utf8_buffer(), payload.to_utf8_buffer()))
+
+## The unlocks the file legitimately carries. A missing, edited, unsigned or foreign file
+## reads as no unlocks rather than as an error -- there is nothing the user can do about a
+## bad license.dat except redeem again, so it is not worth a dialog.
+func _read_license() -> Array[String]:
+	var out: Array[String] = []
+	if not FileAccess.file_exists(LICENSE_PATH):
+		return out
+	var line := FileAccess.get_file_as_string(LICENSE_PATH).strip_edges()
+	var cut := line.rfind("|")
+	if cut <= 0:
+		return out
+	var payload := line.substr(0, cut)
+	if license_sig(payload) != line.substr(cut + 1):
+		push_warning("license.dat failed its signature check; ignoring it")
+		return out
+	var parts := payload.split("|")
+	if parts.size() < 2 or parts[0] != _user_name:
+		return out       # correctly signed, but issued to somebody else
+	for u in parts[1].split(",", false):
+		out.append(u)
+	return out
+
+static func license_test() -> bool:
+	var p := "gavin|snake"
+	var sig := license_sig(p)
+	return not sig.is_empty() and sig == license_sig(p) \
+		and sig != license_sig(p + "x") \
+		and sig != license_sig("someone|snake")
+
+
+# --- TRACKS B: deck B's setlist -------------------------------------------------
+## Deck B gets a SETLIST, not a second library browser. The TRACKS tab already owns
+## scanning, sorting, searching and playlists; forking all of that would be two of
+## everything to keep in step forever. This is a curated running order you push tracks
+## into from the TRACKS right-click menu, which is what a second deck is actually for.
+##
+## Stored as PATHS, so it survives a rescan and a re-sort -- the same reason
+## AudioEngine.set_queue re-anchors on a path rather than on an integer index.
+##
+## It is a plain child of %Tabs, which is all a tab is here, so tear-off and re-dock work
+## through _tab_home_indices with nothing added: the slot registry is keyed by the panel
+## Control and does not care that this one was built in code.
+var _setlist_b: Array[String] = []
+var _setlist_ui: ItemList
+var _setlist_count: Label
+
+func _setup_setlist_b() -> void:
+	var col := VBoxContainer.new()
+	col.name = "TRACKS B"          # TabContainer takes the tab title from the node name
+	col.add_theme_constant_override("separation", 4)
+	_tabs.add_child(col)
+
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 4)
+	col.add_child(row)
+	for spec in [["PLAY", "play"], ["UP", "up"], ["DOWN", "down"],
+			["REMOVE", "remove"], ["CLEAR", "clear"]]:
+		var b := Button.new()
+		b.text = spec[0]
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		var what: String = spec[1]
+		b.pressed.connect(func() -> void: _setlist_action(what))
+		row.add_child(b)
+
+	_setlist_ui = ItemList.new()
+	_setlist_ui.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_setlist_ui.allow_reselect = true
+	_setlist_ui.item_activated.connect(_play_setlist)
+	col.add_child(_setlist_ui)
+
+	_setlist_count = Label.new()
+	col.add_child(_setlist_count)
+	_hover_note(_setlist_ui, func() -> String:
+		return "DECK B SETLIST  //  DOUBLE-CLICK PLAYS ON DECK B  //  ADD FROM TRACKS RMB")
+	_refresh_setlist()
+
+func _refresh_setlist() -> void:
+	if not is_instance_valid(_setlist_ui):
+		return
+	var keep := _setlist_ui.get_selected_items()
+	_setlist_ui.clear()
+	for i in _setlist_b.size():
+		var p: String = _setlist_b[i]
+		var m := _engine.cached_meta(p)
+		# cached_meta NEVER probes -- an ffprobe spawn per row would turn building this
+		# list into a multi-second stall, exactly as it would in the TRACKS tab
+		var who: String = str(m.get("artist", ""))
+		var title: String = str(m.get("title", "")) if m.has("title") else p.get_file().get_basename()
+		_setlist_ui.add_item("%02d  %s" % [i + 1,
+			"%s - %s" % [who, title] if not who.is_empty() else title])
+	for k in keep:
+		if k < _setlist_ui.item_count:
+			_setlist_ui.select(k)
+	_setlist_count.text = "%d TRACK%s" % [_setlist_b.size(), "" if _setlist_b.size() == 1 else "S"]
+
+func _setlist_sel() -> int:
+	if not is_instance_valid(_setlist_ui):
+		return -1
+	var sel := _setlist_ui.get_selected_items()
+	return sel[0] if sel.size() > 0 else -1
+
+## Pure, so the reorder rules are checkable without a list widget. Returns the new index
+## of the moved row, or the original when the move is not legal.
+static func setlist_move(list: Array[String], from: int, delta: int) -> int:
+	if from < 0 or from >= list.size():
+		return from
+	var to := from + delta
+	if to < 0 or to >= list.size():
+		return from          # already at an end: a no-op, not a wrap
+	var p: String = list[from]
+	list.remove_at(from)
+	list.insert(to, p)
+	return to
+
+static func setlist_test() -> bool:
+	var l: Array[String] = ["a", "b", "c"]
+	if setlist_move(l, 0, 1) != 1 or l != ["b", "a", "c"]:
+		return false
+	if setlist_move(l, 0, -1) != 0 or l != ["b", "a", "c"]:   # top edge holds
+		return false
+	if setlist_move(l, 2, 1) != 2 or l != ["b", "a", "c"]:    # bottom edge holds
+		return false
+	if setlist_move(l, -1, 1) != -1 or setlist_move(l, 9, -1) != 9:
+		return false
+	return setlist_move(l, 2, -1) == 1 and l == ["b", "c", "a"]
+
+func _setlist_action(what: String) -> void:
+	var i := _setlist_sel()
+	match what:
+		"play":
+			_play_setlist(i)
+			return
+		"up", "down":
+			var to := setlist_move(_setlist_b, i, -1 if what == "up" else 1)
+			_refresh_setlist()
+			if to >= 0 and to < _setlist_ui.item_count:
+				_setlist_ui.select(to)
+		"remove":
+			if i < 0 or i >= _setlist_b.size():
+				return
+			_setlist_b.remove_at(i)
+			_refresh_setlist()
+		"clear":
+			_setlist_b.clear()
+			_refresh_setlist()
+	_save()
+
+func _add_to_setlist(path: String) -> void:
+	if path.is_empty() or path in _setlist_b:
+		_note = "  //  ALREADY IN DECK B SETLIST"
+		_clear_note_later()
+		return
+	_setlist_b.append(path)
+	_refresh_setlist()
+	_note = "  //  ADDED TO DECK B: %s" % path.get_file()
+	_clear_note_later()
+	_save()
+
+## Loads into deck B whatever deck is currently selected -- this list belongs to B, and
+## having it hijack deck A because that happened to be live would be the surprise.
+##
+## The switch comes FIRST: _bind_deck re-runs _refill(), which hands the visible library
+## list to the engine as the queue, so setting the setlist before switching would have it
+## overwritten a moment later.
+func _play_setlist(i: int) -> void:
+	if i < 0 or i >= _setlist_b.size():
+		return
+	if _engine.deck != 1:
+		_switch_deck(1)
+	_engine.set_queue(_setlist_b, "")
+	_open(i)

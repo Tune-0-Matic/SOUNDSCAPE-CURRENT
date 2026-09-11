@@ -1,0 +1,1510 @@
+<title>SOUNDSCAPE System Teardown</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@400;500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&display=swap">
+<style>
+:root{
+  --paper:#f3f4f2;
+  --raise:#ffffff;
+  --sunk:#e9ebe7;
+  --ink:#15191a;
+  --ink-soft:#4d5457;
+  --ink-faint:#7b8285;
+  --rule:#d6d8d3;
+  --rule-hard:#b9bcb6;
+  --accent:#9a5b0a;
+  --accent-bg:#f5ead9;
+  --data:#1f5f68;
+  --data-bg:#e2eeef;
+  --trap:#8f2f18;
+  --trap-bg:#f7e6e1;
+
+  --serif:"IBM Plex Serif",Georgia,"Times New Roman",serif;
+  --cond:"IBM Plex Sans Condensed","Helvetica Neue",Arial,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;
+
+  --measure:68ch;
+  --rail:214px;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --paper:#0f1413;
+    --raise:#161c1a;
+    --sunk:#131917;
+    --ink:#dee3e0;
+    --ink-soft:#9ba4a1;
+    --ink-faint:#6d7774;
+    --rule:#26302d;
+    --rule-hard:#3a4642;
+    --accent:#e8a33d;
+    --accent-bg:#241c10;
+    --data:#6fc7c4;
+    --data-bg:#10201f;
+    --trap:#e3805f;
+    --trap-bg:#241512;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0f1413;
+  --raise:#161c1a;
+  --sunk:#131917;
+  --ink:#dee3e0;
+  --ink-soft:#9ba4a1;
+  --ink-faint:#6d7774;
+  --rule:#26302d;
+  --rule-hard:#3a4642;
+  --accent:#e8a33d;
+  --accent-bg:#241c10;
+  --data:#6fc7c4;
+  --data-bg:#10201f;
+  --trap:#e3805f;
+  --trap-bg:#241512;
+}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;
+  background:var(--paper);
+  color:var(--ink);
+  font-family:var(--serif);
+  font-size:16.5px;
+  line-height:1.62;
+  font-feature-settings:"kern" 1;
+}
+
+/* ---------- masthead ---------- */
+.masthead{
+  border-bottom:1px solid var(--rule-hard);
+  background:var(--raise);
+}
+.masthead-in{
+  max-width:1180px;margin:0 auto;padding:34px 28px 26px;
+  display:flex;flex-wrap:wrap;gap:26px 44px;align-items:flex-end;justify-content:space-between;
+}
+.brand{max-width:640px}
+.eyebrow{
+  font-family:var(--cond);font-weight:600;font-size:11.5px;letter-spacing:.20em;
+  text-transform:uppercase;color:var(--accent);margin:0 0 10px;
+}
+h1{
+  font-family:var(--cond);font-weight:700;font-size:clamp(34px,6vw,58px);
+  line-height:1.0;letter-spacing:-.015em;margin:0;text-wrap:balance;
+}
+h1 .sub{display:block;font-weight:400;font-size:.42em;letter-spacing:.06em;color:var(--ink-soft);margin-top:12px}
+.deck{
+  font-size:15px;color:var(--ink-soft);margin:16px 0 0;max-width:60ch;
+}
+.colophon{
+  font-family:var(--mono);font-size:11.5px;line-height:1.9;color:var(--ink-faint);
+  border-left:2px solid var(--accent);padding-left:14px;
+}
+.colophon b{color:var(--ink);font-weight:500}
+
+/* ---------- shell ---------- */
+.shell{
+  max-width:1180px;margin:0 auto;padding:0 28px 96px;
+  display:grid;grid-template-columns:var(--rail) minmax(0,1fr);gap:0 48px;align-items:start;
+}
+.rail{
+  position:sticky;top:0;padding:38px 0 0;
+  font-family:var(--cond);font-size:13px;
+}
+.rail-title{
+  font-size:10.5px;font-weight:600;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--ink-faint);padding-bottom:10px;border-bottom:1px solid var(--rule);margin-bottom:4px;
+}
+.rail ol{list-style:none;margin:0;padding:0;counter-reset:sec}
+.rail li{counter-increment:sec;border-bottom:1px solid var(--rule)}
+.rail a{
+  display:flex;gap:10px;padding:9px 2px;color:var(--ink-soft);text-decoration:none;line-height:1.3;
+}
+.rail a::before{
+  content:counter(sec,decimal-leading-zero);
+  font-family:var(--mono);font-size:10.5px;color:var(--accent);padding-top:2px;flex:none;
+}
+.rail a:hover{color:var(--accent)}
+.rail a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.rail .foot{
+  margin-top:18px;font-family:var(--mono);font-size:10.5px;line-height:1.8;color:var(--ink-faint);
+}
+
+main{padding-top:38px;min-width:0}
+
+/* ---------- sections ---------- */
+section{padding-top:26px;margin-bottom:56px;scroll-margin-top:14px}
+h2{
+  font-family:var(--cond);font-weight:700;font-size:clamp(24px,3.2vw,34px);line-height:1.08;
+  letter-spacing:-.01em;margin:0 0 22px;padding-bottom:14px;
+  border-bottom:3px double var(--rule-hard);text-wrap:balance;
+}
+h2 .num{
+  font-family:var(--mono);font-size:.46em;font-weight:500;color:var(--accent);
+  display:block;letter-spacing:.14em;margin-bottom:9px;
+}
+h3{
+  font-family:var(--cond);font-weight:600;font-size:20px;line-height:1.2;
+  margin:38px 0 12px;letter-spacing:-.005em;text-wrap:balance;
+}
+h4{
+  font-family:var(--cond);font-weight:600;font-size:12px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--accent);margin:30px 0 10px;
+}
+p,ul,ol{max-width:var(--measure)}
+p{margin:0 0 15px}
+ul,ol{margin:0 0 16px;padding-left:1.25em}
+li{margin-bottom:7px}
+li::marker{color:var(--accent)}
+strong{font-weight:600}
+em{font-style:italic}
+a{color:var(--accent)}
+
+code{
+  font-family:var(--mono);font-size:.855em;background:var(--sunk);
+  padding:.12em .36em;border-radius:2px;color:var(--ink);
+}
+pre{
+  font-family:var(--mono);font-size:12.5px;line-height:1.62;
+  background:var(--sunk);border:1px solid var(--rule);border-left:3px solid var(--accent);
+  padding:15px 17px;margin:0 0 20px;overflow-x:auto;
+}
+pre code{background:none;padding:0;font-size:inherit}
+
+/* ---------- tables ---------- */
+.tw{overflow-x:auto;margin:0 0 24px;border:1px solid var(--rule);background:var(--raise)}
+table{border-collapse:collapse;width:100%;font-family:var(--cond);font-size:13.5px;line-height:1.45}
+caption{
+  caption-side:top;text-align:left;font-family:var(--cond);font-weight:600;font-size:11px;
+  letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint);
+  padding:11px 14px;border-bottom:1px solid var(--rule);background:var(--sunk);
+}
+th,td{padding:8px 14px;text-align:left;vertical-align:top;border-bottom:1px solid var(--rule)}
+thead th{
+  font-weight:600;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--ink-faint);background:var(--sunk);border-bottom:1px solid var(--rule-hard);
+  white-space:nowrap;
+}
+tbody tr:last-child td{border-bottom:none}
+td code,th code{font-size:12px;background:none;padding:0}
+.num-col{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+th.num-col{text-align:right}
+td:first-child{font-weight:500}
+.mono td:first-child,.mono th:first-child{font-family:var(--mono);font-size:12px;font-weight:400}
+
+/* ---------- spec plate ---------- */
+.plate{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));
+  gap:1px;background:var(--rule);border:1px solid var(--rule);margin:0 0 26px;
+}
+.plate div{background:var(--raise);padding:14px 16px}
+.plate dt{
+  font-family:var(--cond);font-size:10px;font-weight:600;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--ink-faint);margin:0 0 6px;
+}
+.plate dd{
+  margin:0;font-family:var(--mono);font-size:20px;font-weight:500;color:var(--data);
+  font-variant-numeric:tabular-nums;line-height:1.15;letter-spacing:-.02em;
+}
+.plate dd .u{font-size:11.5px;color:var(--ink-faint);letter-spacing:.04em;margin-left:3px}
+.plate dd .note{display:block;font-family:var(--cond);font-size:11px;color:var(--ink-faint);margin-top:5px;letter-spacing:0}
+dl.plate{max-width:none}
+
+/* ---------- notes ---------- */
+aside{
+  background:var(--accent-bg);border-left:3px solid var(--accent);
+  padding:15px 18px 4px;margin:0 0 24px;max-width:var(--measure);font-size:15px;
+}
+aside.trap{background:var(--trap-bg);border-left-color:var(--trap)}
+aside.trap .lab{color:var(--trap)}
+.lab{
+  display:block;font-family:var(--cond);font-size:10px;font-weight:600;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--accent);margin-bottom:8px;
+}
+aside p{max-width:none}
+aside p:last-child{margin-bottom:11px}
+
+.tree{
+  font-family:var(--mono);font-size:11.8px;line-height:1.58;white-space:pre;
+  background:var(--sunk);border:1px solid var(--rule);padding:16px 18px;overflow-x:auto;margin:0 0 24px;
+}
+
+.lede{
+  font-size:18px;line-height:1.55;color:var(--ink-soft);border-left:3px solid var(--accent);
+  padding-left:18px;margin:0 0 30px;max-width:62ch;
+}
+
+footer{
+  border-top:1px solid var(--rule-hard);margin-top:20px;padding:22px 0 0;
+  font-family:var(--mono);font-size:11.5px;color:var(--ink-faint);max-width:var(--measure);
+}
+
+@media (max-width:900px){
+  .shell{grid-template-columns:minmax(0,1fr);gap:0}
+  .rail{position:static;padding:30px 0 6px;border-bottom:1px solid var(--rule-hard);margin-bottom:6px}
+  .rail ol{columns:2;column-gap:26px}
+  .rail li{break-inside:avoid}
+  main{padding-top:22px}
+  :root{--measure:100%}
+}
+@media (max-width:560px){
+  .rail ol{columns:1}
+  .masthead-in{padding:26px 18px 22px}
+  .shell{padding:0 18px 64px}
+}
+
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* ---------- print ---------- */
+@page{margin:16mm 15mm 15mm}
+@media print{
+  :root{
+    --paper:#fff;--raise:#fff;--sunk:#f2f2ef;--ink:#000;--ink-soft:#333;--ink-faint:#555;
+    --rule:#c9cbc6;--rule-hard:#8d908a;--accent:#7a4708;--accent-bg:#f6efe3;
+    --data:#134950;--trap:#7a2812;--trap-bg:#f8ece8;
+  }
+  body{background:#fff;font-size:9.6pt;line-height:1.48}
+  .masthead{border-bottom:1.5pt solid #000;break-after:avoid}
+  .masthead-in{padding:0 0 12pt;max-width:none;display:block}
+  .colophon{margin-top:12pt;border-left-width:1.5pt}
+  h1{font-size:30pt}
+  .deck{max-width:none}
+  .shell{display:block;max-width:none;padding:0}
+  .rail{display:none}
+  main{padding-top:0}
+  section{break-before:page;padding-top:0;margin-bottom:22pt}
+  section:first-of-type{break-before:avoid}
+  h2{font-size:17pt;break-after:avoid}
+  h3{font-size:12pt;break-after:avoid;margin-top:16pt}
+  h4{break-after:avoid;margin-top:14pt}
+  p,ul,ol,.lede{max-width:none}
+  .tw,table,tr,td,th,pre,aside,.plate,.tree,.lede{break-inside:avoid}
+  .tw{border:1px solid var(--rule-hard)}
+  table{font-size:8.4pt}
+  th,td{padding:3.5pt 7pt}
+  pre{font-size:8pt;padding:8pt 10pt}
+  .tree{font-size:7.2pt;line-height:1.42;white-space:pre-wrap;break-inside:auto}
+  .plate dd{font-size:13pt}
+  aside{font-size:9.4pt;padding:10pt 12pt 2pt}
+  a{color:inherit;text-decoration:none}
+  footer{margin-top:16pt}
+}
+</style>
+
+<header class="masthead">
+  <div class="masthead-in">
+    <div class="brand">
+      <p class="eyebrow">Architectural checkpoint &middot; definitive reference</p>
+      <h1>System Teardown<span class="sub">SOUNDSCAPE &mdash; Headless Horseman Edition</span></h1>
+      <p class="deck">Every figure below was read from source or measured on the development machine.
+      Nothing is estimated. Where a documented intention and the measured reality disagree, both
+      are stated and the disagreement is called out.</p>
+    </div>
+    <div class="colophon">
+      BUILD&nbsp;&nbsp;&nbsp;&nbsp;<b>v1.0 by ZFACTOR PSX</b><br>
+      ENGINE&nbsp;&nbsp;&nbsp;<b>Godot 4.7.1.stable a13da4feb</b><br>
+      RENDER&nbsp;&nbsp;&nbsp;<b>Forward+ &middot; Direct3D 12</b><br>
+      SOURCE&nbsp;&nbsp;&nbsp;<b>4,890 lines &middot; 10 files</b><br>
+      DATED&nbsp;&nbsp;&nbsp;&nbsp;<b>10 September 2026</b>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="rail" aria-label="Sections">
+    <p class="rail-title">Contents</p>
+    <ol>
+      <li><a href="#s1">Executive Summary &amp; Benchmarks</a></li>
+      <li><a href="#s2">Architecture &amp; Scene Hierarchy</a></li>
+      <li><a href="#s3">Audio Pipeline &amp; DSP Engine</a></li>
+      <li><a href="#s4">Rendering, CRT &amp; Visualizers</a></li>
+      <li><a href="#s5">UI, Styling &amp; Layout</a></li>
+      <li><a href="#s6">Persistence, Safeguards &amp; Ceilings</a></li>
+    </ol>
+    <p class="foot">
+      Measured on an Intel&nbsp;i7-13620H, RTX&nbsp;4070&nbsp;Laptop, 15.7&nbsp;GiB RAM,
+      three displays, with a live FLAC playing.
+    </p>
+  </nav>
+
+  <main>
+
+<!-- ============================ 1 ============================ -->
+<section id="s1">
+  <h2><span class="num">SECTION 01</span>Executive Summary &amp; System Benchmarks</h2>
+
+  <p class="lede">One scene, one root script, no autoloads, no plugins, and one external
+  dependency. Everything else is 4,890 lines of GDScript and a 40-line shader.</p>
+
+  <h3>1.1&ensp;Identity</h3>
+  <div class="tw">
+    <table>
+      <caption>Project settings, verbatim</caption>
+      <thead><tr><th>Property</th><th>Value</th><th>Source</th></tr></thead>
+      <tbody>
+        <tr><td>Application name</td><td><code>SOUNDSCAPE</code></td><td><code>project.godot</code> &rarr; <code>config/name</code></td></tr>
+        <tr><td>Byline (header bar)</td><td><code>SOUNDSCAPE (HEADLESS HORSEMAN) BY ZFACTOR PSX</code></td><td><code>player.tscn</code> &rarr; <code>Title</code></td></tr>
+        <tr><td>Byline (BIOS POST)</td><td><code>SOUNDSCAPE (HEADLESS HORSEMAN) BY ZFACTORPSX v1.0</code></td><td><code>boot.gd</code> &rarr; <code>LINES[0]</code></td></tr>
+        <tr><td>Engine</td><td>Godot 4.7.1 stable, Forward+</td><td><code>config/features</code></td></tr>
+        <tr><td>Render driver</td><td>Direct3D 12</td><td><code>rendering_device/driver.windows</code></td></tr>
+        <tr><td>Physics</td><td>Jolt &mdash; declared, unused (no 3D bodies exist)</td><td><code>3d/physics_engine</code></td></tr>
+        <tr><td>Main scene</td><td><code>res://player.tscn</code></td><td><code>run/main_scene</code></td></tr>
+        <tr><td>Window mode at boot</td><td><code>3</code> = <strong>fullscreen</strong>, not maximised</td><td><code>window/size/mode</code></td></tr>
+        <tr><td>Base viewport</td><td>1920 &times; 1080, <code>canvas_items</code> stretch, <code>expand</code> aspect</td><td><code>[display]</code></td></tr>
+        <tr><td>Sub-windows</td><td><code>embed_subwindows=false</code> &rarr; real OS windows</td><td><code>[display]</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <aside class="trap">
+    <span class="lab">Most-misread setting</span>
+    <p><strong>The <code>window/size/mode=3</code> value is fullscreen.</strong> Godot's enum is
+    <code>0=windowed, 1=minimized, 2=maximized, 3=fullscreen, 4=exclusive fullscreen</code>.
+    Fullscreen covers the taskbar, which is why the program looks correct at boot and clips at
+    the bottom after a monitor move (&sect;5.5).</p>
+  </aside>
+
+  <h3>1.2&ensp;Design principles</h3>
+  <ul>
+    <li><strong>Single scene.</strong> <code>player.tscn</code>, 117 authored nodes, one root script. No inherited or instanced sub-scenes.</li>
+    <li><strong>No autoloads.</strong> Nothing in <code>[autoload]</code>. Every subsystem is a child node reached by walking down from <code>MediaPlayer</code>.</li>
+    <li><strong>No plugins or addons.</strong> No <code>addons/</code> directory, no <code>[editor_plugins]</code>.</li>
+    <li><strong>No version control.</strong> No <code>.git</code> directory exists, despite <code>.gitignore</code> and <code>.gitattributes</code> being present. Review is the only safety net.</li>
+    <li><strong>No external GDScript dependencies.</strong> The only runtime dependency is <code>ffmpeg</code> / <code>ffprobe</code> on <code>PATH</code>, used for FLAC transcoding and tag reading.</li>
+    <li><strong>One source of truth per parameter.</strong> Where a value appeared in two widgets, one was removed rather than synchronised.</li>
+    <li><strong>Nothing writes to <code>AudioServer</code> from inside an input callback.</strong> Every control sets a dirty flag; the bus is updated once per frame.</li>
+  </ul>
+
+  <h3>1.3&ensp;Measured benchmarks</h3>
+  <p>Captured with a real FLAC playing and the visualizer live.</p>
+
+  <dl class="plate">
+    <div><dt>Frame time</dt><dd>16.67<span class="u">ms</span><span class="note">smoothed <code>_process</code> delta</span></dd></div>
+    <div><dt>Frame rate</dt><dd>60<span class="u">fps</span><span class="note">cap 60, range 10&ndash;240</span></dd></div>
+    <div><dt>Draw calls</dt><dd>117<span class="note">per frame</span></dd></div>
+    <div><dt>Video memory</dt><dd>41.3<span class="u">MB</span><span class="note">43,278,336 B</span></dd></div>
+    <div><dt>Static memory</dt><dd>123.3<span class="u">MB</span><span class="note">peak 133.3 MB</span></dd></div>
+    <div><dt>Runtime nodes</dt><dd>487<span class="note">117 authored + runtime UI</span></dd></div>
+    <div><dt>Bus effects</dt><dd>13<span class="note">12 rack + 1 analyser</span></dd></div>
+    <div><dt>Output latency</dt><dd>10.0<span class="u">ms</span><span class="note">device reported</span></dd></div>
+    <div><dt>Library</dt><dd>79<span class="note">tracks across 3 roots</span></dd></div>
+  </dl>
+
+  <div class="tw">
+    <table class="mono">
+      <caption>Full instrumentation readout</caption>
+      <thead><tr><th>Metric</th><th class="num-col">Measured</th><th>Counter</th></tr></thead>
+      <tbody>
+        <tr><td>Frame time</td><td class="num-col">16.67 ms</td><td>smoothed from <code>_process</code> delta</td></tr>
+        <tr><td>Frame rate</td><td class="num-col">60 FPS</td><td><code>FPS_DEFAULT = 60</code>, range 10&ndash;240</td></tr>
+        <tr><td>Draw calls / frame</td><td class="num-col">117</td><td><code>RENDER_TOTAL_DRAW_CALLS_IN_FRAME</code></td></tr>
+        <tr><td>Video memory</td><td class="num-col">43,278,336 B</td><td><code>RENDER_VIDEO_MEM_USED</code></td></tr>
+        <tr><td>&mdash; texture</td><td class="num-col">16,146,432 B</td><td><code>RENDER_TEXTURE_MEM_USED</code></td></tr>
+        <tr><td>&mdash; buffer</td><td class="num-col">6,156,564 B</td><td><code>RENDER_BUFFER_MEM_USED</code></td></tr>
+        <tr><td>Static memory</td><td class="num-col">129,299,940 B</td><td><code>OS.get_static_memory_usage()</code></td></tr>
+        <tr><td>Static peak</td><td class="num-col">139,728,362 B</td><td><code>OS.get_static_memory_peak_usage()</code></td></tr>
+        <tr><td>Runtime objects</td><td class="num-col">2,834</td><td><code>OBJECT_COUNT</code></td></tr>
+        <tr><td>Runtime nodes</td><td class="num-col">487</td><td><code>OBJECT_NODE_COUNT</code></td></tr>
+        <tr><td>Bus effects on Master</td><td class="num-col">13</td><td>12 from <code>Equalizer</code> + 1 analyser</td></tr>
+        <tr><td>Audio output latency</td><td class="num-col">0.0100 s</td><td><code>AudioServer.get_output_latency()</code></td></tr>
+        <tr><td>Library indexed</td><td class="num-col">79 / 3</td><td>tracks / roots</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>The &ldquo;CPU&rdquo; figure is frame time, not processor share</h4>
+  <p>The STATS panel reads <code>CPU.....16.7 MS/FRAME @ 60 FPS</code>. It is deliberately
+  <strong>not</strong> a percentage. Godot exposes no system-wide CPU percentage and no
+  per-process CPU time, and <code>Performance.TIME_PROCESS</code> proved untrustworthy here &mdash;
+  sampled against real frame time it reported <strong>43.55&nbsp;ms of process time inside an
+  18.06&nbsp;ms frame</strong>, which is impossible. A percentage built on it read 377&ndash;999&nbsp;%.
+  The panel now reports the delta <code>_process</code> is handed, which is the frame by definition.</p>
+
+  <h4>Mix rate: requested 96 kHz, delivered by the device</h4>
+  <p><code>project.godot</code> sets <code>driver/mix_rate=96000</code>. The <strong>actual</strong>
+  rate is whatever the output device negotiates: measured <strong>48,000&nbsp;Hz</strong> in this run,
+  and 96,000&nbsp;Hz in others on the same machine. The status ticker prints the live value
+  (<code>MIX %d HZ</code>) rather than the requested one, so the UI never claims a rate the
+  hardware is not running.</p>
+</section>
+
+<!-- ============================ 2 ============================ -->
+<section id="s2">
+  <h2><span class="num">SECTION 02</span>Architecture &amp; Scene Hierarchy</h2>
+
+  <h3>2.1&ensp;Module responsibilities</h3>
+  <div class="tw">
+    <table>
+      <caption>10 files &middot; 4,890 lines</caption>
+      <thead><tr><th>File</th><th class="num-col">Lines</th><th>Responsibility</th></tr></thead>
+      <tbody>
+        <tr><td><code>player.gd</code></td><td class="num-col">2,545</td><td>Root controller. Every tab, readout and button; owns the two audio players, library index, config file, window management, tear-off windows and the FX rack UI.</td></tr>
+        <tr><td><code>visualizer.gd</code></td><td class="num-col">562</td><td>Ten drawing modes over one shared normalization pipeline. Frame-rate-independent ballistics.</td></tr>
+        <tr><td><code>equalizer.gd</code></td><td class="num-col">454</td><td>The DSP rack: 12 Master-bus effects driven from one dirty flag.</td></tr>
+        <tr><td><code>audio_engine.gd</code></td><td class="num-col">443</td><td>Queue, decode, ffprobe metadata + key tags, FLAC transcode cache, gapless preload. All disk work on workers.</td></tr>
+        <tr><td><code>audio_director.gd</code></td><td class="num-col">259</td><td>Spectrum tap, onset detection, tempo lock, predictive beat clock.</td></tr>
+        <tr><td><code>countach.gd</code></td><td class="num-col">210</td><td>Wireframe Lamborghini generated from hand-placed <code>Vector3</code>s.</td></tr>
+        <tr><td><code>skins.gd</code></td><td class="num-col">180</td><td>Eleven colour schemes applied by mutating shared styleboxes in place.</td></tr>
+        <tr><td><code>boot.gd</code></td><td class="num-col">114</td><td>BIOS POST screen and name prompt.</td></tr>
+        <tr><td><code>test_director.gd</code></td><td class="num-col">83</td><td>Standalone headless accuracy harness for the beat tracker.</td></tr>
+        <tr><td><code>crt.gdshader</code></td><td class="num-col">40</td><td>Phosphor bloom + scanlines over the visualizer viewport.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Non-script assets: <code>player.tscn</code> (29,699&nbsp;B), <code>intro.ogv</code>
+  (790,871&nbsp;B), <code>logo.png</code> (71,964&nbsp;B), <code>Px437_IBM_BIOS.ttf</code>
+  (23,832&nbsp;B).</p>
+
+  <p><strong>Inert:</strong> <code>csharp/KeyDetector.cs</code>, <code>csharp/TagKey.cs</code>,
+  <code>csharp/AudioFxBridge.cs</code> &mdash; written as a hybrid-architecture plan, never compiled.
+  The project uses the standard (non-.NET) Godot build, which ignores <code>.cs</code> entirely.
+  Excluded from exports.</p>
+
+  <h3>2.2&ensp;Scene tree &mdash; <code>player.tscn</code></h3>
+  <p>117 authored nodes. <code>%</code> marks <code>unique_name_in_owner</code>.</p>
+
+  <div class="tree">MediaPlayer                PanelContainer          &larr; root, script: player.gd
+├─ Margin                  MarginContainer         %  6 px inset, 0 in FULLSCREEN feed
+│  └─ Main                 VBoxContainer
+│     ├─ TopHeaderBar      PanelContainer          %
+│     │  └─ HB             HBoxContainer
+│     │     ├─ Title       Label                      byline
+│     │     └─ Clock       Label                   %  24 h or 12 h
+│     ├─ TickerBar         PanelContainer          %
+│     │  └─ Ticker         Label                   %  scrolls 1 char per TickTimer tick
+│     ├─ Workspace         SplitContainer          %  vertical flag = portrait
+│     │  ├─ LeftColumn     VBoxContainer           %
+│     │  │  └─ ScreenPanel PanelContainer          %
+│     │  │     └─ SVB      VBoxContainer
+│     │  │        ├─ ScreenHeader  PanelContainer     "VISUAL_EQUALIZER_FEED"
+│     │  │        ├─ Screen        PanelContainer
+│     │  │        │  ├─ Video      VideoStreamPlayer %  optional source video
+│     │  │        │  └─ VizBox     SubViewportContainer  stretch_shrink 4, CRT material
+│     │  │        │     └─ SubViewport  328×225, transparent, NEAREST
+│     │  │        │        └─ Viz  Control        %  script: visualizer.gd
+│     │  │        └─ NoSignal      Label             "[ NO SIGNAL ]" / "[ LOADING ]"
+│     │  └─ RightSidebar   PanelContainer          %  min width 575 (capped, §5.5)
+│     │     └─ Tabs        TabContainer            %  7 tabs, TBS hidden
+│     │        ├─ TRACKS   Search, SortRow▸Sort, Tracks(ItemList), Count
+│     │        ├─ FOLDERS  FolderTree(Tree), Row▸AddFolder/RemoveFolder/Rescan
+│     │        ├─ VISUAL   Skin, VizMode, ColorRow, Sens, Tilt, Height, Speed, Pad
+│     │        ├─ EQ       TopRow▸EqMode/EqAdapt, PresetRow, NameRow, EzPanel, AdvPanel
+│     │        ├─ TBS      8 settings rows (hidden from the bar — see §5.4)
+│     │        └─ STATS    Stats(Label), Reboot
+│     ├─ ScrubRow          Elapsed, Scrub(ProgressBar), Total
+│     ├─ ControlDeck       Prev, Play, Stop, Next, Shuffle, Repeat, VolPanel▸Vol
+│     └─ StatusBar         Status(Label)
+├─ Boot                    Control                 %  visible=false until begin()
+│  ├─ BG                   ColorRect
+│  └─ Text                 Label
+├─ Intro                   ColorRect               %  black backdrop
+│  └─ IntroVid             VideoStreamPlayer       %  expand=true
+├─ AudioA / AudioB         AudioStreamPlayer       %  crossfade pair
+├─ Engine                  Node                    %  audio_engine.gd
+├─ Eq                      Node                    %  equalizer.gd
+├─ Director                Node                    %  audio_director.gd
+├─ TickTimer               Timer                   %  ticker scroll
+└─ Dialog                  FileDialog              %  native, adds library roots</div>
+
+  <p>Two rows are <strong>built at runtime</strong>, not authored: <code>ClockRow</code> and
+  <code>IntroRow</code> are appended to the TBS tab by <code>_add_settings_rows()</code>, bringing
+  that tab to <strong>ten</strong> rows. The entire FX tab is likewise constructed in code by
+  <code>_setup_fx()</code> and inserted at tab index 4.</p>
+
+  <h3>2.3&ensp;Runtime lifecycle</h3>
+  <h4><code>_ready()</code> &mdash; exact order</h4>
+  <ol>
+    <li><strong>12 assertions</strong> (&sect;6.3). A failure stops the program here.</li>
+    <li><strong><code>ConfigFile.load()</code></strong> &mdash; all 25 keys (&sect;6.1). <code>_dedupe_roots()</code> runs immediately after <code>_folders</code> is assigned.</li>
+    <li><strong>Signal wiring &amp; <code>_setup_*</code> chain</strong>, in this order:
+      <code>_setup_fade</code> &rarr; <code>_setup_feed</code> &rarr; <code>_setup_fps</code> &rarr;
+      <code>_setup_boost</code> &rarr; <code>_setup_layout</code> &rarr; <code>_setup_beat</code> &rarr;
+      <code>_setup_tbs</code> &rarr; <code>_setup_tbs_window</code> &rarr; <code>_setup_tear_off</code></li>
+    <li><code>_refresh_transport</code>, <code>_setup_pixel_font</code></li>
+    <li><strong><code>_setup_eq()</code></strong> &mdash; builds the 12-effect bus chain, then calls <code>_director.rebind()</code>.</li>
+    <li><strong><code>_setup_fx()</code></strong> &mdash; builds the FX rack UI, inserts the tab at index 4.</li>
+    <li><strong><code>_capture_tab_order()</code></strong> &mdash; must run <em>here</em>, after the runtime FX tab exists.</li>
+    <li><code>_setup_cursor</code>, <code>_setup_visual</code>, <code>_director.attach(_audio)</code></li>
+    <li><strong><code>_rescan()</code></strong> &mdash; walks every root, prunes the FLAC cache, builds the folder tree, applies the checkbox filter, sorts, hands the queue to <code>AudioEngine</code>.</li>
+    <li><strong><code>_start_intro()</code></strong></li>
+    <li><strong><code>_save()</code></strong> &mdash; a full config write, so nothing depends on a later edit.</li>
+    <li>Demo tone if the library is empty; <code>_stop()</code>.</li>
+  </ol>
+
+  <aside>
+    <span class="lab">Consequence</span>
+    <p>The library is fully walked and the DSP chain fully built <strong>before</strong> the intro
+    appears. The intro and BIOS screens cover work that has already finished, not work in progress.</p>
+  </aside>
+
+  <h4>Boot sequence</h4>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Stage</th><th>Behaviour</th></tr></thead>
+      <tbody>
+        <tr><td>Logo</td><td><code>intro.ogv</code> &mdash; Theora video + Vorbis audio, 1280&times;720, 9.4&nbsp;s. Any key or click skips. Audio routes through the Master bus.</td></tr>
+        <tr><td>POST</td><td><code>boot.gd</code> reveals its buffer at <strong>150 chars/s</strong>, substituting the real track count into <code>MOUNTING LIBRARY ... %d TRACKS</code>.</td></tr>
+        <tr><td>Identify</td><td>First run &rarr; <code>ENTER NAME:</code> (raw key capture, max 16 chars). Returning &rarr; <code>WELCOME BACK &lt;name&gt;</code>.</td></tr>
+        <tr><td>Enter</td><td>SPACE / ENTER &rarr; <code>finished(user_name)</code> &rarr; config write &rarr; player live.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The whole sequence is skippable: the <strong>INTRO VIDEO</strong> setting (TBS tab, default on)
+  bypasses <em>both</em> the video and the POST when off.</p>
+
+  <aside class="trap">
+    <span class="lab">Engine limitation</span>
+    <p>Godot 4 ships <strong>no H.264 decoder</strong>. <code>VideoStreamPlayer</code> will not accept
+    an <code>.mp4</code> at all. The source MP4 was transcoded to Ogg Theora + Vorbis. The previous
+    <code>intro.ogv</code> had a video stream only &mdash; intro audio never worked before this build.</p>
+  </aside>
+</section>
+
+<!-- ============================ 3 ============================ -->
+<section id="s3">
+  <h2><span class="num">SECTION 03</span>Audio Pipeline &amp; DSP Engine</h2>
+
+  <h3>3.1&ensp;Decode path</h3>
+  <p><code>AudioEngine.request(i)</code> is the single entry point.</p>
+
+<pre><code>request(i)
+  ├─ _token += 1                       monotonic; only the newest request is honoured
+  ├─ preloaded &amp;&amp; path matches? ──────► _deliver(token, path, stream)      [no I/O]
+  └─ WorkerThreadPool.add_task:
+         decode(path)                  format-specific
+         metadata(path)                ffprobe, ~55 ms
+         _deliver.bind(...).call_deferred()   ← back on the main thread</code></pre>
+
+  <p><code>_deliver()</code> drops the result if <code>token != _token</code>, so a fast double-click
+  cannot let a superseded decode hijack playback. On success it emits <code>track_ready</code> and
+  immediately warms the <strong>next</strong> track.</p>
+
+  <div class="tw">
+    <table>
+      <caption>Format handling</caption>
+      <thead><tr><th>Format</th><th>Path</th></tr></thead>
+      <tbody>
+        <tr><td>mp3</td><td><code>AudioStreamMP3.load_from_file()</code></td></tr>
+        <tr><td>ogg</td><td><code>AudioStreamOggVorbis.load_from_file()</code></td></tr>
+        <tr><td>wav</td><td><code>AudioStreamWAV.load_from_file()</code></td></tr>
+        <tr><td>flac</td><td>ffmpeg &rarr; raw <code>s16le</code> &rarr; hand-written RIFF header &rarr; <code>AudioStreamWAV</code>, cached in <code>user://</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Gapless preload</h4>
+  <p><code>_preload()</code> decodes <strong>and probes</strong> on the worker. The probe is not
+  incidental: without it, <code>_deliver()</code> fell through to <code>metadata()</code> on the main
+  thread and spawned ffprobe there &mdash; <strong>measured 54&nbsp;ms, 3.3 dropped frames, on every
+  gapless transition</strong>. With the probe warmed, the same call costs <strong>0.02&nbsp;ms</strong>.
+  Cost: one decoded stream held in RAM, ~90&nbsp;MB for a four-minute 96&nbsp;kHz stereo track.</p>
+
+  <h4>The <code>WAVE_FORMAT_EXTENSIBLE</code> trap</h4>
+  <aside class="trap">
+    <span class="lab">Silent failure</span>
+    <p>Godot 4.7 has <strong>no FLAC decoder</strong> &mdash; <code>AudioStreamFLAC</code> does not exist.
+    Above 48&nbsp;kHz, ffmpeg's WAV muxer emits <code>WAVE_FORMAT_EXTENSIBLE</code> (fmt tag
+    <code>0xFFFE</code>, 40-byte fmt chunk), which Godot's parser rejects: <code>load_from_file</code>
+    returns <code>null</code> <strong>with no error</strong>, presenting as &ldquo;the track just will
+    not switch&rdquo;.</p>
+  </aside>
+  <p>The fix is to never let ffmpeg mux. Raw <code>s16le</code> is piped out and a canonical 44-byte
+  header is written by hand (16-byte fmt chunk, <code>wFormatTag = 1</code>). Verified loading at
+  44.1 / 48 / 96 / 192&nbsp;kHz. <code>CHUNK = 1 &lt;&lt; 20</code> streams the copy so a 90&nbsp;MB
+  wav never sits in RAM twice.</p>
+  <p>Cache files are <code>user://pcm_&lt;hash&gt;.wav</code>, pruned after every scan against what is
+  on <strong>disk</strong> &mdash; unchecking a folder must not force a re-transcode when it is
+  re-checked. A cached file of &le;&nbsp;44 bytes is treated as a miss and re-transcoded (a transcode
+  killed mid-write used to load as <code>null</code> forever).</p>
+
+  <h3>3.2&ensp;Metadata, tags and thread safety</h3>
+  <p><code>metadata()</code> shells out to <code>ffprobe</code> for sample rate, channels, bit depth,
+  codec, title, artist, album and musical key. Results never change for a file, so they are cached
+  for the session in <code>_meta</code>.</p>
+  <p><code>_meta</code> is written from <strong>worker</strong> threads and read from the
+  <strong>main</strong> thread, and a Godot <code>Dictionary</code> is not thread-safe &mdash; an insert
+  can rehash under a concurrent read. It is guarded by <code>_meta_lock: Mutex</code> with a
+  deliberate protocol:</p>
+
+<pre><code>lock → read cache → unlock
+   … probe unlocked (~55 ms) …
+lock → if another thread already published, take theirs; else publish ours → unlock</code></pre>
+
+  <p>The lock is <strong>never</strong> held across the probe. Holding it would serialise every worker
+  and block the main thread outright &mdash; reintroducing the stall the preload fix removed. Two
+  threads may therefore probe the same file; that costs one duplicate ffprobe and nothing else,
+  because the first writer wins and every caller ends up holding the same <code>Dictionary</code>
+  instance. Temp JSON is named <code>probe_&lt;pathhash&gt;_&lt;threadid&gt;.json</code> so concurrent
+  probes of the same file cannot clobber one another.</p>
+  <p>Verified under 24 concurrent workers on 6 files: 144 results, 0 content mismatches, 6 cache
+  entries, 0 leftover temp files.</p>
+
+  <aside class="trap">
+    <span class="lab">Encoding trap</span>
+    <p><code>OS.execute()</code> decodes subprocess output using the <strong>system ANSI codepage</strong>,
+    which mojibakes any non-Latin tag (&#20013;&#21407; came back as
+    &auml;&cedil;&shy;&aring;&#381;&#159;). ffprobe writes its JSON to a file with <code>-o</code>;
+    <code>FileAccess</code> reads it back as UTF-8 correctly.</p>
+  </aside>
+
+  <h4>Key tags</h4>
+  <p>The key is read from the file's own tag during that same probe &mdash; matched
+  case-insensitively against <code>KEY</code>, <code>INITIALKEY</code>, <code>INITIAL_KEY</code>,
+  <code>TKEY</code>, across both container and stream tags. Whatever the tagger wrote is normalised:</p>
+
+  <div class="tw">
+    <table class="mono">
+      <caption>Tag normalisation</caption>
+      <thead><tr><th>Input</th><th>Output</th><th>Input</th><th>Output</th></tr></thead>
+      <tbody>
+        <tr><td>Am</td><td>8A (Am)</td><td>F#m</td><td>11A (F#m)</td></tr>
+        <tr><td>8A</td><td>8A (Am)</td><td>Ebm</td><td>2A (D#m)</td></tr>
+        <tr><td>A minor</td><td>8A (Am)</td><td>10B</td><td>10B (D)</td></tr>
+        <tr><td>Amin</td><td>8A (Am)</td><td>Bb</td><td>6B (A#)</td></tr>
+        <tr><td>A</td><td>11B (A)</td><td>13A</td><td>13A &nbsp;<em>unparsed, passed through</em></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The Camelot number is a circle-of-fifths position with C major pinned at <strong>8B</strong>; a
+  minor key borrows the number of its <strong>relative</strong> major, which is the entire point of
+  the notation &mdash; same number means compatible. A tag that will not parse is shown verbatim
+  rather than blanked. Untagged files show <code>KEY: --</code> and cost nothing.</p>
+
+  <aside>
+    <span class="lab">Removed by design</span>
+    <p>Spectral key <em>estimation</em> was built (Goertzel chromagram + Krumhansl-Schmuckler,
+    verified exact on synthetic material) and then <strong>removed</strong>: it cost ~1&nbsp;s of
+    tight-loop CPU plus a second concurrent ffmpeg per track, to produce a guess. Tags are free and
+    authoritative.</p>
+  </aside>
+
+  <h3>3.3&ensp;Master bus chain &mdash; slots 0&ndash;12</h3>
+  <p>Inserted at ascending slots from the head of the bus, so the analyser appended by
+  <code>AudioDirector</code> always ends up last. <strong>The visualizer therefore shows post-EQ
+  audio: what you see is what you hear.</strong> Bus effects also run <em>before</em> bus volume is
+  applied on send, so none of this is affected by the VOL knob.</p>
+
+  <div class="tw">
+    <table>
+      <caption>Insertion order and gating</caption>
+      <thead><tr><th class="num-col">Slot</th><th>Effect</th><th>Role</th><th>Enabled when</th></tr></thead>
+      <tbody>
+        <tr><td class="num-col">0</td><td><code>LowPassFilter</code></td><td>DJ filter, cut direction</td><td><code>live &amp;&amp; cut &lt; 0.46</code></td></tr>
+        <tr><td class="num-col">1</td><td><code>HighPassFilter</code></td><td>DJ filter, boost direction</td><td><code>live &amp;&amp; cut &gt; 0.54</code></td></tr>
+        <tr><td class="num-col">2</td><td><code>PitchShift</code></td><td>TAPE SPEED &times; KEY SHIFT</td><td><code>live &amp;&amp; |scale&minus;1| &gt; 0.005</code></td></tr>
+        <tr><td class="num-col">3</td><td><code>EQ21</code></td><td>21 bands from a 16-lane curve</td><td><code>mode != OFF</code></td></tr>
+        <tr><td class="num-col">4</td><td><code>LowShelfFilter</code></td><td>T-BASS lift, 120 Hz</td><td><code>tbass &gt; 0.001</code></td></tr>
+        <tr><td class="num-col">5</td><td><code>Distortion</code></td><td>T-BASS saturation (overdrive)</td><td><code>tbass &gt; 0.001</code></td></tr>
+        <tr><td class="num-col">6</td><td><code>HighShelfFilter</code></td><td>BBE sparkle, 3.5 kHz</td><td><code>bbe &gt; 0.001</code></td></tr>
+        <tr><td class="num-col">7</td><td><code>StereoEnhance</code></td><td>BBE phase alignment</td><td><code>bbe &gt; 0.001</code></td></tr>
+        <tr><td class="num-col">8</td><td><code>Delay</code></td><td>Two-tap stereo delay</td><td><code>live &amp;&amp; dly_on</code></td></tr>
+        <tr><td class="num-col">9</td><td><code>Reverb</code></td><td>Wet/dry crossfade</td><td><code>live &amp;&amp; rev_on</code></td></tr>
+        <tr><td class="num-col">10</td><td><code>Amplify</code></td><td>VOLUME BOOST, 0 &rarr; 24 dB</td><td><code>boost_db &gt; 0.05</code></td></tr>
+        <tr><td class="num-col">11</td><td><code>HardLimiter</code></td><td>Ceiling &minus;0.5 dBFS</td><td>any of the above</td></tr>
+        <tr><td class="num-col">12</td><td><code>SpectrumAnalyzer</code></td><td>Analysis tap, 32 bands</td><td>always</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Every effect is inserted <strong>disabled</strong>; <code>add_bus_effect</code> enables by default
+  and the per-frame push does not run until frame 1, so without this the chain would process a frame
+  or two before anything had decided it should be on.</p>
+
+  <p>Three ordering decisions are load-bearing:</p>
+  <ol>
+    <li><strong>The DJ filter is at the front.</strong> Filtering <em>after</em> the reverb would leave the tail unfiltered and the sweep would not read as a cut.</li>
+    <li><strong>Time-based effects follow the tone stage</strong>, so they reverberate the shaped signal.</li>
+    <li><strong>Boost and limiter are effects, not bus volume.</strong> Bus volume is applied after the chain on send, so a limiter placed anywhere else could never catch clipping the rack in front of it caused.</li>
+  </ol>
+
+  <aside class="trap">
+    <span class="lab">Invalidation trap</span>
+    <p><strong>Adding or removing any bus effect rebuilds every effect <em>instance</em> on that bus</strong>,
+    silently invalidating the analyser handle <code>AudioDirector</code> cached in its own
+    <code>_ready()</code> &mdash; levels then read 0.0 forever with no error. Children are ready before
+    their parent, so <code>_setup_eq()</code> must call <code>_director.rebind()</code> after building
+    the chain. Note that <code>set_bus_effect_enabled()</code> does <strong>not</strong> rebuild
+    instances; only add/remove does.</p>
+  </aside>
+
+  <p><strong>Enabled-slot verification.</strong> With EQ OFF and no FX engaged, a live capture shows
+  exactly one enabled slot: <code>12:SpectrumAnalyzer</code>. Everything else genuinely unloads at rest.</p>
+
+  <h3>3.4&ensp;DSP parameters</h3>
+  <h4>FX rack &mdash; <code>Equalizer.FX_SPEC</code></h4>
+  <p>One table drives the UI builder, the readouts and the config section, so a new knob is one line
+  rather than a setter, getter, save line, load line and slider.</p>
+
+  <div class="tw">
+    <table class="mono">
+      <caption>FX_SPEC, verbatim</caption>
+      <thead><tr><th>Key</th><th>Label</th><th class="num-col">Min</th><th class="num-col">Max</th><th class="num-col">Default</th></tr></thead>
+      <tbody>
+        <tr><td>rev_room</td><td>ROOM SIZE</td><td class="num-col">0.0</td><td class="num-col">1.0</td><td class="num-col">0.60</td></tr>
+        <tr><td>rev_damp</td><td>DAMPNESS</td><td class="num-col">0.0</td><td class="num-col">1.0</td><td class="num-col">0.50</td></tr>
+        <tr><td>rev_wet</td><td>WET MIX</td><td class="num-col">0.0</td><td class="num-col">1.0</td><td class="num-col">0.30</td></tr>
+        <tr><td>dly_ms</td><td>TIME</td><td class="num-col">20.0</td><td class="num-col">1000.0</td><td class="num-col">250.0</td></tr>
+        <tr><td>dly_fb</td><td>FEEDBACK</td><td class="num-col">0.0</td><td class="num-col">1.0</td><td class="num-col">0.35</td></tr>
+        <tr><td>dly_wet</td><td>MIX</td><td class="num-col">0.0</td><td class="num-col">1.0</td><td class="num-col">0.40</td></tr>
+        <tr><td>cut</td><td>CUTOFF</td><td class="num-col">0.0</td><td class="num-col">1.0</td><td class="num-col">0.50</td></tr>
+        <tr><td>res</td><td>RESONANCE</td><td class="num-col">0.0</td><td class="num-col">1.0</td><td class="num-col">0.20</td></tr>
+        <tr><td>tape</td><td>TAPE SPEED</td><td class="num-col">0.5</td><td class="num-col">2.0</td><td class="num-col">1.0</td></tr>
+        <tr><td>key_semi</td><td>KEY SHIFT</td><td class="num-col">&minus;12.0</td><td class="num-col">12.0</td><td class="num-col">0.0</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Switches: <code>rev_on</code>, <code>dly_on</code>, <code>bypass</code>. Rack modules:
+  <code>[ REVERB UNIT ]</code>, <code>[ ECHO / DELAY ]</code>, <code>[ DJ FILTER DECK ]</code>,
+  <code>[ KEY SHIFT ]</code>, plus <code>[ HARDWARE DRIVE ]</code> (T-BASS / BBE / DRIVE).</p>
+
+  <h4>DJ filter and its dead centre</h4>
+  <p><code>CUT_DEAD = 0.04</code> &mdash; a &plusmn;4&nbsp;% detent around 0.5 where <strong>neither</strong>
+  filter is in circuit.</p>
+<pre><code>cut &lt; 0.46 →  LOW-PASS,  f = 80 · (20000/80)^(t)      t = cut/0.46
+cut &gt; 0.54 →  HIGH-PASS, f = 20 · (8000/20)^(t)       t = (cut−0.54)/0.46
+otherwise  →  BYPASS</code></pre>
+  <p>Both sweeps are <strong>logarithmic</strong>. A linear sweep spends most of its travel above
+  10&nbsp;kHz, where nothing is, and crosses the whole audible bass range in the last few pixels. A
+  click within 6&nbsp;% of centre snaps to exactly 0.5, because hitting an 8&nbsp;%-wide detent by
+  pixel while sweeping is not something a hand can do.</p>
+
+  <h4>T-BASS (bass enhancer)</h4>
+<pre><code>shelf.cutoff_hz  = 120
+shelf.gain       = 1.0 + tbass · 1.8        → up to 2.8×
+drive.mode       = MODE_OVERDRIVE
+drive.keep_hf_hz = 320                       band-limited: thickens, does not fizz
+drive.drive      = tbass · 0.35
+drive.pre_gain   = tbass · 4.0
+drive.post_gain  = −tbass · 6.0              claws back the level the drive adds</code></pre>
+
+  <h4>BBE (sonic maximizer)</h4>
+<pre><code>shelf.cutoff_hz        = 3500
+shelf.gain             = 1.0 + bbe · 1.5     → up to 2.5×
+phase.time_pullout_ms  = bbe · 12.0          inter-channel time offset
+phase.surround         = bbe · 0.4
+phase.pan_pullout      = 1.0</code></pre>
+  <p>The time offset is the phase-alignment half of what a real Sonic Maximizer does.</p>
+
+  <aside>
+    <span class="lab">Behavioural change</span>
+    <p><strong>T-BASS and BBE are independent of the EQ mode.</strong> They used to be gated on
+    <code>mode != OFF</code>, which made the rack faders silently inert whenever EQ read OFF &mdash;
+    the fader moved, the readout changed, nothing happened to the sound, with the explanation two
+    tabs away. They now behave exactly as <code>boost_db</code> always has: the drive stage is the
+    hardware colour of the signal, not part of the equalizer curve.</p>
+  </aside>
+
+  <h4>Pitch / tape</h4>
+<pre><code>pitch_scale = tape · 2^(key_semi / 12)</code></pre>
+  <p>TAPE SPEED and KEY SHIFT are two views of <strong>one</strong> <code>AudioEffectPitchShift</code>
+  &mdash; tape in playback ratio, key in semitones, multiplied. A second shifter would double the most
+  expensive thing on the bus to say the same thing twice. At TAPE 1.00&times; and KEY 0&nbsp;ST the
+  product is exactly 1.0 and the effect is <strong>switched off</strong>, not merely at unity.
+  Verified: <code>+7 ST &rarr; 1.4983</code>, <code>&minus;12 ST &rarr; 0.5000</code>,
+  <code>tape 1.25 alone &rarr; 1.2500</code>.</p>
+
+  <aside class="trap">
+    <span class="lab">Never touched</span>
+    <p><code>AudioStreamPlayer.pitch_scale</code> is deliberately never used. Driving it puts every
+    frame of a 96&nbsp;kHz stream through the realtime resampler &mdash; measured as audible stutter.</p>
+  </aside>
+
+  <h4>Delay</h4>
+<pre><code>tap1: delay = ms,        level = 20·log10(wet),      pan = −0.4
+tap2: delay = ms × 1.5,  level = tap1 − 3 dB,        pan = +0.4
+feedback: active if fb &gt; 0.005, level = lerp(−30 dB, −3 dB, fb)
+dry = 1.0</code></pre>
+  <p>The 1&times; / 1.5&times; offset with opposed panning <strong>is</strong> the stereo in &ldquo;stereo
+  delay&rdquo;; one centred tap is an echo, not a spread. Feedback never reaches unity &mdash; at 0&nbsp;dB
+  a delay line never decays and the tail builds until it clips. &minus;3&nbsp;dB at the top is still
+  ~10 audible repeats.</p>
+
+  <h4>Reverb</h4>
+<pre><code>room_size = rev_room
+damping   = rev_damp
+wet       = rev_wet
+dry       = 1.0 − rev_wet          a true crossfade</code></pre>
+  <p>A wet send bolted onto a full dry signal would make the level climb with the mix knob, so
+  WET MIX would read as a volume.</p>
+
+  <h4>Equalizer &mdash; 16 lanes onto 21 bands</h4>
+  <p>Godot ships <code>EQ6</code>, <code>EQ10</code> and <code>EQ21</code>; there is no
+  <code>EQ16</code>. The 16 UI lanes are a <strong>control curve</strong>, sampled and linearly
+  interpolated onto EQ21's band gains:</p>
+<pre><code>for band b in 0..20:
+    t = b / 20 · 15
+    i = floor(t);  f = t − i
+    gain[b] = lerp(curve[i], curve[min(i+1, 15)], f)</code></pre>
+  <p>Lane centres run 32&nbsp;Hz &rarr; 16&nbsp;kHz logarithmically: <code>f(i) = 32 · 500^(i/15)</code>.
+  Only every fourth lane is labelled &mdash; 16 stacked captions is unreadable at that width.</p>
+  <p>Range <code>GAIN_MIN &minus;18 dB</code> &hellip; <code>GAIN_MAX +18 dB</code>. Modes:
+  <strong>OFF</strong> (bypass), <strong>EZ</strong> (three macros weighted onto the same curve with
+  raised cosines, so bands overlap smoothly rather than stepping at the crossover),
+  <strong>ADVANCED</strong> (all 16 + 8 preset slots, <code>EQ_SLOTS = 8</code>).</p>
+  <p><strong>ADAPT</strong> spreads a change across neighbours with a Gaussian of
+  <code>ADAPT_SIGMA = 1.6</code> lanes &mdash; the immediate neighbour lands at &asymp;0.82 of the dragged
+  lane, the third out at &asymp;0.17. The spread is measured from a <strong>snapshot taken when the
+  drag began</strong>; working from live values would compound the curve into a spike over a long drag.</p>
+  <p><code>BOOST_MAX = 24 dB</code> (16&times; amplitude). The hard limiter behind it is what makes that
+  safe: past the clipping point it saturates instead, so the top of the dial trades dynamics for
+  loudness rather than breaking up.</p>
+
+  <h3>3.5&ensp;Spectrum analysis &amp; beat tracking</h3>
+  <p><code>AudioDirector</code> reads <strong>32 bands</strong> (<code>BAND_COUNT</code>) spread
+  logarithmically from <code>F_MIN = 30 Hz</code> to <code>F_MAX = 16 000 Hz</code>. That part is
+  nearly free and always runs &mdash; it feeds the visualizer. The tempo machinery on top is
+  <strong>off by default</strong> (<code>track_tempo = false</code>) because the fit sweeps ~560
+  candidate periods every 0.5&nbsp;s on the main thread and nothing but the BPM readout consumes it.</p>
+
+  <h4><code>BUFFER_LENGTH = 0.05</code> is measured, not chosen</h4>
+  <div class="tw">
+    <table class="mono">
+      <thead><tr><th class="num-col">Value</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td class="num-col">0.10</td><td>beat clock &minus;169 ms, sd 196 &mdash; never locks</td></tr>
+        <tr><td class="num-col"><strong>0.05</strong></td><td><strong>+6 ms, sd 8</strong></td></tr>
+        <tr><td class="num-col">0.03</td><td>tempo confidence collapses 0.87 &rarr; 0.29</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Onset detection</h4>
+  <p>Spectral flux is taken from the <strong>low 11 bands only</strong> (<code>FLUX_BANDS = 11</code>,
+  &asymp;30&ndash;250&nbsp;Hz: kick and low bass), kick-weighted <code>1 + 2·(1 &minus; i/32)</code>.
+  Full-spectrum flux tracks a click track fine but smears on a real dense mix &mdash; measured 0.11
+  confidence on a pop track versus a usable lock from these bands.</p>
+  <p>An onset is flux above the mean of a trailing <code>FLUX_WINDOW = 43</code> frame window
+  (&asymp;0.7&nbsp;s at 60&nbsp;FPS) &times; <code>sensitivity</code> (default 1.5), plus a 0.12&nbsp;s
+  debounce (caps at ~500 onsets/min). There is deliberately <strong>no local-peak test</strong>: it
+  rejected the rising frame of short transients and starved the fit &mdash; 7&ndash;11 onsets where
+  15&ndash;30 were present.</p>
+
+  <h4>Tempo fit</h4>
+  <p>Onsets are treated as impulses and the DFT magnitude taken at each candidate tempo:</p>
+<pre><code>for bpm in 60.0 … 200.0 step 0.25:            561 candidates
+    period = 60 / bpm
+    re = Σ cos(2π·t/period),  im = Σ sin(2π·t/period)
+    magnitude = √(re² + im²) / n
+phase = fposmod(atan2(im, re)/2π · period, period)</code></pre>
+  <p>Phase-invariant, and the complex argument hands back the grid phase for free.</p>
+  <p><strong>Octave correction:</strong> an eighth-note grid scores as well as the quarter-note one,
+  so if half the winning tempo scores above <strong>0.8&times;</strong> the best, the slower reading wins.</p>
+  <p><strong>Phase easing:</strong> once locked, phase eases toward each new fit at
+  <code>PHASE_EASE = 0.25</code> rather than snapping. A hard re-anchor every fit jittered the clock
+  to sd 89&nbsp;ms at 90&nbsp;BPM; this is a PLL-lite that stays predictive while still following real
+  drift. History: <code>HISTORY = 10.0 s</code> of onsets, <code>MIN_ONSETS = 6</code> below which a
+  fit is noise.</p>
+
+  <h4>True song clock</h4>
+<pre><code>song_time = player.get_playback_position()
+          + AudioServer.get_time_since_last_mix()
+          − AudioServer.get_output_latency()</code></pre>
+  <p>This removes mix-ahead and output latency. It does <strong>not</strong> cover the analyser's own
+  trailing-buffer lag, which is why onsets are timestamped back by a separate calibration constant,
+  <code>onset_lag = 0.066</code>, while the beat clock runs on true song time. It is an exposed knob,
+  not a magic number: 0.035 overcorrects to +42&nbsp;ms.</p>
+  <p><code>time_to_beat()</code> returns seconds until the <strong>next predicted</strong> beat, so
+  animation can be led rather than triggered after the fact. Bar indices derive from the absolute
+  beat index, so a re-lock re-anchors bars to the music &mdash; bars emitted is deliberately
+  <em>not</em> beats &divide; 4.</p>
+</section>
+
+<!-- ============================ 4 ============================ -->
+<section id="s4">
+  <h2><span class="num">SECTION 04</span>Rendering, CRT Shader &amp; Visualizers</h2>
+
+  <h3>4.1&ensp;SubViewport upscaling</h3>
+  <p>The visualizer does <strong>not</strong> draw at window resolution.</p>
+
+  <div class="tw">
+    <table class="mono">
+      <caption>Viewport configuration</caption>
+      <thead><tr><th>Property</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td>SubViewport.size</td><td>328 &times; 225 (authored base)</td></tr>
+        <tr><td>transparent_bg</td><td>true</td></tr>
+        <tr><td>canvas_item_default_texture_filter</td><td>0 (nearest)</td></tr>
+        <tr><td>SubViewportContainer.stretch</td><td>true</td></tr>
+        <tr><td>stretch_shrink</td><td>4</td></tr>
+        <tr><td>texture_filter</td><td>1 (nearest)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>With <code>stretch = true</code> the SubViewport is resized to <code>container_size / 4</code>
+  each layout, so the authored 328&nbsp;&times;&nbsp;225 is a starting point, not a fixed buffer.
+  Measured live:</p>
+
+  <div class="tw">
+    <table>
+      <thead><tr><th>Context</th><th class="num-col">SubViewport</th></tr></thead>
+      <tbody>
+        <tr><td>LARGE feed, 1920&times;1080</td><td class="num-col">327 &times; 220</td></tr>
+        <tr><td>FULLSCREEN feed, screen 0</td><td class="num-col">476 &times; 259</td></tr>
+        <tr><td>FULLSCREEN feed, portrait screen (1080&times;1920)</td><td class="num-col">511 &times; 259</td></tr>
+        <tr><td>FULLSCREEN feed, screen 2 (1646&times;1029)</td><td class="num-col">476 &times; 268</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>A &ldquo;pixel&rdquo; in a bar is genuinely one buffer texel blown up to a 4&times;4 block.
+  <strong>Every coordinate in the drawing code is snapped to an integer</strong> &mdash; at this
+  resolution a half-pixel smears a cell edge and loses the entire point of the viewport. Column edges
+  are snapped independently so bars tile exactly; some end up 1&nbsp;px wider, which is correct for
+  pixel art and is what stops a dead strip appearing on the right at awkward widths.</p>
+
+  <h3>4.2&ensp;CRT shader</h3>
+  <p><code>crt.gdshader</code> is a <code>canvas_item</code> shader on the <strong>container</strong>,
+  not the viewport. That ordering matters: the buffer is already upscaled by the time the shader runs,
+  so scanlines land on real screen pixels rather than on chunky viewport texels &mdash; which is what
+  makes them read as a monitor instead of as part of the artwork.</p>
+
+  <div class="tw">
+    <table class="mono">
+      <caption>Uniforms</caption>
+      <thead><tr><th>Uniform</th><th>Range</th><th class="num-col">Value</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td>glow_amount</td><td>0&ndash;3</td><td class="num-col">1.15</td><td>Strength of phosphor bloom over the base sample</td></tr>
+        <tr><td>glow_radius</td><td>0&ndash;8</td><td class="num-col">2.2</td><td>Ring offset in texels for the 8-tap blur</td></tr>
+        <tr><td>scan_strength</td><td>0&ndash;1</td><td class="num-col">0.30</td><td>How far dark rows are pulled down</td></tr>
+        <tr><td>scan_period</td><td>2&ndash;12</td><td class="num-col">4.0</td><td>Screen-space px per scanline pair</td></tr>
+        <tr><td>bleed</td><td>0&ndash;1</td><td class="num-col">0.25</td><td>How much of the glow's alpha survives</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+<pre><code>sum = (8 taps around a ring at ±px, ±0.7px) × 0.125
+col = base.rgb + sum.rgb · glow_amount
+a   = clamp(base.a + sum.a · glow_amount · bleed, 0, 1)
+row = mod(FRAGCOORD.y, scan_period)
+col *= mix(1 − scan_strength, 1, step(scan_period·0.5, row))</code></pre>
+
+  <p>The blur is an 8-tap ring rather than a separable Gaussian: a Gaussian would be cleaner but needs
+  two passes, and on a 1&nbsp;px wireframe over black the two are indistinguishable.</p>
+
+  <aside class="trap">
+    <span class="lab">Invisible-bloom trap</span>
+    <p><strong>Glow must carry alpha.</strong> The viewport is transparent. Adding only
+    <code>sum.rgb</code> produces a bloom that is mathematically present and completely invisible,
+    because destination alpha is still zero everywhere the source was.</p>
+  </aside>
+
+  <p>Hard alternating rows via <code>step()</code>, not a soft sine wash &mdash; distinct, like a real
+  monitor.</p>
+
+  <h3>4.3&ensp;Normalization pipeline</h3>
+  <p>All ten modes read the same 32 magnitudes and pass through the same four stages. The constants
+  were measured against this library, not guessed.</p>
+  <ol>
+    <li><strong>dB conversion.</strong> <code>linear_to_db(max(level, 1e-7))</code>. Linear amplitude leaves a real mix pinned to the floor; dB is the only mapping that spreads it over the full height.</li>
+    <li><strong>Spectral tilt.</strong> <code>+ tilt_db · i/32</code>, default <strong>20&nbsp;dB</strong>, cancelling the library's natural &asymp;39&nbsp;dB slope (band 0 peaks &minus;7&nbsp;dBFS, band 28 &minus;46). At tilt 0 the top two-thirds of the display never leave the floor.</li>
+    <li><strong>Auto-gain.</strong> Mandatory, not polish &mdash; masters here range &minus;7 to &minus;32&nbsp;dBFS peak. <code>_agc = max(max(_agc &minus; 8.0·dt, top), &minus;50)</code>: tracks the loudest band instantly, falls at <code>AGC_FALL = 8 dB/s</code>, floored at <code>AGC_FLOOR = &minus;50</code>.</li>
+    <li><strong>Ballistics.</strong> Attack 0.22&rarr;0.95, release 0.04&rarr;0.40, peak-hold fall 0.15&rarr;1.30, all driven by one SPEED knob. <strong>Attack always outruns release</strong> &mdash; equal rates read as flicker rather than as an EQ, so the two ranges never cross.</li>
+  </ol>
+  <p>Window span: <code>lerp(80, 30, sensitivity)</code>&nbsp;dB.</p>
+
+  <h4>Frame-rate independence</h4>
+  <p>Anything that used to advance &ldquo;once per <code>_process</code>&rdquo; ran 2.4&times; faster at
+  144&nbsp;FPS than at 60. <code>REF_FPS = 60.0</code> is the reference every per-frame constant was
+  tuned at.</p>
+<pre><code>_fps_lerp(a, b, k, dt) = lerp(a, b, 1 − (1−k)^(dt · REF_FPS))</code></pre>
+  <p>At exactly 60&nbsp;FPS the exponent is 1 and this reduces to the original <code>lerp</code>, so the
+  tuned feel is preserved rather than re-guessed. <code>_due_steps(dt)</code> converts elapsed time
+  into whole steps for the discrete effects (waterfall rows, grid history, fire propagation), carrying
+  the remainder, capped at 4 so a frame hitch replays a few steps instead of hundreds.</p>
+
+  <div class="tw">
+    <table>
+      <caption>Measured convergence</caption>
+      <thead><tr><th></th><th class="num-col">30 FPS</th><th class="num-col">60 FPS</th><th class="num-col">144 FPS</th></tr></thead>
+      <tbody>
+        <tr><td>Attack &rarr; 90&nbsp;%</td><td class="num-col">166.7 ms</td><td class="num-col">166.7 ms</td><td class="num-col">159.7 ms</td></tr>
+        <tr><td>Release &rarr; 10&nbsp;%</td><td class="num-col">966.7 ms</td><td class="num-col">950.0 ms</td><td class="num-col">944.4 ms</td></tr>
+        <tr><td>Waterfall rows/s</td><td class="num-col">60</td><td class="num-col">60</td><td class="num-col">59</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Already correctly delta-scaled and left alone: AGC fall, peak decay, hue cycling, tunnel phase,
+  road phase.</p>
+
+  <h3>4.4&ensp;The ten modes</h3>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Mode</th><th>Technique</th></tr></thead>
+      <tbody>
+        <tr><td>SEGMENTS</td><td>Classic lit-cell ladder; independently snapped column edges.</td></tr>
+        <tr><td>MIRROR</td><td>The same ladder reflected about the horizontal centre.</td></tr>
+        <tr><td>WATERFALL</td><td>One row per step into a ring-buffer <code>Image</code> (<code>WF_HEIGHT = 96</code>), drawn as two offset halves &mdash; far cheaper than shifting the image or drawing 32&times;96 rects. Alpha is <code>v&sup2;</code>; linear alpha made every cell bright and read as a green wall.</td></tr>
+        <tr><td>GRID</td><td>Perspective spectrum landscape: <code>GRID_ROWS = 20</code> past spectra receding to a horizon, newest at the front. The 90s &ldquo;3D bars&rdquo; view, wireframed to stay crisp.</td></tr>
+        <tr><td>RADIAL</td><td>Spectrum swept around a circle; the 90s scope-panel look.</td></tr>
+        <tr><td>MATRIX</td><td>Dot-matrix panel where unlit cells stay faintly on, the way a real VFD looks. That dim grid is what separates it from SEGMENTS.</td></tr>
+        <tr><td>TUNNEL</td><td>Rings receding on a 1/z curve, cross-sectioned by the spectrum itself, so the tube bulges wherever a band is loud. Phase <code>+= dt·(0.35 + bass·2.4)·speed</code>.</td></tr>
+        <tr><td>CRUISE</td><td>The Countach on a receding road, EQ bars along both verges, retrowave sun on the horizon. Phase <code>+= dt·(2.0 + bass·9.0)·speed</code>.</td></tr>
+        <tr><td>FIRE</td><td>Demoscene cellular fire on a deliberately coarse <code>FIRE_W 56 &times; FIRE_H 40</code> grid so it upscales chunky. Bottom row seeded from the spectrum; each cell above averages <code>(below·2 + left + right)·0.25·cool</code>.</td></tr>
+        <tr><td>KALEIDO</td><td>Spectrum swept through a quarter turn and mirrored into the other three quadrants.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Colour: six presets (green, amber, cyan, white, magenta, red) plus a rainbow mode selected one
+  past the last preset, cycling hue at &asymp;16&nbsp;s per revolution at mid SPEED. Ring modes cap
+  their radius at the circle inscribed in the canvas &mdash; unclamped, <code>height_scale</code> at
+  maximum pushed RADIAL to 0.74 and KALEIDO to 0.81 of the short side, so in a short wide panel the
+  ring was cut flat and read as a squashed oval.</p>
+
+  <h4>CRUISE projection</h4>
+<pre><code>EYE_Y = 1.30     camera height above the road plane
+ROAD_HALF = 5.0  half-width of the tarmac
+VERGE = 6.4      x offset of the EQ bars
+Z_NEAR = 0.55    RIB_SPACING = 2.4     Z_FAR = 46.0</code></pre>
+  <p>Segments are clipped to the near plane <strong>before</strong> projecting; without that a line
+  crossing behind the camera wraps to the far side of the screen instead of running off it.</p>
+
+  <h3>4.5&ensp;The Countach</h3>
+  <p>Built entirely from hand-placed <code>Vector3</code>s in a local space where <strong>+Z is the
+  nose, +Y is up, and the wheels sit on y = 0</strong>.</p>
+  <p>The body is <strong>lofted</strong>: nine cross-section rings (&ldquo;stations&rdquo;) from nose tip
+  to chopped tail are rungged together with longitudinal rails, producing the wedge without
+  hand-listing several hundred edges. Each station is
+  <code>[z, lower half-width, lower y, waist half-width, waist y, top half-width, top y]</code>.</p>
+
+  <div class="tw">
+    <table class="mono">
+      <caption>Stations</caption>
+      <thead><tr><th class="num-col">#</th><th class="num-col">z</th><th>Station</th></tr></thead>
+      <tbody>
+        <tr><td class="num-col">0</td><td class="num-col">+1.70</td><td>nose tip, low wedge</td></tr>
+        <tr><td class="num-col">1</td><td class="num-col">+1.45</td><td>nose break</td></tr>
+        <tr><td class="num-col">2</td><td class="num-col">+1.05</td><td>front axle</td></tr>
+        <tr><td class="num-col">3</td><td class="num-col">+0.62</td><td>windscreen base</td></tr>
+        <tr><td class="num-col">4</td><td class="num-col">+0.18</td><td>roof front</td></tr>
+        <tr><td class="num-col">5</td><td class="num-col">&minus;0.42</td><td>roof rear</td></tr>
+        <tr><td class="num-col">6</td><td class="num-col">&minus;0.85</td><td>rear deck</td></tr>
+        <tr><td class="num-col">7</td><td class="num-col">&minus;1.30</td><td>over rear axle</td></tr>
+        <tr><td class="num-col">8</td><td class="num-col">&minus;1.62</td><td>chopped tail</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Stations 4&ndash;5 are the greenhouse, and the numbers are the car</strong>: top half-width
+  collapses to <strong>0.40</strong> while the waist stays at <strong>0.72</strong>. That pinch
+  <em>is</em> the Countach's narrow cabin over wide hips.</p>
+  <p>On top of the loft: deployed pop-up headlights with inset lens faces, side NACA ducts, shoulder
+  scoops, the rear wing as a closed box so it has thickness in wireframe, flared arches as 8-segment
+  arcs, and <strong>octagonal wheels</strong> (<code>WHEEL_R 0.26</code>, <code>WHEEL_X 0.70</code>,
+  axles at &plusmn;1.05) &mdash; at this line weight a circle needs far more segments to read as round,
+  and faceted wheels are truer to the vector-graphics era anyway.</p>
+
+  <h4>Suspension</h4>
+  <p>The edge list is built once in <code>_init()</code> and never rebuilt &mdash; the body does not
+  deform. Motion is a transform offset applied at draw time:</p>
+<pre><code>offset.y = sin(t·47.0)·0.009 + sin(t·31.3)·0.0054      jitter_amp = 0.009
+offset.x = sin(t·0.37)·0.11  + sin(t·0.23)·0.0605      sway_amp   = 0.11</code></pre>
+  <p>Detuned sine pairs, so the cycle never visibly repeats. Amplitudes are deliberately tiny: the
+  road is already moving, so the car only has to stop looking welded to the screen.</p>
+</section>
+
+<!-- ============================ 5 ============================ -->
+<section id="s5">
+  <h2><span class="num">SECTION 05</span>UI System, Styling &amp; Responsive Layout</h2>
+
+  <h3>5.1&ensp;The skin system</h3>
+  <p>Eleven schemes: <code>WIN98, MAROON, MIDNIGHT, AMBER, TOKYO, TERMINAL, ICE, VAPORWAVE, MIAMI,
+  C64, HAZARD</code>.</p>
+  <p><strong>The in-place mutation trick.</strong> Every stylebox in <code>player.tscn</code> is a
+  <em>shared sub-resource</em>. <code>Skins.apply()</code> mutates those resources directly &mdash;
+  <code>sb.bg_color = s.panel</code> &mdash; so a single write repaints every panel that references it.
+  No theme rebuild, no node walk, no per-node override.</p>
+  <p>This is also why the FX rack (built entirely in GDScript) repaints with every skin for free: it
+  creates <strong>no</strong> styleboxes of its own. A locally-constructed one would be the single
+  panel stuck on WIN98 grey.</p>
+  <p>Each scheme defines <code>window, panel, border, header, header_text, text, screen, screen_text,
+  accent</code>, and optionally <code>accent2</code>. Where <code>accent2</code> exists it drives the
+  <strong>filled</strong> indicators (progress bars, fader tracks, list selection) while
+  <code>accent</code> keeps the text highlights &mdash; that split is what makes the two-tone skins
+  read as two-tone instead of one hue smeared over everything.</p>
+  <p>Theme <strong>type variations</strong> rather than per-node overrides: <code>Header</code> and
+  <code>Screen</code> derive from <code>PanelContainer</code>; <code>HeaderLabel</code> and
+  <code>Green</code> from <code>Label</code>. Every stylebox is a <code>StyleBoxFlat</code> with
+  <strong>corner radius 0</strong> and a 1&nbsp;px border. Nothing is rounded; nothing has a shadow.</p>
+
+  <aside class="trap">
+    <span class="lab">Type-check is not enough</span>
+    <p><strong><code>Skins._flat()</code> must test <code>has_stylebox()</code> first.</strong> For a
+    <strong>missing</strong> entry Godot does <em>not</em> return <code>null</code> &mdash; it hands back
+    a fresh default <code>StyleBoxFlat</code>, which sails through an <code>is StyleBoxFlat</code> test.
+    Type-checking alone caught only a wrong-<em>typed</em> entry and stayed silent on a renamed or
+    deleted one, which is exactly the case the warning exists for. Audited across all 11 schemes: no
+    dead entries today.</p>
+  </aside>
+
+  <h3>5.2&ensp;Typography</h3>
+  <p><code>Px437_IBM_BIOS.ttf</code> &mdash; a vector reconstruction of the 8&times;16 VGA ROM font from
+  the IBM PC BIOS. Theme <code>default_font</code>, <code>default_font_size = 16</code>, the size at
+  which its 16&nbsp;px glyph cells land on exact pixel boundaries.</p>
+  <p>Every import setting exists to stop Godot being helpful:</p>
+
+  <div class="tw">
+    <table class="mono">
+      <caption>Font import</caption>
+      <thead><tr><th>Setting</th><th>Value</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>antialiasing</td><td>0</td><td>A bitmap-derived face with AA looks like a blurry photocopy of itself</td></tr>
+        <tr><td>subpixel_positioning</td><td>0</td><td>Glyphs snap to whole pixels, not fractional offsets</td></tr>
+        <tr><td>hinting</td><td>0</td><td>The outlines already sit on the pixel grid</td></tr>
+        <tr><td>generate_mipmaps</td><td>false</td><td>Nothing to scale down to; a mipchain only softens</td></tr>
+        <tr><td>disable_embedded_bitmaps</td><td>true</td><td>&mdash;</td></tr>
+        <tr><td>keep_rounding_remainders</td><td>true</td><td>Stops accumulated advance error drifting a long line off grid</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>CJK fallback.</strong> Px437 covers code page 437 &mdash; box drawing, a few accents, no
+  Japanese. The library contains tracks by &#20013;&#21407;&#12417;&#12356;&#12371;, which would render
+  as tofu. <code>_setup_pixel_font()</code> attaches a <code>SystemFont</code> chain at runtime:</p>
+<pre><code>font_names = ["Yu Gothic UI", "Meiryo", "MS Gothic", "Segoe UI"]
+antialiasing         = FONT_ANTIALIASING_NONE
+subpixel_positioning = SUBPIXEL_POSITIONING_DISABLED</code></pre>
+  <p>The fallback carries the <strong>same</strong> settings. Without that, a Japanese album name
+  renders smooth and grey beside hard black Latin text in the same label &mdash; which reads as a bug,
+  not as a fallback.</p>
+  <p><strong>Cursor.</strong> A 12&times;19 arrow built in code from an ASCII-art constant
+  (<code>#</code> outline, <code>.</code> fill, space transparent), nearest-scaled &times;3
+  (<code>CURSOR_SCALE</code>), hotspot at pixel (0,0). Drawing it rather than shipping a PNG keeps it
+  one file and lets a constant decide how chunky the pixels read.</p>
+
+  <h3>5.3&ensp;Responsive layout</h3>
+  <p><code>Workspace</code> is a <code>SplitContainer</code> whose <code>vertical</code> flag is the
+  portrait switch.</p>
+<pre><code>aspect = viewport.x / viewport.y
+portrait = aspect &lt; PORTRAIT_BELOW        PORTRAIT_BELOW = 1.1</code></pre>
+  <p><strong>1.1 rather than 1.0</strong> so a near-square window commits to one layout instead of
+  flickering between the two on tiny resizes. <code>AUTO-DETECT</code> can be overridden by
+  <code>FORCE LANDSCAPE</code> / <code>FORCE PORTRAIT</code>.</p>
+
+  <div class="tw">
+    <table>
+      <caption>Feed sizes and divider fractions</caption>
+      <thead><tr><th>Mode</th><th class="num-col">Landscape ratio</th><th class="num-col">Portrait ratio</th><th>Divider fraction</th></tr></thead>
+      <tbody>
+        <tr><td>LARGE</td><td class="num-col">3.0</td><td class="num-col">0.82</td><td><code>r/(r+1)</code> = 0.750 / 0.451</td></tr>
+        <tr><td>MEDIUM</td><td class="num-col">1.5</td><td class="num-col">0.54</td><td>0.600 / 0.351</td></tr>
+        <tr><td>SMALL</td><td class="num-col">0.5</td><td class="num-col">0.30</td><td>0.333 / 0.231</td></tr>
+        <tr><td>GONE</td><td class="num-col">&mdash;</td><td class="num-col">&mdash;</td><td>left column hidden</td></tr>
+        <tr><td>FULLSCREEN</td><td class="num-col">&mdash;</td><td class="num-col">&mdash;</td><td>all chrome hidden, margin 0</td></tr>
+        <tr><td>CUSTOM</td><td class="num-col">&mdash;</td><td class="num-col">&mdash;</td><td>user's stored <code>split_frac</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><code>SIDEBAR_MIN_X = 575</code> keeps the tab dock usable beside the feed, but is capped at
+  <strong>half the viewport</strong> in landscape &mdash; on a narrow-but-still-landscape window
+  (700&nbsp;px is aspect 1.13, so not portrait) an unconditional 575 leaves the visualizer 125&nbsp;px
+  and pushes the layout past the window edge. In portrait the floor is dropped to 0, because stacked
+  it would be a horizontal floor on the whole window.</p>
+
+  <aside>
+    <span class="lab">Not a regression</span>
+    <p><strong>LARGE cannot reach 3:1.</strong> It lands at 0.694 because the 575&nbsp;px sidebar floor
+    is a hard minimum. The previous <code>BoxContainer</code> gave 0.696 for the same reason &mdash;
+    minimum size beats stretch ratio.</p>
+  </aside>
+
+  <h4>The split solver</h4>
+  <p><code>SplitContainer</code> ignores <code>size_flags_stretch_ratio</code>; it positions the divider
+  from <code>split_offset</code>, a <strong>delta from a default set by the children's minimum
+  sizes</strong>. That default cannot simply be read &mdash; measured, <code>split_offset = 0</code> is
+  <em>itself</em> clamped and reads 102&nbsp;px short. The relationship is otherwise exactly linear,
+  slope 1.0:</p>
+<pre><code>off=0     → first = 1325   (clamped)
+off=−200  → first = 1227
+off=−400  → first = 1027
+off=−1000 → first =  427        ⇒ true default = 1427</code></pre>
+  <p>So <code>_split_to_fraction()</code> solves by fixed-point iteration: with slope 1 it lands exactly
+  in one correction when the target is reachable, and stops itself the moment the offset stops changing
+  &mdash; which is what a clamped mode does. Two frames per pass (the container re-sorts a frame after
+  the offset is set). A <code>_split_gen</code> token drops superseded runs, because switching feed size
+  twice quickly leaves two coroutines both writing the divider.</p>
+  <p><strong><code>split_frac</code> is stored as a fraction, not pixels.</strong> The stretch base pins
+  the viewport width at 1920 on every screen, so only the height changes &mdash; 1080 on the landscape
+  panel, 3413 on the portrait one. A single stored pixel offset was being applied to a
+  <em>horizontal</em> split across 1920 and a <em>vertical</em> split across 3413; it could not be
+  correct in both. Verified across all three monitors: 0.400 requested, 0.400 measured on each.</p>
+
+  <h3>5.4&ensp;Detachable windows</h3>
+  <p><code>embed_subwindows=false</code> makes <code>Window</code> nodes <strong>real OS
+  windows</strong>. This is global &mdash; there is no per-window override &mdash; and it also promotes
+  the FOLDERS file dialog to a native window.</p>
+  <p><strong>The settings screen.</strong> The TBS tab is hidden from the tab bar
+  (<code>set_tab_hidden</code>); all ten of its rows pop out into an OS window via the
+  <code>[ TBS SCREEN ]</code> button on STATS. The node is hidden rather than deleted because it is
+  where the rows go home to when the window closes. Window: 640&nbsp;&times;&nbsp;620, min
+  430&nbsp;&times;&nbsp;470, centred on the <strong>usable</strong> rect of its screen.</p>
+  <p><strong>Tear-off tabs.</strong> <code>drag_to_rearrange_enabled = true</code> is what makes a tab
+  draggable at all. The tab under the cursor is recorded on <code>NOTIFICATION_DRAG_BEGIN</code>; on
+  <code>DRAG_END</code>, if <code>gui_is_drag_successful()</code> is false <em>and</em> the cursor is
+  outside the TabContainer rect, the tab tears off into its own window. Size
+  620&nbsp;&times;&nbsp;720 landscape / 560&nbsp;&times;&nbsp;1000 portrait, clamped to the screen's
+  usable rect, with the <strong>minimum derived from the panel itself</strong> &mdash; measured, the tabs
+  need 532 / 480 / 412 / 336&nbsp;px, so the original fixed 380&nbsp;px floor let EQ be dragged
+  152&nbsp;px narrower than it can draw in. Padding drops 6&nbsp;px &rarr; 1&nbsp;px below 520&nbsp;px wide.</p>
+  <p>Restoring uses a <strong>canonical order map</strong>, not a stored index: a stored absolute index
+  goes stale the moment a second tab is torn off. Verified with three tabs torn off and restored in a
+  different order than they left.</p>
+
+  <aside class="trap">
+    <span class="lab">Measured, corrected three times</span>
+    <p><strong>Reparenting and <code>%UniqueName</code>.</strong> <code>reparent()</code> preserves a
+    moved node's whole subtree of unique-name registrations <strong>when that node has an owner</strong>.
+    A runtime-created carrier with no owner loses them for its descendants &mdash; silently, so
+    <code>%EqMode</code> simply stops resolving and the next <code>_refresh_eq()</code> dies on a null.
+    <code>_restore_unique_names()</code> re-toggles the flag over the moved subtree as insurance, since
+    the FX tab is built at runtime and has no owner.</p>
+  </aside>
+
+  <h3>5.5&ensp;Window management &amp; multi-monitor</h3>
+  <div class="tw">
+    <table>
+      <caption>Every display reserves 72 px for the taskbar</caption>
+      <thead><tr><th>Screen</th><th class="num-col">Size</th><th class="num-col">Usable</th><th class="num-col">Taskbar</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td class="num-col">1920 &times; 1080</td><td class="num-col">1920 &times; 1008</td><td class="num-col">72</td></tr>
+        <tr><td>1</td><td class="num-col">1080 &times; 1920 (portrait)</td><td class="num-col">1080 &times; 1848</td><td class="num-col">72</td></tr>
+        <tr><td>2</td><td class="num-col">1646 &times; 1029</td><td class="num-col">1646 &times; 957</td><td class="num-col">72</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The program boots <strong>fullscreen</strong>, which covers the taskbar, so nothing is hidden at
+  rest. Shift+Win+Arrow moves the window while leaving that mode in place, and the taskbar then draws
+  over the bottom 72&nbsp;px &mdash; exactly the status bar plus half the transport deck, gone with
+  nothing to say so.</p>
+  <p><code>_refit_window_to_screen()</code> polls the current screen index each frame (Godot exposes no
+  &ldquo;window changed screen&rdquo; notification). On a change, if the window hangs past the usable
+  rect on <strong>either</strong> axis, it switches to <strong>borderless MAXIMIZED</strong>. The first
+  reading is recorded and never acted on &mdash; at boot the window <em>is</em> deliberately 72&nbsp;px
+  past the usable rect.</p>
+  <p>Why that repair and not another, all measured:</p>
+  <ul>
+    <li><code>WINDOWED</code> is <strong>unreachable</strong> from the boot fullscreen state on this build &mdash; setting it reports <code>EXCLUSIVE_FULLSCREEN</code> back and <code>window_set_size</code> is refused outright.</li>
+    <li>Re-asserting <code>FULLSCREEN</code> on the new screen changes nothing; still 72&nbsp;px under.</li>
+    <li><code>MAXIMIZED</code> lands inside the usable rect on all three screens, portrait included.</li>
+    <li><code>BORDERLESS</code> keeps the chromeless look the fullscreen boot has.</li>
+  </ul>
+
+  <h4>F11</h4>
+  <p><code>F11</code> toggles the OS window. Entering saves the current geometry to
+  <code>_windowed_rect</code> (session-only &mdash; a saved rect that no longer fits the current monitor
+  arrangement is worse than none) and sets fullscreen. Leaving clears borderless, goes via
+  <code>MAXIMIZED</code>, then requests <code>WINDOWED</code>, verifies the result, and <strong>falls
+  back to borderless MAXIMIZED</strong> if the release did not take. Geometry is restored exactly:</p>
+<pre><code>F11 → fullscreen    saved rect = [P:(0,419), S:(1920,1006)]
+F11 → windowed      restored   = pos (0,419) size (1920,1006)</code></pre>
+  <p><code>ESC</code> unwinds whichever kind of full screen is on &mdash; the in-app FULLSCREEN
+  <em>feed</em> first (hides chrome), then the OS window mode. The two are separate and stack.</p>
+  <p>Both paths call <code>_relayout_for_window()</code>: two frames deferred (the window has not
+  finished resizing when the mode change returns), then <code>_update_orientation()</code> re-reads the
+  viewport, re-picks portrait/landscape, recomputes the sidebar floor and re-applies the feed &mdash;
+  which re-solves the split from its <strong>fraction</strong>, so the divider lands proportionally
+  right at the new size. The SubViewport follows on its own via <code>stretch_shrink</code>.</p>
+  <p>Measured on all three monitors in fullscreen: viewport aspect equals window aspect in every case
+  (no letterboxing), and the FULLSCREEN feed fills the workspace exactly.</p>
+
+  <h3>5.6&ensp;Controls</h3>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Input</th><th>Action</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>SPACE</td><td>Play / pause</td><td>A focused <code>LineEdit</code> consumes it first, so typing a space in SEARCH is unaffected</td></tr>
+        <tr><td>H</td><td>Hide / show mouse pointer</td><td><code>MOUSE_MODE_HIDDEN</code>, not <code>CAPTURED</code> &mdash; the pointer still moves, hovers and clicks</td></tr>
+        <tr><td>F11</td><td>Toggle OS fullscreen</td><td>Saves/restores geometry</td></tr>
+        <tr><td>ESC</td><td>Leave in-app FULLSCREEN feed, else OS fullscreen</td><td>&mdash;</td></tr>
+        <tr><td>Any key / click</td><td>Skip the logo intro</td><td>Handled in the root's <code>_input</code>, because Boot has not taken control yet</td></tr>
+        <tr><td>Double-click a fader</td><td>Reset to <code>FX_SPEC</code> default</td><td>Works on every rack bar</td></tr>
+        <tr><td>Click-drag a bar</td><td>Set value</td><td>Shared <code>_bar_drag()</code> predicate</td></tr>
+        <tr><td>REBOOT &times;2</td><td>Factory reset</td><td>First click arms and shows <code>CONFIRM?</code>; a second within 4&nbsp;s commits</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Scrub and volume are <code>ProgressBar</code> + <code>gui_input</code>, not <code>HSlider</code>
+  &mdash; a real slider needs a grabber texture, and a texture is the one thing the skin system cannot
+  recolour. The EQ's vertical faders <em>do</em> use <code>VSlider</code>, so they get a generated
+  13&times;7 cap drawn in code in deliberately neutral grey, so it reads on every skin without being
+  rebuilt when the palette changes.</p>
+
+  <aside class="trap">
+    <span class="lab">Zero-width bar trap</span>
+    <p>A <code>Control</code> not yet laid out still receives input, and computing a ratio on a
+    zero-width bar returns 0 for <em>any</em> x &mdash; silently writing the minimum of the range into
+    whatever parameter that bar owns. This is not theoretical: it flattened a whole config section to
+    its floor values during testing. Every drag handler tests <code>bar.size.x &lt; 2.0</code> first.</p>
+  </aside>
+
+  <aside class="trap">
+    <span class="lab">Polled, not awaited</span>
+    <p>A release outside the bar is never delivered to its <code>gui_input</code>; waiting for one let
+    the scrub's drag flag latch on permanently, so a later hover kept scrubbing with nothing held down.
+    <code>_process</code> polls the button instead.</p>
+  </aside>
+</section>
+
+<!-- ============================ 6 ============================ -->
+<section id="s6">
+  <h2><span class="num">SECTION 06</span>Data Persistence, Safeguards &amp; Self-Checks</h2>
+
+  <h3>6.1&ensp;Configuration</h3>
+  <p>State lives in a single <code>ConfigFile</code> under <code>user://</code> &mdash; on Windows,
+  <code>%APPDATA%\Godot\app_userdata\SOUNDSCAPE\</code>.</p>
+<pre><code>var _cfg := "user://library_dev.cfg" if OS.has_feature("editor") else "user://library.cfg"</code></pre>
+  <p>The editor and an exported build share <code>user://</code> on one machine, so an editor save would
+  otherwise be the first thing a shipped player sees. On a player's machine neither file exists yet, so
+  the export always starts clean.</p>
+
+  <div class="tw">
+    <table>
+      <caption>All 25 keys &mdash; verified to both load and save</caption>
+      <thead><tr><th>Section</th><th>Keys</th></tr></thead>
+      <tbody>
+        <tr><td><code>[library]</code></td><td><code>folders</code>, <code>enabled_folders</code>, <code>known_folders</code>, <code>sort</code>, <code>tbs</code>, <code>shuffle</code>, <code>repeat</code></td></tr>
+        <tr><td><code>[audio]</code></td><td><code>volume</code>, <code>boost</code>, <code>fade</code>, <code>fade_ms</code>, <code>play_delay_ms</code>, <code>track_tempo</code></td></tr>
+        <tr><td><code>[visual]</code></td><td><code>feed_size</code>, <code>split_frac</code>, <code>clock_12h</code>, <code>intro_video</code>, <code>layout</code>, <code>max_fps</code>, <code>skin</code>, <code>viz</code></td></tr>
+        <tr><td><code>[eq]</code></td><td><code>state</code>, <code>presets</code></td></tr>
+        <tr><td><code>[effects]</code></td><td>one entry per <code>FX_SPEC</code> key + the three switches (flat and hand-editable)</td></tr>
+        <tr><td><code>[stats]</code></td><td><code>total_seconds</code>, <code>user_name</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><code>[effects]</code> is written one entry per parameter rather than a single blob, so it stays
+  readable and hand-editable like every other section &mdash; and everything is <strong>re-clamped on
+  load</strong> rather than trusted, because a plain text file a user can edit will eventually contain
+  an out-of-range value, and an out-of-range cutoff is an audible fault, not a caught error.</p>
+  <p>Two things are deliberately <strong>not</strong> persisted: <code>Feed.FULLSCREEN</code> (it would
+  boot into a UI with no visible way out) and the <code>[H]</code> cursor-hidden state (same reason).</p>
+  <p><code>known_folders</code> exists because the enabled set alone cannot distinguish &ldquo;the user
+  switched this off&rdquo; from &ldquo;this did not exist yet&rdquo; &mdash; both are simply absent.
+  Treating the second as the first is what made a freshly dropped album invisible with no error anywhere.</p>
+
+  <h4>Write scheduling</h4>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Trigger</th><th>Timing</th></tr></thead>
+      <tbody>
+        <tr><td>Continuous controls (faders, volume)</td><td><code>_save_soon()</code> &mdash; <strong>1.5&nbsp;s debounce</strong>, at most one write regardless of how many controls move</td></tr>
+        <tr><td>Odometer flush</td><td>every <strong>30&nbsp;s</strong> of <code>_session_secs</code></td></tr>
+        <tr><td>Discrete actions (toggles, sort, folders)</td><td>immediate <code>_save()</code></td></tr>
+        <tr><td>Application exit</td><td><code>NOTIFICATION_WM_CLOSE_REQUEST</code> &mdash; the only exit path, so without it the last half-minute is lost</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Both periodic jobs schedule against <code>_session_secs</code>, which starts at zero every launch.
+  <code>_save_at</code> previously ran off <code>_total_secs</code> &mdash; a lifetime counter loaded from
+  config &mdash; which needed re-anchoring after load or the first frame tripped it.</p>
+
+  <h3>6.2&ensp;Factory reset</h3>
+  <p><code>REBOOT</code> arms on the first click (<code>CONFIRM?</code>) and commits on a second within
+  4&nbsp;s. It resets every persisted setting: library roots, enabled/known folders, TBS list, sort,
+  skin, username, EQ state and presets, all six visualizer parameters, boost, shuffle, repeat, beat
+  tracking, layout, clock format, intro video, max FPS, feed size &mdash; <strong>and</strong> volume,
+  fade, fade time, play delay, split fraction and the search filter, each pushing its widget back as
+  well. A reset that leaves the UI showing old values is worse than one that skips.</p>
+  <p>Named default constants (<code>VOLUME_DEFAULT 80.0</code>, <code>FADE_ON_DEFAULT true</code>,
+  <code>FADE_MS_DEFAULT 1000</code>, <code>DELAY_MS_DEFAULT 250</code>,
+  <code>SPLIT_FRAC_DEFAULT 0.5</code>, <code>FPS_DEFAULT 60</code>) are shared between the config
+  fallbacks and the reset, so the two cannot drift.</p>
+
+  <h3>6.3&ensp;Startup assertion battery</h3>
+  <p>There is no test framework. Pure logic with real branches carries a static self-test, and those run
+  as <code>assert()</code> on every debug launch &mdash; a failure stops the program at startup rather
+  than producing a plausible-looking wrong answer later.</p>
+
+  <div class="tw">
+    <table>
+      <caption>12 assertions in <code>_ready()</code></caption>
+      <thead><tr><th>Assertion</th><th>Pins</th></tr></thead>
+      <tbody>
+        <tr><td><code>_fmt</code>, <code>_ratio_at</code></td><td>Time formatting; drag-ratio clamping at both ends</td></tr>
+        <tr><td><code>_is_audio</code></td><td>Extension matching is case-insensitive and rejects cover art</td></tr>
+        <tr><td><code>_cmp_by</code> &times;2</td><td>All five sort comparators order as their names claim</td></tr>
+        <tr><td><code>peek_next</code> &times;3</td><td>Shuffle never returns the playing track (except a one-track queue); repeat OFF terminates</td></tr>
+        <tr><td><code>Equalizer.cut_test</code></td><td>DJ filter dead centre and both sweep endpoints</td></tr>
+        <tr><td><code>Equalizer.pitch_test</code></td><td>TAPE &times; KEY SHIFT, and defaults producing exactly 1.0</td></tr>
+        <tr><td><code>AudioEngine.key_tag_test</code></td><td>15 tag spellings, four Camelot corners, unparsed passthrough</td></tr>
+        <tr><td><code>_viz.fps_lerp_test</code></td><td>Visualizer settles in the same wall-clock time at 30 / 60 / 144&nbsp;FPS</td></tr>
+        <tr><td><code>clock_test</code></td><td>12-hour wrap: midnight and noon are <strong>both</strong> 12</td></tr>
+        <tr><td><code>roots_test</code></td><td>Library root nesting and path normalisation</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><code>Equalizer</code> extends <code>Node</code>, not <code>RefCounted</code>, so any test
+  constructing one must <code>free()</code> it or leak.</p>
+
+  <h3>6.4&ensp;Headless harnesses</h3>
+  <p><strong><code>test_director.gd</code></strong> &mdash;
+  <code>godot --headless --path . --script res://test_director.gd</code>. Synthesises click tracks at
+  90 / 120 / 128 / 174&nbsp;BPM (55&nbsp;ms kicks, 120 &rarr; 45&nbsp;Hz pitch sweep with exponential
+  decay &mdash; a sub-one-cycle blip is not a fair test signal), plays them, and asserts locked BPM
+  within <strong>&plusmn;2.0</strong> and mean phase error within <strong>&plusmn;30&nbsp;ms</strong>,
+  judging only the second half so the lock-in transient is ignored.</p>
+
+  <aside class="trap">
+    <span class="lab">Load-bearing</span>
+    <p><code>Engine.max_fps</code> matters there: headless Godot runs <code>_process</code> uncapped,
+    which aliases against the audio mix callback and smears the song clock badly enough to look like a
+    tracker bug.</p>
+  </aside>
+
+  <p><strong>Visual verification</strong> &mdash;
+  <code>--write-movie &lt;dir&gt;/f.png --fixed-fps 20 --quit-after N</code> writes a numbered PNG
+  sequence, so any screen can be inspected without adding debug drawing.</p>
+
+  <aside class="trap">
+    <span class="lab">Caveat</span>
+    <p>The render opens a <strong>real window under the mouse</strong>, and stray input lands on whatever
+    control is beneath it, silently rewriting persisted settings. Renders go to
+    <code>library_dev.cfg</code>, so the real library is safe, but the dev config needs resetting after
+    a render session.</p>
+  </aside>
+
+  <h3>6.5&ensp;Known ceilings and deliberate constraints</h3>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Ceiling</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td>16-bit truncation</td><td>Sample rate is preserved exactly at any rate and FLAC is never re-encoded through a lossy codec &mdash; but <code>AudioStreamWAV</code> supports 8- and 16-bit PCM only, so a 24-bit source is <strong>always</strong> truncated somewhere. There is no bit-transparent path in this engine version, and no arrangement of these functions creates one.</td></tr>
+        <tr><td>No FLAC decoder</td><td><code>AudioStreamFLAC</code> does not exist in Godot 4.7; FLAC requires the ffmpeg round-trip.</td></tr>
+        <tr><td>No H.264</td><td><code>VideoStreamPlayer</code> will not take an <code>.mp4</code> at all. Ogg Theora only.</td></tr>
+        <tr><td>Key from tags only</td><td>Untagged files show <code>KEY: --</code>. Spectral estimation was built, measured and removed.</td></tr>
+        <tr><td>mm:ss rollover</td><td><code>_fmt</code> is mm:ss only, so a 61-minute source reads <code>61:04</code>.</td></tr>
+        <tr><td>Preload holds ~90&nbsp;MB</td><td>One decoded stream stays in RAM for the next track &mdash; the price of gapless-feeling transitions.</td></tr>
+        <tr><td>Tempo fit is main-thread</td><td>~560 candidate periods every 0.5&nbsp;s; ships <strong>off</strong>, and <code>_process</code> returns before any of that work when it is off.</td></tr>
+        <tr><td><code>WINDOWED</code> unreliable</td><td>Not reachable from fullscreen on this build; F11 falls back to borderless MAXIMIZED.</td></tr>
+        <tr><td>Mix rate is the device's</td><td>The project <em>requests</em> 96&nbsp;kHz; the device decides. The UI prints the live value.</td></tr>
+        <tr><td>C# files inert</td><td><code>csharp/</code> cannot compile without the .NET Godot build and the .NET SDK, neither of which is installed. Excluded from exports.</td></tr>
+        <tr><td>No version control</td><td>No <code>.git</code>. ~4,900 lines with no history.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Deliberate non-features</h4>
+  <ul>
+    <li><strong>TBS means TO BE SORTED.</strong> It is now a settings screen; the staging list was removed at the owner's request. The <code>[library] tbs</code> key is still loaded and saved, so an existing list survives untouched if the feature is ever restored.</li>
+    <li><strong>The FX rack's BYPASS does not reach the drive stage.</strong> T-BASS, BBE and the booster are the hardware colour of the signal, not spatial effects, so they stay live.</li>
+    <li><strong>The visualizer runs post-EQ deliberately.</strong> The analyser is the last slot so the display cannot disagree with the ears.</li>
+  </ul>
+
+  <footer>
+    End of teardown. Every numeric claim above traces to a source file or a measurement taken on
+    9&ndash;10 September 2026.
+  </footer>
+</section>
+
+  </main>
+</div>
