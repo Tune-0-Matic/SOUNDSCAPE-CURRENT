@@ -120,90 +120,160 @@ func _ready() -> void:
 	_wf_tex = ImageTexture.create_from_image(_wf_img)
 	add_child(_car)  # child so its _process drives the suspension jitter
 
-## User gradients, each an evenly-spaced list of stops. Owned by player.gd, which loads
-## them from library.cfg -- this class only samples them.
+## User gradients. Owned by player.gd, which loads/saves them as hex lists in
+## library.cfg -- this class only samples them. Each is a real Gradient resource:
+## Gradient natively supports non-uniform stop offsets (add_point / set_offset /
+## sample), which is what lets a stop be dragged to an arbitrary position instead of
+## always landing evenly spaced.
 ##
 ## The gradient is applied HERE and not in crt.gdshader, and that is the whole design
 ## decision: the shader is a post pass over the SubViewportContainer, so by the time it
 ## runs the bars are already pixels and a sampler2D there could only tint the finished
 ## image uniformly. Per-bar colour is chosen at draw time, which is this file.
-var gradients: Array = []      # Array[PackedColorArray]
+var gradients: Array[Gradient] = []
+
+## How a gradient moves. STATIC is the original "colour list" behaviour: color_at(t)
+## samples purely by bar position and nothing drifts. The other three all walk the
+## gradient's phase off _hue, the same clock the rainbow preset already uses.
+enum ColorAnim { STATIC, FADE, LEFT_RIGHT, WAVE }
+var color_anim: ColorAnim = ColorAnim.FADE
+
+## Automatically steps color_index through the saved gradient list while one is
+## selected. Off by default -- a gradient someone dialled in should not change under
+## them without being asked.
+var rotate_gradients := false
+const ROTATE_PERIOD_SEC := 20.0
+var _rotate_t := 0.0
 
 ## color_index layout: 0..PRESETS.size()-1 fixed, PRESETS.size() rainbow, then one slot
 ## per user gradient. Returns -1 when the current selection is not a gradient.
 func gradient_index() -> int:
 	return color_index - PRESETS.size() - 1
 
-## Evenly-spaced stops. Draggable positions would be a gradient EDITOR; this is a colour
-## list, which is also exactly what the hex string in library.cfg can express.
-static func sample(stops: PackedColorArray, t: float) -> Color:
-	if stops.is_empty():
+## Gradient.sample() does not loop -- an offset past 1.0 just holds the last colour --
+## so an animation whose phase drifts continuously through 0..1 and wraps hit a hard
+## cut from the last stop back to the first. This treats the space between the last
+## stop and the first (crossing the 1.0/0.0 seam) as one more segment, so a looping
+## animation closes smoothly instead of snapping.
+static func sample_looped(grad: Gradient, t: float) -> Color:
+	var n := grad.get_point_count()
+	if n == 0:
 		return Color.WHITE
-	if stops.size() == 1:
-		return stops[0]
-	var x := clampf(t, 0.0, 1.0) * float(stops.size() - 1)
-	var i := int(floor(x))
-	if i >= stops.size() - 1:
-		return stops[stops.size() - 1]
-	return stops[i].lerp(stops[i + 1], x - float(i))
+	if n == 1:
+		return grad.get_color(0)
+	var first: float = grad.get_offset(0)
+	var last: float = grad.get_offset(n - 1)
+	var tt := fposmod(t, 1.0)
+	if tt >= first and tt <= last:
+		return grad.sample(tt)
+	var span: float = (1.0 - last) + first
+	if span <= 0.00001:
+		return grad.get_color(n - 1)
+	var local: float = ((tt - last) if tt > last else (tt + (1.0 - last))) / span
+	return grad.get_color(n - 1).lerp(grad.get_color(0), clampf(local, 0.0, 1.0))
 
-## Colour for a bar at t in 0..1 across the spectrum. Falls back to color() for the fixed
-## and rainbow selections, which are deliberately uniform across the display.
+## Colour for a bar at t in 0..1 across the spectrum. Falls back to color() for the
+## fixed and rainbow selections, which are deliberately uniform across the display.
 func color_at(t: float) -> Color:
 	var gi := gradient_index()
 	if gi < 0 or gi >= gradients.size():
 		return color()
-	return sample(gradients[gi], t)
+	var grad := gradients[gi]
+	match color_anim:
+		ColorAnim.LEFT_RIGHT:
+			return sample_looped(grad, t + _hue)
+		ColorAnim.WAVE:
+			return sample_looped(grad, t + sin((_hue + t) * TAU) * 0.15)
+		ColorAnim.FADE:
+			return sample_looped(grad, _hue)
+		_:   # STATIC: pure spatial position, nothing moves over time
+			return grad.sample(clampf(t, 0.0, 1.0))
 
 func color() -> Color:
 	var gi := gradient_index()
 	if gi >= 0 and gi < gradients.size():
-		# modes that take ONE colour per frame still animate, by walking the gradient on
-		# the same phase the rainbow uses instead of freezing on one stop
-		return sample(gradients[gi], fposmod(_hue, 1.0))
+		# a mode that wants ONE colour per frame still animates unless STATIC, walking
+		# the same phase the per-bar modes use so every mode stays in sync
+		return gradients[gi].sample(0.0) if color_anim == ColorAnim.STATIC \
+			else sample_looped(gradients[gi], _hue)
 	if color_index >= PRESETS.size():
 		# full saturation, full value: the bars are drawn on black, so a desaturated
 		# sweep would just read as grey at the ends of the cycle
 		return Color.from_hsv(fposmod(_hue, 1.0), 0.85, 1.0)
 	return PRESETS[clampi(color_index, 0, PRESETS.size() - 1)]
 
-## "000000,ff0055,00ffcc,ffffff" in, colours out. The same string is what library.cfg
-## stores and what travels through the clipboard, so one parser serves both.
-## Unparseable entries are DROPPED rather than defaulted: a typo becoming silent black
-## would look like a deliberate stop.
-static func parse_hex_list(s: String) -> PackedColorArray:
-	var out := PackedColorArray()
+## "000000,ff0055,00ffcc,ffffff" (legacy: no positions, falls back to even spacing) or
+## "000000@0.0000,ff0055@0.3000,...@1.0000" (explicit offsets, what the drag editor
+## writes) in, a Gradient out. The same string is what library.cfg stores and what
+## travels through the clipboard, so one parser serves both, and a gradient saved
+## before offsets existed still loads looking exactly as it always did.
+## Unparseable stops are DROPPED rather than defaulted: a typo becoming silent black
+## would look like a deliberate stop. Returns null for a list with no valid colour.
+static func parse_hex_list(s: String) -> Gradient:
+	var colors := PackedColorArray()
+	var offsets := PackedFloat32Array()
 	for part in s.split(",", false):
-		var h := part.strip_edges().trim_prefix("#")
-		if Color.html_is_valid(h):
-			out.append(Color.html(h))
-	return out
+		var piece := part.strip_edges()
+		var at := piece.find("@")
+		var hex := piece if at < 0 else piece.substr(0, at)
+		hex = hex.trim_prefix("#")
+		if not Color.html_is_valid(hex):
+			continue
+		var off := -1.0
+		if at >= 0:
+			var num := piece.substr(at + 1)
+			if num.is_valid_float():
+				off = clampf(num.to_float(), 0.0, 1.0)
+		colors.append(Color.html(hex))
+		offsets.append(off)
+	if colors.is_empty():
+		return null
+	# any stop with no explicit (valid) offset falls back to even spacing across the
+	# whole list -- this is the entire legacy path, since an old hex list never has "@"
+	for i in offsets.size():
+		if offsets[i] < 0.0:
+			offsets[i] = float(i) / float(maxi(colors.size() - 1, 1))
+	var g := Gradient.new()
+	g.offsets = offsets
+	g.colors = colors
+	return g
 
-static func to_hex_list(stops: PackedColorArray) -> String:
+static func to_hex_list(grad: Gradient) -> String:
 	var parts := PackedStringArray()
-	for c in stops:
-		parts.append(c.to_html(false))
+	for i in grad.get_point_count():
+		parts.append("%s@%.4f" % [grad.get_color(i).to_html(false), grad.get_offset(i)])
 	return ",".join(parts)
 
-## Self-check, asserted from player.gd's _ready. The round trip is the part that matters:
-## a gradient that survives to library.cfg but comes back a different colour is invisible
-## until someone notices their saved palette drifted.
+## Self-check, asserted from player.gd's _ready. The round trip is the part that
+## matters: a gradient that survives to library.cfg but comes back different is
+## invisible until someone notices their saved palette drifted.
 static func gradient_test() -> bool:
 	var g := parse_hex_list("000000,ff0055, 00ffcc ,#ffffff")
-	if g.size() != 4 or to_hex_list(g) != "000000,ff0055,00ffcc,ffffff":
+	if not g or g.get_point_count() != 4:
 		return false
-	if parse_hex_list("zzz,,##,ff0000").size() != 1:   # junk dropped, no crash
+	# legacy list (no "@") parses to even spacing: 0, 1/3, 2/3, 1
+	if not (is_equal_approx(g.get_offset(0), 0.0) and is_equal_approx(g.get_offset(1), 1.0 / 3.0)
+			and is_equal_approx(g.get_offset(3), 1.0)):
 		return false
-	if not parse_hex_list("").is_empty():
+	if parse_hex_list("zzz,,##,ff0000").get_point_count() != 1:   # junk dropped, no crash
+		return false
+	if parse_hex_list("") != null:
 		return false
 	var two := parse_hex_list("000000,ffffff")
-	return sample(two, 0.0).is_equal_approx(Color.BLACK) \
-		and sample(two, 1.0).is_equal_approx(Color.WHITE) \
-		and absf(sample(two, 0.5).r - 0.5) < 0.01 \
-		and sample(two, -5.0).is_equal_approx(Color.BLACK) \
-		and sample(two, 99.0).is_equal_approx(Color.WHITE) \
-		and sample(PackedColorArray(), 0.5) == Color.WHITE \
-		and sample(parse_hex_list("ff0000"), 0.7) == Color.RED
+	if not (two.sample(0.0).is_equal_approx(Color.BLACK) and two.sample(1.0).is_equal_approx(Color.WHITE)
+			and absf(two.sample(0.5).r - 0.5) < 0.01):
+		return false
+	# explicit offsets round-trip exactly, including a stop dragged off even spacing
+	var explicit := parse_hex_list("000000@0.0000,ff0055@0.2000,ffffff@1.0000")
+	if to_hex_list(explicit) != "000000@0.0000,ff0055@0.2000,ffffff@1.0000":
+		return false
+	# sample_looped must close the seam: at the exact midpoint of the gap between the
+	# last stop (0.75) and the first (0.25, via the 1.0/0.0 wrap) the two colours
+	# should read roughly half and half -- Gradient.sample() alone would read pure
+	# green there, since nothing past offset 0.75 is defined going forward
+	var loop_g := parse_hex_list("ff0000@0.25,00ff00@0.75")
+	var mid_wrap := sample_looped(loop_g, 0.0)
+	return absf(mid_wrap.r - mid_wrap.g) < 0.1 and mid_wrap.r > 0.3
 
 func _process(delta: float) -> void:
 	if not director:
@@ -212,6 +282,15 @@ func _process(delta: float) -> void:
 	if color_index >= PRESETS.size():
 		# ~16 s per full cycle at the middle SPEED setting: a slow drift, not a strobe
 		_hue += delta * 0.062 * lerpf(0.5, 2.0, speed)
+	# Only ticks while a gradient is actually the active selection -- a preset or the
+	# rainbow is not something the rotator should silently steer away from.
+	if rotate_gradients and gradient_index() >= 0 and gradients.size() > 1:
+		_rotate_t += delta
+		if _rotate_t >= ROTATE_PERIOD_SEC:
+			_rotate_t = 0.0
+			color_index = PRESETS.size() + 1 + (gradient_index() + 1) % gradients.size()
+	else:
+		_rotate_t = 0.0
 	if mode == Mode.SNAKE:
 		# steps on the music rather than on its own clock, so it reads as a visualiser and
 		# not as a screensaver that happens to be running

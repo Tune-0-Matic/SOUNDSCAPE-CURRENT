@@ -297,6 +297,7 @@ size_flags_vertical = 3
 expand = true
 
 [node name="VizBox" type="SubViewportContainer" parent="Margin/Main/Workspace/LeftColumn/ScreenPanel/SVB/Screen" unique_id=1730989502]
+unique_name_in_owner = true
 texture_filter = 1
 material = SubResource("Mat_crt")
 layout_mode = 2
@@ -430,10 +431,11 @@ unique_name_in_owner = true
 layout_mode = 2
 text = "MODE: SEGMENTS"
 
-[node name="ColorRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1050232331]
+[node name="ColorRow" type="HFlowContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1050232331]
 unique_name_in_owner = true
 layout_mode = 2
-theme_override_constants/separation = 3
+theme_override_constants/h_separation = 3
+theme_override_constants/v_separation = 3
 
 [node name="SensLabel" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=919974982]
 unique_name_in_owner = true
@@ -681,10 +683,16 @@ visible = false
 layout_mode = 2
 metadata/_tab_index = 5
 
-[node name="Stats" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/STATS" unique_id=1185936533]
-unique_name_in_owner = true
+[node name="StatsScroll" type="ScrollContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/STATS"]
 layout_mode = 2
 size_flags_vertical = 3
+horizontal_scroll_mode = 0
+
+[node name="Stats" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/STATS/StatsScroll" unique_id=1185936533]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+clip_text = true
 text = "SOURCE..DEMO_TONE.WAV"
 
 [node name="Reboot" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/STATS" unique_id=1376236871]

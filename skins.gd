@@ -4,7 +4,7 @@ class_name Skins
 ## rebuild the theme or touch individual nodes.
 
 const NAMES := ["WIN98", "MAROON", "MIDNIGHT", "AMBER", "TOKYO", "TERMINAL", "ICE",
-	"VAPORWAVE", "MIAMI", "C64", "HAZARD"]
+	"VAPORWAVE", "MIAMI", "C64", "HAZARD", "BLACK"]
 
 ## Schemes may set a second accent. Where they do, "accent2" drives the filled
 ## indicators (progress bars, fader tracks, list selection) while "accent" keeps the
@@ -89,6 +89,17 @@ const SCHEMES := {
 		"header_text": Color(1, 1, 1), "text": Color(0.063, 0.133, 0.169),
 		"screen": Color(0, 0.031, 0.059), "screen_text": Color(0.616, 0.792, 0.867),
 		"accent": Color(0.216, 0.835, 0.949),
+	},
+	# Pitch black: window, panel, header and screen are all literal (0,0,0), not a dark
+	# shade of one -- an OLED-off background, not a "dark theme". Border and text sit at
+	# just enough grey to stay legible against it; the accent is neutral white rather
+	# than a hue, so nothing here reads as a tint of black.
+	"BLACK": {
+		"window": Color(0, 0, 0), "panel": Color(0, 0, 0),
+		"border": Color(0.18, 0.18, 0.18), "header": Color(0, 0, 0),
+		"header_text": Color(1, 1, 1), "text": Color(0.85, 0.85, 0.85),
+		"screen": Color(0, 0, 0), "screen_text": Color(1, 1, 1),
+		"accent": Color(1, 1, 1),
 	},
 }
 

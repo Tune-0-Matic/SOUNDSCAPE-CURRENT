@@ -1,0 +1,9 @@
+git init
+git branch -M main
+@"
+.godot/
+export_presets.cfg
+.import/
+.DS_Store
+Thumbs.db
+"@ | Set-Content -Encoding utf8 .gitignore

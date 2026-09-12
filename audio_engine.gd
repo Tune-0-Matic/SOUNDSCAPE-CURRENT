@@ -73,6 +73,7 @@ var _deck_players: Array[AudioStreamPlayer] = []
 
 func _ready() -> void:
 	_setup_master_limiter()
+	_setup_master_mono()
 	_setup_decks()
 
 ## Ceiling for the Master safety limiter. A hair under 0 dBFS, same reasoning as the
@@ -97,6 +98,40 @@ func _setup_master_limiter() -> void:
 	var lim := AudioEffectHardLimiter.new()
 	lim.ceiling_db = MASTER_CEILING_DB
 	AudioServer.add_bus_effect(m, lim, 0)
+
+var _mono_bus_idx := -1
+var _mono_effect_idx := -1
+
+## MONO folds L/R to (L+R)/2 in both channels using AudioEffectStereoEnhance at
+## pan_pullout 0.0 -- not a custom effect. Godot decomposes into a mid/side pair
+## internally (mid=(L+R)/2, side scaled by pan_pullout); at pan_pullout 0 the side
+## term drops out entirely and both channels become the mid alone, which is an exact
+## fold, not an approximation. surround stays 0 for the same reason equalizer.gd
+## keeps it 0 on BBE: that tap is a delayed mono sum added back into both channels,
+## and it would smuggle a comb-filtered image back in on top of the fold.
+##
+## It sits right after the limiter, slot 1, and before whatever AudioDirector appends,
+## since MONO is a monitoring fold on the final, already-limited signal -- not a mix
+## decision. Same idempotency rule as the limiter above: a second _ready must not
+## stack a second fold. True-bypassed by set_bus_effect_enabled, never added/removed
+## at runtime -- that is what invalidates AudioDirector's cached analyser handle.
+func _setup_master_mono() -> void:
+	_mono_bus_idx = AudioServer.get_bus_index("Master")
+	for i in AudioServer.get_bus_effect_count(_mono_bus_idx):
+		if AudioServer.get_bus_effect(_mono_bus_idx, i) is AudioEffectStereoEnhance:
+			_mono_effect_idx = i
+			return
+	var fold := AudioEffectStereoEnhance.new()
+	fold.pan_pullout = 0.0
+	fold.surround = 0.0
+	fold.time_pullout_ms = 0.0
+	AudioServer.add_bus_effect(_mono_bus_idx, fold, 1)
+	_mono_effect_idx = 1
+	AudioServer.set_bus_effect_enabled(_mono_bus_idx, _mono_effect_idx, false)
+
+func set_mono(on: bool) -> void:
+	if _mono_effect_idx >= 0:
+		AudioServer.set_bus_effect_enabled(_mono_bus_idx, _mono_effect_idx, on)
 
 func _setup_decks() -> void:
 	for i in DECK_BUSES.size():
@@ -127,8 +162,26 @@ func set_deck(which: int) -> void:
 ## Relative channel gain in dB, from a linear 0..1 fader. Linear rather than equal-power
 ## on purpose: this fader doubles as the mute for a deck nobody is using, and an
 ## equal-power law never quite reaches silence at its ends.
+## Both decks at unity with the crossfader ignored -- the deck button's third state.
+## set_crossfader refuses to write while this is on, so a config load or a stray call
+## cannot silently fade one deck back out from under it; player.gd clears BOTH first
+## when the user actually grabs the crossfader.
+var both := false
+
+func set_both(on: bool) -> void:
+	both = on
+	if not on:
+		set_crossfader(crossfader)
+		return
+	for bus in DECK_BUSES:
+		var b := AudioServer.get_bus_index(bus)
+		if b >= 0:
+			AudioServer.set_bus_volume_db(b, 0.0)
+
 func set_crossfader(x: float) -> void:
 	crossfader = clampf(x, 0.0, 1.0)
+	if both:
+		return
 	for i in DECK_BUSES.size():
 		var gain: float = (1.0 - crossfader) if i == 0 else crossfader
 		var b := AudioServer.get_bus_index(DECK_BUSES[i])
@@ -577,6 +630,171 @@ static func key_tag_test() -> bool:
 			return false
 	return format_key_tag("ZZTOP")["pc"] == -1 and format_key_tag("Am")["pc"] == 9 \
 		and key_shifted(9, 2) == 11 and key_shifted(-1, 5) == -1
+
+# --- reverse playback ---------------------------------------------------------
+## AudioStreamPlayer cannot play backwards -- pitch_scale has no negative half -- so a
+## reversed take is a real file: ffmpeg -af areverse into the same user:// cache the
+## FLAC transcode uses, keyed by path hash so a track is only ever reversed once.
+##
+## Forced to 44.1 kHz 16-bit PCM on the way out for the same reason the FLAC path is:
+## above 48 kHz ffmpeg writes WAVE_FORMAT_EXTENSIBLE, which Godot's wav parser rejects
+## by returning null with no error at all.
+signal reversed_ready(path: String, stream: AudioStream)
+
+func request_reversed(path: String) -> void:
+	if path.is_empty() or _shutdown:
+		return
+	_reverse_tasks.append(WorkerThreadPool.add_task(func() -> void:
+		if _shutdown:
+			return
+		var out := ProjectSettings.globalize_path("user://rev_%d.wav" % hash(path))
+		if not FileAccess.file_exists(out):
+			var args := ["-v", "error", "-y", "-i", path, "-af", "areverse",
+				"-ar", "44100", "-c:a", "pcm_s16le", out]
+			if OS.execute("ffmpeg", args, [], true) != 0:
+				push_warning("could not reverse %s" % path.get_file())
+				return
+		var stream := AudioStreamWAV.load_from_file(out)
+		if stream:
+			call_deferred("emit_signal", "reversed_ready", path, stream)))
+
+# --- offline spectral key estimation ------------------------------------------------
+## Everything above is what runs at playtime, and stays true to its own rule: no DSP
+## here. This is the one exception, and it earns it by breaking every part of that
+## rule's original complaint -- it never runs at playtime (nothing on the
+## request()/_open() path touches it), it never competes with the decode or the mix
+## (it is a WorkerThreadPool task queued from a folder SCAN, not from playback), and it
+## only ever runs for a track whose tag was silent, which is the one case a tag genuinely
+## has nothing to say. The actual chroma/Krumhansl-Schmuckler analysis lives in
+## spectral_key.gd, a separate module, so this file's own DSP-free boundary stays literal.
+signal spectral_key_ready(path: String, pc: int, minor: bool)
+
+## Guards _spectral_cache/_spectral_pending exactly the way _meta_lock guards _meta
+## above: a worker thread writes a result the instant it lands, the main thread reads
+## it to paint a readout or to decide whether to queue another file, and a plain
+## Dictionary is not safe under that without a lock around each access.
+var _spectral_lock := Mutex.new()
+var _spectral_cache := {}     # str(hash(path)) -> [pc, minor] -- loaded from library.cfg
+var _spectral_pending := {}   # path -> true, so a rescan never queues the same file twice
+var _spectral_queue: Array[String] = []   # waiting to be analysed, drained by ONE worker
+var _spectral_running := false
+var _spectral_task := -1
+var _reverse_tasks: Array[int] = []       # main thread only: request_reversed is UI-side
+
+## Set by shutdown(). Every worker checks it between items, so a queue with hundreds of
+## tracks left in it abandons them immediately instead of holding the process open.
+var _shutdown := false
+
+## Called before the scene tree frees this node. Without it, a worker can be midway
+## through writing _spectral_cache under _spectral_lock while the main thread tears the
+## engine down -- the lock outlives the object that owns it and the process wedges on
+## exit instead of closing. Waits only for what is genuinely in flight: _shutdown makes
+## the drain loop drop everything still queued rather than finish the backlog.
+func shutdown() -> void:
+	_shutdown = true
+	if _spectral_task != -1:
+		WorkerThreadPool.wait_for_task_completion(_spectral_task)
+		_spectral_task = -1
+	for id in _reverse_tasks:
+		WorkerThreadPool.wait_for_task_completion(id)
+	_reverse_tasks.clear()
+
+static func spectral_cache_key(path: String) -> String:
+	return str(hash(path))
+
+## Whatever queue_spectral_key has already found for this path, or {} if it has not
+## been analysed (or analysis found nothing conclusive) yet.
+func spectral_key_for(path: String) -> Dictionary:
+	_spectral_lock.lock()
+	var v = _spectral_cache.get(spectral_cache_key(path))
+	_spectral_lock.unlock()
+	if v == null:
+		return {}
+	return {"pc": int(v[0]), "minor": bool(v[1])}
+
+## A locked snapshot for library.cfg to iterate at save time -- iterating the live
+## Dictionary directly from the main thread while a worker might still be writing to it
+## is exactly the unsafe access the lock exists to prevent.
+func spectral_cache_snapshot() -> Dictionary:
+	_spectral_lock.lock()
+	var copy: Dictionary = _spectral_cache.duplicate()
+	_spectral_lock.unlock()
+	return copy
+
+## Only ever called at startup, before any worker exists -- no concurrent writer yet,
+## so no lock is needed here the way every other access takes one.
+func load_spectral_cache(k: String, pc: int, minor: bool) -> void:
+	_spectral_cache[k] = [pc, minor]
+
+## Queued, not fanned out. One task per track meant a folder scan handed the pool a
+## thousand of them at once -- ffprobe plus ffmpeg plus an FFT on every core, which
+## starves the main thread and shows up as the visualizer stuttering and track loads
+## hanging while a scan runs. A single drain task keeps the whole feature on ONE core
+## and leaves the rest of the pool for decode and preload, which are the tasks a user
+## is actually waiting on.
+func queue_spectral_key(path: String) -> void:
+	if _shutdown:
+		return
+	var ck := spectral_cache_key(path)
+	var launch := false
+	_spectral_lock.lock()
+	if not (_spectral_cache.has(ck) or _spectral_pending.has(path)):
+		_spectral_pending[path] = true
+		_spectral_queue.append(path)
+		if not _spectral_running:
+			_spectral_running = true
+			launch = true
+	_spectral_lock.unlock()
+	if launch:
+		_spectral_task = WorkerThreadPool.add_task(_drain_spectral_queue)
+
+## The single worker. Takes the queue one path at a time and stops the moment it runs
+## dry -- the running flag is cleared under the SAME lock as the empty check, so a path
+## queued a microsecond later cannot slip in between and be left with no worker.
+func _drain_spectral_queue() -> void:
+	while not _shutdown:
+		_spectral_lock.lock()
+		if _spectral_queue.is_empty():
+			_spectral_running = false
+			_spectral_lock.unlock()
+			return
+		var path: String = _spectral_queue.pop_front()
+		_spectral_lock.unlock()
+
+		var result := _run_spectral_key(path)
+		_spectral_lock.lock()
+		_spectral_pending.erase(path)
+		if not result.is_empty():
+			_spectral_cache[spectral_cache_key(path)] = [int(result["pc"]), bool(result["minor"])]
+		_spectral_lock.unlock()
+		# deferred, never emitted from this thread: a signal handler repaints UI, and
+		# touching a Control from a worker is a crash waiting for the wrong frame
+		if not result.is_empty():
+			call_deferred("emit_signal", "spectral_key_ready", path,
+				int(result["pc"]), bool(result["minor"]))
+	_spectral_lock.lock()
+	_spectral_running = false
+	_spectral_lock.unlock()
+
+## metadata() already reads the file's own tag; that one probe is cheap (it rides the
+## ffprobe pass every track gets anyway) and is the gate that keeps this from ever
+## running on a tagged file. ffmpeg does the decode, downmix and resample -- the same
+## external dependency the FLAC transcode already relies on, rather than a hand-rolled
+## resampler in GDScript on top of an already CPU-heavy FFT.
+func _run_spectral_key(path: String) -> Dictionary:
+	if int((metadata(path).get("key", {}) as Dictionary).get("pc", -1)) >= 0:
+		return {}   # tagged -- nothing for a spectral guess to add
+	var tmp := ProjectSettings.globalize_path("user://spectral_%d_%d.raw" % [
+		hash(path), OS.get_thread_caller_id()])
+	var args := ["-v", "error", "-i", path, "-ac", "1", "-ar", str(SpectralKey.SAMPLE_RATE),
+		"-f", "s16le", "-y", tmp]
+	var ok := OS.execute("ffmpeg", args, [], true) == 0
+	var result := {}
+	if ok:
+		result = SpectralKey.estimate(tmp)
+	if FileAccess.file_exists(tmp):
+		DirAccess.remove_absolute(tmp)
+	return result
 
 ## One line for the status ticker: what the file is, and what the engine actually plays.
 func ticker_line(path: String) -> String:
