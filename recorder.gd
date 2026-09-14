@@ -19,10 +19,12 @@ extends Node
 signal finished(path: String, ok: bool)
 
 const BUS := "Master"
-## Half a second of headroom. The default 0.1 s is enough only if every single frame
-## pulls on time; one hitch at 30 FPS and the capture buffer overruns and drops audio,
-## which get_discarded_frames() then reports for the rest of the take.
-const BUFFER_SEC := 0.5
+## Two seconds of headroom. The buffer only drains from _process, so it has to outlast the
+## longest thing the main thread ever does synchronously -- a rescan, a skin switch, a big
+## save -- while the mixer keeps filling it. Measured with test_recorder.gd stalling the main
+## thread 1.2 s mid-take: at 0.5 s the take dropped 53760 frames, over a second of audio; at
+## 2.0 s it dropped none and held 99% of the wall-clock span. About 2 MB at a 96 kHz mix.
+const BUFFER_SEC := 2.0
 const FILE_TYPES := ["WAV", "FLAC"]
 const RATES := [44100, 48000, 96000]
 ## WAV: output bit depth. FLAC: ffmpeg compression level, 0 fastest .. 8 smallest.

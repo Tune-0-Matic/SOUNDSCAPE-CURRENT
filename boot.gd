@@ -77,7 +77,7 @@ func _redraw() -> void:
 	var out := _buf.substr(0, int(_shown))
 	match _phase:
 		Phase.ASK:
-			out += "\nENTER NAME: " + _typed + _caret()
+			out += "\nENTER NAME (OR JUST ENTER TO SKIP): " + _typed + _caret()
 		Phase.WELCOME:
 			out += "\nWELCOME BACK " if _returning else "\nWELCOME "
 			out += user_name + "\n\nPRESS SPACE TO ENTER " + _caret()
@@ -102,11 +102,18 @@ func _unhandled_key_input(event: InputEvent) -> void:
 		accept_event()
 		return
 	if k.keycode == KEY_ENTER or k.keycode == KEY_KP_ENTER:
-		if not _typed.strip_edges().is_empty():
-			user_name = _typed.strip_edges().to_upper()
-			_buf += "\nCOMPLETE\n"
-			_shown = float(_buf.length())
-			_phase = Phase.WELCOME
+		if _typed.strip_edges().is_empty():
+			# a blank name is a skip, not a stall: straight into the player, nameless. The
+			# prompt returns next launch, one ENTER away -- the same cost as WELCOME's SPACE.
+			_phase = Phase.DONE
+			visible = false
+			finished.emit("")
+			accept_event()
+			return
+		user_name = _typed.strip_edges().to_upper()
+		_buf += "\nCOMPLETE\n"
+		_shown = float(_buf.length())
+		_phase = Phase.WELCOME
 	elif k.keycode == KEY_BACKSPACE:
 		_typed = _typed.left(_typed.length() - 1)
 	elif k.unicode >= 32 and _typed.length() < MAX_NAME:

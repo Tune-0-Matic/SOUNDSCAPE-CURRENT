@@ -1,0 +1,36 @@
+; libsoundscape_dsp -- SOUNDSCAPE's native DSP bridge.
+;
+; entry_symbol MUST match the extern "C" function in extension/src/register_types.cpp.
+; When they disagree the library loads and registers nothing, which presents as
+; "SsEffect does not exist" with no error printed anywhere -- so test_ss_effect.gd
+; checks for the class rather than assuming the load worked.
+;
+; compatibility_minimum 4.7: the bindings are generated from the 4.7 API
+; (api_version=4.7 in extension/SConstruct). Lowering this without regenerating them
+; is how an extension loads on an older engine and then crashes on the first call
+; into a method whose hash moved.
+;
+; reloadable = false. Hot-reloading an extension that owns audio-thread state means
+; the server can be mid-_process on a pointer into a library being unloaded. This is
+; the one place where the convenience is not worth the class of bug it opens.
+
+[configuration]
+
+entry_symbol = "soundscape_dsp_init"
+compatibility_minimum = "4.7"
+reloadable = false
+
+[libraries]
+
+windows.debug.x86_64 = "res://bin/libsoundscape_dsp.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://bin/libsoundscape_dsp.windows.template_release.x86_64.dll"
+windows.debug.arm64 = "res://bin/libsoundscape_dsp.windows.template_debug.arm64.dll"
+windows.release.arm64 = "res://bin/libsoundscape_dsp.windows.template_release.arm64.dll"
+
+linux.debug.x86_64 = "res://bin/libsoundscape_dsp.linux.template_debug.x86_64.so"
+linux.release.x86_64 = "res://bin/libsoundscape_dsp.linux.template_release.x86_64.so"
+linux.debug.arm64 = "res://bin/libsoundscape_dsp.linux.template_debug.arm64.so"
+linux.release.arm64 = "res://bin/libsoundscape_dsp.linux.template_release.arm64.so"
+
+macos.debug = "res://bin/libsoundscape_dsp.macos.template_debug.framework"
+macos.release = "res://bin/libsoundscape_dsp.macos.template_release.framework"

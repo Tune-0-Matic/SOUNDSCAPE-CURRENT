@@ -103,8 +103,88 @@ const SCHEMES := {
 	},
 }
 
+# --- user skins ------------------------------------------------------------------
+## Palettes dropped into user://skins as .cfg files, no rebuild needed:
+##
+##   [colors]
+##   window="#101418"
+##   accent="#39ff14"          ; any SCHEME_KEYS entry, "#rrggbb" or a Color(...) literal
+##   [style]
+##   border_width=2            ; 0..4, applied only to boxes that have a border already
+##   corner_radius=0           ; 0..12
+##
+## Missing colours fall back to WIN98's, so a three-line file is a whole skin. A value that
+## will not parse rejects the FILE rather than guessing at it, and a name that collides with
+## a built-in is refused, so a stray win98.cfg can never silently replace the default.
+const USER_SKIN_DIR := "user://skins"
+const SCHEME_KEYS := ["window", "panel", "border", "header", "header_text", "text",
+	"screen", "screen_text", "accent"]
+
+static var user_schemes := {}      # NAME -> scheme Dictionary, same shape as SCHEMES
+static var _base_border := {}      # StyleBoxFlat -> its border width as player.tscn built it
+
+static func names() -> Array:
+	var out: Array = NAMES.duplicate()
+	for n in user_schemes:
+		out.append(n)
+	return out
+
+## Rescans `dir` (created if missing, so the folder itself documents where skins go) and
+## returns the names that loaded. Cheap enough to call on every SKIN click.
+static func load_user_skins(dir := USER_SKIN_DIR) -> Array[String]:
+	user_schemes.clear()
+	if not DirAccess.dir_exists_absolute(dir):
+		DirAccess.make_dir_recursive_absolute(dir)
+	var loaded: Array[String] = []
+	var files := Array(DirAccess.get_files_at(dir))
+	files.sort()
+	for f: String in files:
+		if f.get_extension().to_lower() != "cfg":
+			continue
+		var skin_name := f.get_basename().to_upper()
+		if skin_name in NAMES:
+			push_warning("Skins: %s would shadow the built-in %s skin; ignored" % [f, skin_name])
+			continue
+		var s := parse_skin(dir.path_join(f))
+		if s.is_empty():
+			push_warning("Skins: %s did not parse as a skin; ignored" % f)
+			continue
+		user_schemes[skin_name] = s
+		loaded.append(skin_name)
+	return loaded
+
+static func parse_skin(path: String) -> Dictionary:
+	var cfg := ConfigFile.new()
+	if cfg.load(path) != OK:
+		return {}
+	var base: Dictionary = SCHEMES["WIN98"]
+	var s := {}
+	var any := false
+	for key in SCHEME_KEYS + ["accent2"]:
+		# has_section_key first: get_value with a null default counts as NO default, and
+		# Godot logs an ERROR for every colour a partial skin leaves out
+		if not cfg.has_section_key("colors", key):
+			if key in SCHEME_KEYS:
+				s[key] = base[key]
+			continue
+		var v: Variant = cfg.get_value("colors", key)
+		if v is Color:
+			s[key] = v
+		elif v is String and Color.html_is_valid(v):
+			s[key] = Color.html(v)
+		else:
+			return {}
+		any = true
+	if not any:
+		return {}
+	var bw: Variant = cfg.get_value("style", "border_width", 1)
+	var cr: Variant = cfg.get_value("style", "corner_radius", 0)
+	s["border_width"] = clampi(int(bw), 0, 4) if (bw is int or bw is float) else 1
+	s["corner_radius"] = clampi(int(cr), 0, 12) if (cr is int or cr is float) else 0
+	return s
+
 static func apply(theme: Theme, root: Control, name: String) -> void:
-	var s: Dictionary = SCHEMES.get(name, SCHEMES["WIN98"])
+	var s: Dictionary = SCHEMES.get(name, user_schemes.get(name, SCHEMES["WIN98"]))
 	var a2: Color = s.get("accent2", s.accent)
 	# One theme-changed pass, not sixty-odd.
 	#
@@ -182,6 +262,21 @@ static func apply(theme: Theme, root: Control, name: String) -> void:
 	_flat(theme, "TabContainer", "tab_selected").bg_color = s.header
 	_flat(theme, "TabContainer", "tabbar_background").bg_color = s.window
 	_flat(theme, "TabContainer", "panel").bg_color = s.panel
+
+	# [style] from a user skin, or the built-in look for every other skin. A border only
+	# changes on a box that HAS one in player.tscn: the fills and headers are borderless on
+	# purpose, and a 2 px user border must not grow one onto them.
+	var bw: int = int(s.get("border_width", 1))
+	var cr: int = int(s.get("corner_radius", 0))
+	for type in theme.get_type_list():
+		for box in theme.get_stylebox_list(type):
+			var sb := theme.get_stylebox(box, type) as StyleBoxFlat
+			if not sb:
+				continue
+			if not _base_border.has(sb):
+				_base_border[sb] = sb.border_width_left
+			sb.set_border_width_all(bw if int(_base_border[sb]) > 0 else 0)
+			sb.set_corner_radius_all(cr)
 
 	theme.set_block_signals(false)
 	theme.emit_changed()   # the one pass that repaints the program

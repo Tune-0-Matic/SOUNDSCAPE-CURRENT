@@ -3,8 +3,8 @@ extends Control
 ## Pixelated spectrum visualizers. Drawn at low resolution inside a SubViewport and
 ## upscaled with NEAREST, so these are real pixels, not big smooth rectangles.
 ##
-## Normalization (tilt + AGC + attack/release) is shared by every mode and was measured
-## against this library -- see the constants below before changing any of them.
+## Normalization (tilt + a fixed dB window + attack/release) is shared by every mode.
+## The window is absolute, not auto-gained: see _process for why.
 
 ## SNAKE is last and deliberately outside the normal cycle: player.gd's VIZ_NAMES only
 ## reaches it once the code has been typed, so an unlocked mode cannot be stumbled into.
@@ -24,7 +24,8 @@ var director: AudioDirector
 
 var mode: Mode = Mode.SEGMENTS
 var color_index := 0
-## 0..1 -> span_db 80..30. A smaller window means quieter detail reaches full height.
+## 0..1 -> dB floor -80..-40 (0.5 is the -60 the display is tuned around). A higher
+## setting raises the floor, so quieter detail reaches full height.
 var sensitivity := 0.5
 ## Cancels the library's ~39 dB natural slope (band 0 peaks -7 dBFS, band 28 -46).
 ## At 0 the top two thirds of the display never leave the floor.
@@ -35,9 +36,9 @@ var height_scale := 0.62
 ## rather than as an EQ, so the two ranges never cross.
 var speed := 0.5
 
-# Auto-gain is mandatory, not polish: masters here range from -7 to -32 dBFS peak.
-const AGC_FALL := 8.0
-const AGC_FLOOR := -50.0
+## Nothing auto-gains any more -- see the FIXED dB window in _process. The AGC that
+## used to live here is what made the bars pin and thrash, because it moved the scale
+## itself in response to the music it was measuring.
 
 ## The frame rate every per-frame constant below was tuned at. Nothing here should ever
 ## advance "once per _process" again: at 144 FPS that runs 2.4x faster than at 60, which
@@ -76,8 +77,9 @@ static func fps_lerp_test() -> bool:
 	var a: float = settle.call(60.0)
 	var b: float = settle.call(144.0)
 	var c: float = settle.call(30.0)
-	# all three must land within a hair of each other, and of the old 60 FPS behaviour
-	return absf(a - b) < 0.001 and absf(a - c) < 0.001 and a > 0.99
+	var d: float = settle.call(240.0)
+	# all four must land within a hair of each other, and of the old 60 FPS behaviour
+	return absf(a - b) < 0.001 and absf(a - c) < 0.001 and absf(a - d) < 0.001 and a > 0.99
 
 func _attack() -> float: return lerpf(0.22, 0.95, clampf(speed, 0.0, 1.0))
 func _release() -> float: return lerpf(0.04, 0.40, clampf(speed, 0.0, 1.0))
@@ -86,7 +88,6 @@ func _peak_fall() -> float: return lerpf(0.15, 1.30, clampf(speed, 0.0, 1.0))
 var _v := PackedFloat32Array()
 var _peak := PackedFloat32Array()
 var _db := PackedFloat32Array()
-var _agc := -20.0
 var _hue := 0.0
 var _wf_img: Image
 var _wf_tex: ImageTexture
@@ -150,11 +151,22 @@ var _rotate_t := 0.0
 func gradient_index() -> int:
 	return color_index - PRESETS.size() - 1
 
+## Fraction of one cycle spent crossfading the last stop back to the first.
+##
+## The old version only closed the seam when the gradient left a gap of its own (first
+## stop past 0, or last stop before 1) and returned the last colour flat when it did
+## not. Every legacy hex list and every gradient the editor writes spans a full 0..1, so
+## that was the common case -- and there sample() at 0.999 is the last colour while at
+## 0.0 it is the first, with nothing in between. That hard cut is the pop.
+const GRAD_SEAM := 0.12
+
 ## Gradient.sample() does not loop -- an offset past 1.0 just holds the last colour --
-## so an animation whose phase drifts continuously through 0..1 and wraps hit a hard
-## cut from the last stop back to the first. This treats the space between the last
-## stop and the first (crossing the 1.0/0.0 seam) as one more segment, so a looping
-## animation closes smoothly instead of snapping.
+## so an animation whose phase drifts continuously through 0..1 and wraps hits a hard
+## cut from the last stop back to the first. This always reserves a seam: a gradient
+## that leaves its own gap donates it, one that fills 0..1 has GRAD_SEAM taken out of
+## the body instead. Either way the body maps across 0..body and the remainder
+## crossfades last -> first, so sampling either side of the wrap lands on the same
+## colour and the loop closes for ANY gradient rather than only for a gapped one.
 static func sample_looped(grad: Gradient, t: float) -> Color:
 	var n := grad.get_point_count()
 	if n == 0:
@@ -163,29 +175,44 @@ static func sample_looped(grad: Gradient, t: float) -> Color:
 		return grad.get_color(0)
 	var first: float = grad.get_offset(0)
 	var last: float = grad.get_offset(n - 1)
+	var seam: float = maxf((1.0 - last) + first, GRAD_SEAM)
+	var body: float = 1.0 - seam
 	var tt := fposmod(t, 1.0)
-	if tt >= first and tt <= last:
-		return grad.sample(tt)
-	var span: float = (1.0 - last) + first
-	if span <= 0.00001:
-		return grad.get_color(n - 1)
-	var local: float = ((tt - last) if tt > last else (tt + (1.0 - last))) / span
-	return grad.get_color(n - 1).lerp(grad.get_color(0), clampf(local, 0.0, 1.0))
+	if body <= 0.00001:
+		# every stop piled on one offset: there is no body to sweep, only the crossfade
+		return grad.get_color(n - 1).lerp(grad.get_color(0), tt)
+	if tt <= body:
+		return grad.sample(remap(tt, 0.0, body, first, last))
+	return grad.get_color(n - 1).lerp(grad.get_color(0), (tt - body) / seam)
 
-## Colour for a bar at t in 0..1 across the spectrum. Falls back to color() for the
-## fixed and rainbow selections, which are deliberately uniform across the display.
+## How much of the ramp each animated mode lays across the 32 bands. FADE used to spread
+## NONE of it -- every bar took one colour, so a twelve-stop gradient rendered as a
+## single block that slowly changed hue and the spectrum carried no colour information
+## at all. It now sweeps a fraction of the ramp across the columns while still drifting,
+## which is what makes the display read as deep rather than flat; LEFT_RIGHT keeps the
+## full ramp, so the two stay clearly different modes.
+const SPREAD_FADE := 0.45
+## The rainbow preset had the same flat problem. A hue axis across the spectrum is what
+## a spectrum colour is FOR, so it spreads too -- less than a full turn, or the two ends
+## of the display meet and the sweep reads as a repeat rather than a range.
+const SPREAD_RAINBOW := 0.6
+
+## Colour for a bar at t in 0..1 across the spectrum. The fixed presets are deliberately
+## one flat colour; everything else varies across the bands.
 func color_at(t: float) -> Color:
 	var gi := gradient_index()
 	if gi < 0 or gi >= gradients.size():
+		if color_index >= PRESETS.size():
+			return Color.from_hsv(fposmod(_hue + t * SPREAD_RAINBOW, 1.0), 0.85, 1.0)
 		return color()
 	var grad := gradients[gi]
 	match color_anim:
 		ColorAnim.LEFT_RIGHT:
 			return sample_looped(grad, t + _hue)
 		ColorAnim.WAVE:
-			return sample_looped(grad, t + sin((_hue + t) * TAU) * 0.15)
+			return sample_looped(grad, t + _hue + sin((_hue + t) * TAU) * 0.15)
 		ColorAnim.FADE:
-			return sample_looped(grad, _hue)
+			return sample_looped(grad, t * SPREAD_FADE + _hue)
 		_:   # STATIC: pure spatial position, nothing moves over time
 			return grad.sample(clampf(t, 0.0, 1.0))
 
@@ -267,21 +294,32 @@ static func gradient_test() -> bool:
 	var explicit := parse_hex_list("000000@0.0000,ff0055@0.2000,ffffff@1.0000")
 	if to_hex_list(explicit) != "000000@0.0000,ff0055@0.2000,ffffff@1.0000":
 		return false
-	# sample_looped must close the seam: at the exact midpoint of the gap between the
-	# last stop (0.75) and the first (0.25, via the 1.0/0.0 wrap) the two colours
-	# should read roughly half and half -- Gradient.sample() alone would read pure
-	# green there, since nothing past offset 0.75 is defined going forward
-	var loop_g := parse_hex_list("ff0000@0.25,00ff00@0.75")
-	var mid_wrap := sample_looped(loop_g, 0.0)
-	return absf(mid_wrap.r - mid_wrap.g) < 0.1 and mid_wrap.r > 0.3
+	# The seam must be CONTINUOUS -- sampling either side of the 1.0/0.0 wrap has to land
+	# on very nearly the same colour, or the animation snaps once per cycle. The two
+	# full-range lists are the cases that used to pop: with no gap of their own, the old
+	# code jumped from the last stop straight back to the first.
+	for hexes in ["ff0000@0.25,00ff00@0.75", "ff0000@0.0,00ff00@1.0", "000000,ff0055,ffffff"]:
+		var lg := parse_hex_list(hexes)
+		var before := sample_looped(lg, -0.002)
+		var after := sample_looped(lg, 0.002)
+		if absf(before.r - after.r) > 0.05 or absf(before.g - after.g) > 0.05 \
+				or absf(before.b - after.b) > 0.05:
+			return false
+	# ...and it must still SWEEP: a closed seam is worthless if the phase stopped moving
+	var sweep := parse_hex_list("ff0000@0.0,00ff00@1.0")
+	return not sample_looped(sweep, 0.0).is_equal_approx(sample_looped(sweep, 0.4))
 
 func _process(delta: float) -> void:
 	if not director:
 		return
 	var n := AudioDirector.BAND_COUNT
 	if color_index >= PRESETS.size():
-		# ~16 s per full cycle at the middle SPEED setting: a slow drift, not a strobe
-		_hue += delta * 0.062 * lerpf(0.5, 2.0, speed)
+		# ~16 s per full cycle at the middle SPEED setting: a slow drift, not a strobe.
+		# WRAPPED every frame rather than left to grow: an unbounded phase loses float
+		# precision as it climbs (after an hour it is past 200, and the gap between
+		# representable values is coarse enough that the wrap lands unevenly), which is
+		# what made a long-running gradient visibly jump at the seam.
+		_hue = fposmod(_hue + delta * 0.062 * lerpf(0.5, 2.0, speed), 1.0)
 	# Only ticks while a gradient is actually the active selection -- a preset or the
 	# rainbow is not something the rotator should silently steer away from.
 	if rotate_gradients and gradient_index() >= 0 and gradients.size() > 1:
@@ -301,22 +339,41 @@ func _process(delta: float) -> void:
 		while _snake_t >= 1.0:
 			_snake_t -= 1.0
 			_snake_step()
-	var span: float = lerpf(80.0, 30.0, clampf(sensitivity, 0.0, 1.0))
-	var top := -200.0
-	for i in n:
-		# linear amplitude -> dB, then tilt. dB is the only mapping that spreads a real
-		# mix over the full height instead of leaving it pinned to the floor.
-		_db[i] = linear_to_db(maxf(director.levels[i], 1e-7)) + tilt_db * float(i) / float(n)
-		top = maxf(top, _db[i])
-	_agc = maxf(maxf(_agc - AGC_FALL * delta, top), AGC_FLOOR)
-	var atk := _attack()
-	var rel := _release()
-	var pf := _peak_fall()
-	for i in n:
-		var t := clampf(inverse_lerp(_agc - span, _agc, _db[i]), 0.0, 1.0)
-		# was lerpf(...) with no delta, which is what made the bars snap at high FPS
-		_v[i] = _fps_lerp(_v[i], t, atk if t > _v[i] else rel, delta)
-		_peak[i] = maxf(_peak[i] - pf * delta, _v[i])
+	# FIXED dB window, 0 dBFS at the top. The auto-gain this replaces chased the loudest
+	# band down to a -50 dB floor, which is why the display pinned to full height on
+	# anything dense and thrashed between bands on anything sparse: the scale itself was
+	# moving under the bars. An absolute window means a loud mix reads loud and a quiet
+	# one reads quiet, which is what a meter is for.
+	#
+	# SENSITIVITY moves the FLOOR rather than a relative span -- 0.5 lands on the -60 dB
+	# the display is tuned around, and the ends stay useful for very quiet or very hot
+	# material without handing the scale back to an AGC.
+	# Silent feed means an EXACTLY empty display. AudioDirector zeroes its own bands when
+	# the player is stopped; without matching that here the bars would hold their last
+	# smoothed value forever, because _fps_lerp only ever approaches zero asymptotically.
+	#
+	# ONLY the bands are zeroed. Everything else keeps running on an idle feed: the hue
+	# drift, the gradient rotator, SNAKE, and -- no longer behind an early return -- the
+	# stepped modes below. That return used to freeze FIRE on its last flame, WATERFALL on
+	# its last rows and GRID on its last spectra for as long as playback stayed stopped;
+	# fed zeros they empty themselves on the same wall-clock schedule at any FPS.
+	if director.levels.is_empty() or not director.is_live():
+		_v.fill(0.0)
+		_peak.fill(0.0)
+		_db.fill(0.0)
+	else:
+		var floor_db: float = lerpf(-80.0, -40.0, clampf(sensitivity, 0.0, 1.0))
+		var atk := _attack()
+		var rel := _release()
+		var pf := _peak_fall()
+		for i in n:
+			# linear amplitude -> dB, then tilt. dB is the only mapping that spreads a real
+			# mix over the full height instead of leaving it pinned to the floor.
+			_db[i] = linear_to_db(maxf(director.levels[i], 1e-7)) + tilt_db * float(i) / float(n)
+			var t := clampf(remap(_db[i], floor_db, 0.0, 0.0, 1.0), 0.0, 1.0)
+			# was lerpf(...) with no delta, which is what made the bars snap at high FPS
+			_v[i] = _fps_lerp(_v[i], t, atk if t > _v[i] else rel, delta)
+			_peak[i] = maxf(_peak[i] - pf * delta, _v[i])
 	# divisor derived from the bands actually summed, not a hardcoded 6: BAND_COUNT is a
 	# constant today but a smaller one would have this understating bass, and a zero one
 	# would divide by zero
@@ -378,9 +435,8 @@ func _draw_segments(mirror: bool) -> void:
 	var base := size.y * 0.5 if mirror else size.y
 	var full := (size.y * 0.5 if mirror else size.y * height_scale)
 	for i in n:
-		# per BAR, so a gradient runs left to right across the spectrum. For the fixed and
-		# rainbow selections color_at falls through to color(), which is uniform, so this
-		# costs one extra call per band and changes nothing about how they look.
+		# per BAR, so a gradient -- or the rainbow -- runs left to right across the
+		# spectrum. Only the fixed presets still fall through to the uniform color().
 		var c := color_at(float(i) / float(maxi(n - 1, 1)))
 		var x := _col_x(i)
 		var bw := _col_w(i)

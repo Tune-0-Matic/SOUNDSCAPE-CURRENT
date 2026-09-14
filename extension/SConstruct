@@ -1,0 +1,96 @@
+#!/usr/bin/env python
+"""
+libsoundscape_dsp -- SOUNDSCAPE's native DSP bridge.
+
+    cd extension
+    scons target=template_debug        # -> ../bin/libsoundscape_dsp.<suffix>.<ext>
+    scons target=template_release
+    scons -c                           # clean
+
+godot-cpp is expected at extension/godot-cpp. Override with godot_cpp_dir=<path>,
+which is worth doing on this machine: the project lives under OneDrive, and a
+godot-cpp checkout there is ~30 MB of files OneDrive will happily sync forever.
+
+    scons godot_cpp_dir=C:/dev/godot-cpp target=template_debug
+
+api_version is pinned to 4.7 to match compatibility_minimum in
+soundscape.gdextension. godot-cpp master ships extension_api-4-7.json, whose
+AudioEffectInstance._process signature was diffed against this machine's own
+`--dump-extension-api` output and found identical -- see STEP0.md.
+"""
+
+import os
+import sys
+
+# --- where godot-cpp lives ----------------------------------------------------
+# Read before the SConscript call because that call needs the path, and SCons has
+# not built an Environment for us yet.
+#
+# POPPED, not read: godot-cpp's own SConstruct validates ARGUMENTS against the
+# variables it knows and warns about anything left over, so leaving ours in prints
+# "Unknown SCons variables were passed and will be ignored" on every single build --
+# a warning that is both wrong (it was not ignored) and permanent.
+godot_cpp_dir = ARGUMENTS.pop("godot_cpp_dir", os.environ.get("GODOT_CPP_DIR", "godot-cpp"))
+
+if not os.path.isfile(os.path.join(godot_cpp_dir, "SConstruct")):
+    print("")
+    print("  godot-cpp not found at: %s" % os.path.abspath(godot_cpp_dir))
+    print("")
+    print("  Vendor it (shallow -- the full history is ~200 MB and buys nothing):")
+    print("    git clone --depth 1 --branch master \\")
+    print("        https://github.com/godotengine/godot-cpp.git %s" % godot_cpp_dir)
+    print("")
+    print("  There is no godot-cpp branch or tag for 4.7 -- upstream branches stop at")
+    print("  4.5 and master is what carries extension_api-4-7.json. Pin the commit you")
+    print("  build against; STEP0.md records the one this was verified on.")
+    print("")
+    print("  Or point at an existing checkout:")
+    print("    scons godot_cpp_dir=C:/dev/godot-cpp")
+    print("")
+    Exit(1)
+
+# api_version keeps the generated bindings on the 4.7 API. Passing it here rather
+# than relying on the default is what stops a godot-cpp master that has moved on to
+# 4.8 from silently generating bindings this engine cannot load.
+env = SConscript(os.path.join(godot_cpp_dir, "SConstruct"), {"api_version": "4.7"})
+
+# --- our sources --------------------------------------------------------------
+env.Append(CPPPATH=["src/"])
+sources = Glob("src/*.cpp")
+
+# --- RT-safety hardening ------------------------------------------------------
+# Exceptions are already off in godot-cpp's own flags; these are the two that matter
+# for an audio callback and are not.
+#
+#   - denormals: a decaying tail that reaches ~1e-38 costs hundreds of cycles per
+#     sample on x86 unless flush-to-zero is on. It is the classic "the reverb tail
+#     makes the CPU meter spike" bug, and it is a compiler flag, not a code fix.
+#   - fast-math is deliberately NOT enabled: it lets the compiler reassociate float
+#     arithmetic, and the pass-through milestone asserts BIT-IDENTICAL output. An
+#     optimiser that is allowed to reorder a sum cannot be asked for exactness.
+if env["platform"] == "windows" and env.get("use_mingw", False) is False:
+    # MSVC: /fp:precise is the default and is what the bit-identical assertion needs.
+    env.Append(CCFLAGS=["/fp:precise"])
+else:
+    env.Append(CCFLAGS=["-ffp-contract=off"])  # no fused multiply-add substitution
+
+env.Append(CPPDEFINES=["SOUNDSCAPE_DSP"])
+
+# --- output -------------------------------------------------------------------
+# env["suffix"] is godot-cpp's ".<platform>.<target>.<arch>" string, which is exactly
+# the shape soundscape.gdextension's [libraries] keys expect. Building the name from
+# it rather than by hand is what keeps the two files from drifting apart.
+if env["platform"] == "macos":
+    library = env.SharedLibrary(
+        "../bin/libsoundscape_dsp.{}.{}.framework/libsoundscape_dsp.{}.{}".format(
+            env["platform"], env["target"], env["platform"], env["target"]
+        ),
+        source=sources,
+    )
+else:
+    library = env.SharedLibrary(
+        "../bin/libsoundscape_dsp{}{}".format(env["suffix"], env["SHLIBSUFFIX"]),
+        source=sources,
+    )
+
+Default(library)

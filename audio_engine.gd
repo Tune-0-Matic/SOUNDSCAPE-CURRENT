@@ -2,24 +2,21 @@ class_name AudioEngine
 extends Node
 ## Decoding, caching, metadata and queue management for the media player.
 ##
-## FIDELITY CEILING -- read this before trusting the word "lossless" anywhere below.
-## Godot 4.7 has no FLAC decoder (AudioStreamFLAC does not exist; AudioStream recognizes
-## only mp3str / oggvorbisstr / sample). AudioStreamWAV supports 8- and 16-bit PCM only.
-## So a 24-bit source is ALWAYS truncated to 16-bit somewhere in this pipeline. There is
-## no bit-transparent path in this engine version, and no arrangement of these functions
-## creates one. What IS preserved:
-##   - sample rate, exactly, at any rate (44.1 / 48 / 96 / 192 kHz all verified loading)
-##   - channel count
-##   - no lossy re-encode: FLAC is decoded straight to PCM, never through mp3/ogg
-## Set audio/driver/mix_rate to match your material or the AudioServer resamples on output.
+## FIDELITY -- read this before trusting the word "lossless" anywhere below.
+## FLAC decodes natively in libsoundscape_dsp (SsFlacStream, dr_flac): 24-bit and hi-res
+## files reach the mixer as 32-bit float at their own sample rate, with no transcode, no
+## cache file and no ffmpeg spawn. Float holds every 24-bit sample exactly, so nothing is
+## truncated on the way IN. What happens next is Godot's: the mixer resamples to
+## audio/driver/mix_rate when the rates differ, the deck's effects run in float, and the
+## device takes whatever format it negotiated. WAV still loads through AudioStreamWAV, which
+## is 16-bit; MP3 and Ogg decode to float.
 
-signal track_ready(path: String, stream: AudioStream, meta: Dictionary)
+signal track_ready(path: String, stream: AudioStream, meta: Dictionary, deck: int)
 signal track_failed(path: String, reason: String)
 signal queue_changed()
 
 enum Repeat { OFF, ALL, ONE }
 
-const CHUNK := 1 << 20  # 1 MiB streaming copy, so a 90 MB wav never sits in RAM twice
 
 ## Pitch-class names, index 0 = C. Only used to render a key TAG; nothing here
 ## analyses audio.
@@ -39,7 +36,9 @@ var _meta := {}
 var _meta_lock := Mutex.new()
 var _next_stream: AudioStream  # preloaded so a track change does not stall on disk I/O
 var _next_path := ""
-var _token := 0
+## One generation counter PER DECK. A single shared one let a request on deck B supersede a
+## decode still in flight for deck A; each deck now only ever cancels its own.
+var _tokens: Array[int] = [0, 0]
 
 # --- decks -----------------------------------------------------------------
 ## Two mixer channels under one engine. Each deck is a bus plus the players that feed it;
@@ -236,39 +235,43 @@ func prev_index() -> int:
 # --- request ---------------------------------------------------------------
 ## Asks for a track. Emits track_ready on the main thread when the stream and its
 ## metadata are both available. Any work that can block (ffmpeg, ffprobe, reading a
-## 90 MB wav) happens on a worker; only the newest request is honoured.
+## 90 MB wav) happens on a worker; only the newest request PER DECK is honoured.
 func request(i: int) -> void:
-	if i < 0 or i >= queue.size():
+	if i < 0 or i >= queue.size() or _shutdown:
 		return
 	index = i
-	_token += 1
-	var token := _token
+	# The deck is captured HERE, at request time. A cold FLAC transcode takes seconds, and
+	# switching decks inside that window must not redirect the result: it belongs to the
+	# deck that asked for it, and track_ready carries that deck back to player.gd.
+	var d := deck
+	_tokens[d] += 1
+	var token: int = _tokens[d]
 	var path := queue[i]
 	if path == _next_path and _next_stream:  # preloaded by the previous track
 		var s := _next_stream
 		_next_stream = null
 		_next_path = ""
-		_deliver(token, path, s)
+		_deliver(d, token, path, s)
 		return
-	WorkerThreadPool.add_task(func() -> void:
+	run_task(func() -> void:
 		# The pool QUEUES tasks, so by the time this one starts several more skips may have
 		# landed. Testing the token here rather than only in _deliver is what stops a
 		# superseded track decoding anyway -- which for a FLAC means a full ffmpeg spawn and
 		# 35-160 MB of PCM materialised for a track nobody is going to hear.
-		if token != _token:
+		if token != _tokens[d] or _shutdown:
 			return
 		var s := decode(path)
 		var m := metadata(path)
-		_deliver.bind(token, path, s, m).call_deferred())
+		_deliver.bind(d, token, path, s, m).call_deferred())
 
-func _deliver(token: int, path: String, s: AudioStream, m: Dictionary = {}) -> void:
-	if token != _token:
-		return  # superseded by a newer request; drop it rather than hijack playback
+func _deliver(d: int, token: int, path: String, s: AudioStream, m: Dictionary = {}) -> void:
+	if _shutdown or token != _tokens[d]:
+		return  # superseded on this deck, or closing; drop it rather than hijack playback
 	if not s:
 		track_failed.emit(path, "decode failed")
 		return
-	track_ready.emit(path, s, m if not m.is_empty() else metadata(path))
-	_preload(next_index())
+	track_ready.emit(path, s, m if not m.is_empty() else metadata(path), d)
+	_preload(next_index(), d)
 
 ## Warms the NEXT track's stream AND its metadata on a worker, so a transition costs no
 ## disk I/O and no process spawn.
@@ -281,7 +284,7 @@ func _deliver(token: int, path: String, s: AudioStream, m: Dictionary = {}) -> v
 ##
 ## Holds one decoded stream in RAM (~90 MB for a 4 min 96 kHz stereo track) -- that is
 ## the price of gapless-feeling transitions. Drop this call to trade smoothness for RAM.
-func _preload(i: int) -> void:
+func _preload(i: int, d: int) -> void:
 	if i < 0 or i >= queue.size() or queue[i] == _next_path:
 		return
 	var path := queue[i]
@@ -290,15 +293,15 @@ func _preload(i: int) -> void:
 	# points somewhere else -- 35-160 MB of decoded PCM for a track nothing is heading to.
 	# Dropped here, so at most one preloaded stream is ever resident.
 	_next_stream = null
-	var token := _token
-	WorkerThreadPool.add_task(func() -> void:
-		if token != _token:
+	var token: int = _tokens[d]
+	run_task(func() -> void:
+		if token != _tokens[d] or _shutdown:
 			return   # queue moved on while this sat in the pool: no decode, no ffmpeg
 		var s := decode(path)
 		metadata(path)   # so _deliver never has to probe on the main thread
 		(func() -> void:
-			# re-tested on the main thread, which is where _token and _next_path settle
-			if token == _token and _next_path == path:
+			# re-tested on the main thread, which is where the tokens and _next_path settle
+			if token == _tokens[d] and _next_path == path and not _shutdown:
 				_next_stream = s).call_deferred())
 
 # --- decoding --------------------------------------------------------------
@@ -307,148 +310,41 @@ func decode(path: String) -> AudioStream:
 		"mp3": return AudioStreamMP3.load_from_file(path)
 		"ogg": return AudioStreamOggVorbis.load_from_file(path)
 		"wav": return AudioStreamWAV.load_from_file(path)
-		"flac":
-			var c := cache_path(path)
-			return AudioStreamWAV.load_from_file(c) if _to_pcm(path, c) else null
+		"flac": return native_flac(path)
 	return null
 
-func cache_path(src: String) -> String:
-	return "user://pcm_%d.wav" % hash(src)
+## True when libsoundscape_dsp loaded and registered SsFlacStream. Without it a FLAC does not
+## play at all: the ffmpeg transcode fallback is gone on purpose, rather than kept as a second,
+## 16-bit path that would quietly mask a library that failed to load.
+static func native_flac_available() -> bool:
+	return ClassDB.class_exists("SsFlacStream")
 
-## Deletes cached PCM belonging to tracks that are no longer in the library. The cache is
-## keyed by a hash of the ABSOLUTE source path, so renaming or moving a FLAC orphans its
-## entry permanently and nothing would ever reclaim it -- and these files run 30-120 MB
-## each. Called after every library scan; returns how many files were removed.
-##
-## Anything under user:// starting with "pcm_" is in scope, which also sweeps up the
-## `.wav.pcm` and `.wav.part` temporaries a transcode killed part-way through leaves
-## behind. A track mid-decode is safe: it is in the library, so its entry is kept.
-func prune_cache(active: Array[String]) -> int:
-	var keep := {}
-	for p in active:
-		if p.get_extension().to_lower() == "flac":
-			keep[cache_path(p).get_file()] = true
-	var dir := DirAccess.open("user://")
-	if not dir:
-		return 0
-	var removed := 0
-	for f in dir.get_files():
-		if not f.begins_with("pcm_"):
+## The COMPRESSED bytes are what stays resident -- about 130 MB for 4 min of 96 kHz/24-bit,
+## 30 MB at CD rate -- and frames decode block by block inside the mix, so there is no decoded
+## copy at all. Called on a worker by request()/_preload(), like every other decode.
+static func native_flac(path: String) -> AudioStream:
+	if not native_flac_available():
+		push_warning("%s: FLAC needs libsoundscape_dsp, which did not load" % path.get_file())
+		return null
+	var s: AudioStream = ClassDB.instantiate("SsFlacStream")
+	return s if int(s.call("load", path)) == OK else null
+
+## Every build before native FLAC cached an ffmpeg transcode of each FLAC in user:// as
+## pcm_<hash>.wav -- 30-120 MB apiece -- plus .part/.pcm leftovers from interrupted runs.
+## Nothing reads them any more. Swept once per session; returns the bytes reclaimed.
+static func purge_transcode_cache(dir := "user://") -> int:
+	var freed := 0
+	for f in DirAccess.get_files_at(dir):
+		if not (f.begins_with("pcm_") and f.contains(".wav")):
 			continue
-		# "pcm_123.wav.part" and "pcm_123.wav.pcm" both belong to "pcm_123.wav"
-		var owner := f
-		var cut := f.find(".wav")
-		if cut >= 0:
-			owner = f.substr(0, cut + 4)
-		if keep.has(owner):
-			continue
-		if dir.remove(f) == OK:
-			removed += 1
-	return removed
-
-## FLAC -> PCM at the SOURCE sample rate.
-##
-## We deliberately do NOT let ffmpeg mux the wav. Above 48 kHz its wav muxer emits
-## WAVE_FORMAT_EXTENSIBLE (fmt tag 0xFFFE, 40-byte fmt chunk) and Godot's parser rejects
-## that outright -- load_from_file returns null with no error, which reads as "the track
-## just will not switch". Piping raw s16le and writing a canonical 16-byte PCM header
-## ourselves keeps the native rate AND loads: verified at 44.1 / 48 / 96 / 192 kHz.
-## (The older workaround, -ar 44100, also loaded but threw away the hi-res rate.)
-func _to_pcm(src: String, dst: String) -> bool:
-	# A cache hit has to be a USABLE file, not merely a present one. A transcode killed
-	# between creating the file and filling it leaves a zero-byte or header-only wav,
-	# and the old existence check accepted it forever -- load_from_file then returned
-	# null on every play with no error. Anything at or under a bare 44-byte RIFF header
-	# holds no audio, so it is treated as a miss and re-transcoded.
-	if FileAccess.file_exists(dst):
-		var f := FileAccess.open(dst, FileAccess.READ)
-		var usable := f != null and f.get_length() > 44
-		if f:
-			f.close()
-		if usable:
-			return true
-		DirAccess.remove_absolute(ProjectSettings.globalize_path(dst))
-	var m := metadata(src)
-	var rate: int = m.get("sample_rate", 44100)
-	var ch: int = clampi(m.get("channels", 2), 1, 2)  # AudioStreamWAV is mono or stereo only
-	# Thread id in the temp names, exactly as metadata() does for its probe JSON and for
-	# exactly the same reason: two workers can legitimately be transcoding the SAME file at
-	# once. The preload for track N+1 is still running when the user clicks track N+1, and
-	# request() only takes the warmed stream if it has already ARRIVED -- otherwise it
-	# starts a second decode of the same path. With names derived from the path alone the
-	# two runs wrote over each other's .pcm and .part. Measured on a cold cache: one round
-	# produced a file 176 bytes short that still LOADED -- a silently truncated track,
-	# cached forever, because the >44-byte hit check accepts it -- and the next round
-	# produced a zero-byte one.
-	var tag := str(OS.get_thread_caller_id())
-	var raw_rel := "%s.%s.pcm" % [dst, tag]
-	var part_rel := "%s.%s.part" % [dst, tag]
-	var raw := ProjectSettings.globalize_path(raw_rel)
-	var out: Array = []
-	# s16le because AudioStreamWAV has no 24-bit format. This is the truncation point.
-	var args := ["-y", "-v", "error", "-i", src, "-map", "0:a:0",
-		"-c:a", "pcm_s16le", "-ac", str(ch), "-f", "s16le", raw]
-	if OS.execute("ffmpeg", args, out, true) != 0:
-		push_warning("ffmpeg failed on %s: %s" % [src.get_file(), "".join(out)])
-		DirAccess.remove_absolute(raw)
-		return false
-	var ok := _wrap_pcm(raw_rel, part_rel, rate, ch)
-	DirAccess.remove_absolute(raw)
-	if not ok:
-		return false
-	# rename last, so an interrupted run never leaves a half-written file in the cache
-	if DirAccess.rename_absolute(ProjectSettings.globalize_path(part_rel),
-			ProjectSettings.globalize_path(dst)) == OK:
-		return true
-	# Lost the race: another worker finished the same file first. Its result is exactly as
-	# good as ours, so drop ours and use it rather than reporting a decode failure.
-	DirAccess.remove_absolute(ProjectSettings.globalize_path(part_rel))
-	return FileAccess.file_exists(dst)
-
-func _wrap_pcm(raw: String, dst: String, rate: int, ch: int) -> bool:
-	var src := FileAccess.open(raw, FileAccess.READ)
-	if not src:
-		return false
-	var f := FileAccess.open(dst, FileAccess.WRITE)
-	if not f:
-		src.close()
-		return false
-	f.store_buffer(wav_header(src.get_length(), rate, ch))
-	while not src.eof_reached():
-		f.store_buffer(src.get_buffer(CHUNK))
-	f.close()
-	src.close()
-	return true
-
-## Canonical 44-byte RIFF/WAVE header: 16-byte fmt chunk, wFormatTag = 1 (PCM).
-## Godot accepts this at any sample rate; it is the extensible variant it refuses.
-static func wav_header(data_bytes: int, rate: int, ch: int) -> PackedByteArray:
-	var b := PackedByteArray()
-	b.append_array("RIFF".to_ascii_buffer())
-	b.append_array(_i32(36 + data_bytes))
-	b.append_array("WAVEfmt ".to_ascii_buffer())
-	b.append_array(_i32(16))          # fmt chunk size: 16, never 40
-	b.append_array(_i16(1))           # WAVE_FORMAT_PCM
-	b.append_array(_i16(ch))
-	b.append_array(_i32(rate))
-	b.append_array(_i32(rate * ch * 2))  # byte rate
-	b.append_array(_i16(ch * 2))         # block align
-	b.append_array(_i16(16))             # bits per sample
-	b.append_array("data".to_ascii_buffer())
-	b.append_array(_i32(data_bytes))
-	return b
-
-static func _i32(v: int) -> PackedByteArray:
-	var a := PackedByteArray()
-	a.resize(4)
-	a.encode_s32(0, v)
-	return a
-
-static func _i16(v: int) -> PackedByteArray:
-	var a := PackedByteArray()
-	a.resize(2)
-	a.encode_s16(0, v)
-	return a
+		var path := dir.path_join(f)
+		var file := FileAccess.open(path, FileAccess.READ)
+		var size := file.get_length() if file else 0
+		if file:
+			file.close()
+		if DirAccess.remove_absolute(ProjectSettings.globalize_path(path)) == OK:
+			freed += size
+	return freed
 
 # --- metadata --------------------------------------------------------------
 ## Godot cannot read FLAC/Vorbis/ID3 tags, so this shells out to ffprobe, which ships
@@ -473,6 +369,8 @@ func cached_meta(path: String) -> Dictionary:
 	_meta_lock.lock()
 	var d: Variant = _meta.get(path)
 	_meta_lock.unlock()
+	if d == null:
+		d = _from_disk(path)   # a stat, never a probe
 	return d if d else {}
 
 func metadata(path: String) -> Dictionary:
@@ -481,11 +379,11 @@ func metadata(path: String) -> Dictionary:
 	_meta_lock.unlock()
 	if cached != null:
 		return cached
-	var d := {
-		"title": path.get_file().get_basename(), "artist": "", "album": "",
-		"sample_rate": 44100, "channels": 2, "bits": 16, "codec": path.get_extension().to_upper(),
-		"key": {"text": "", "pc": -1, "minor": false}, "duration": 0.0,
-	}
+	var indexed: Variant = _from_disk(path)
+	if indexed != null:
+		return indexed   # probed in an earlier session and unchanged since: no ffprobe
+	var stamp := file_stamp(path)
+	var d := default_meta(path)
 	# ffprobe emits UTF-8, but OS.execute decodes its output with the system ANSI codepage,
 	# which mojibakes any non-Latin tag (Japanese album names came back as "ä¸­åŽŸ").
 	# Writing to a file and reading it back with FileAccess decodes UTF-8 correctly.
@@ -543,12 +441,119 @@ func metadata(path: String) -> Dictionary:
 	# result, and handing back that instance rather than this one keeps every caller
 	# pointing at the same Dictionary.
 	_meta_lock.lock()
+	probes += 1
 	var winner: Variant = _meta.get(path)
 	if winner == null:
 		_meta[path] = d
+		_stamps[path] = stamp
 		winner = d
 	_meta_lock.unlock()
 	return winner
+
+# --- persistent library index ------------------------------------------------------
+## Everything metadata() learns is kept across sessions in user://library_index.dat, and
+## trusted only while the file it describes is unchanged: each entry carries that file's
+## modification time and size, and a mismatch drops the entry so the track is probed afresh.
+## A cold start therefore runs ffprobe only for what is new or edited -- durations, tags and
+## keys for everything else are dictionary reads, which is what lets TRACKS sort by ARTIST,
+## ALBUM and KEY the moment the library appears.
+const INDEX_PATH := "user://library_index.dat"
+const INDEX_VERSION := 1
+
+var probes := 0      # ffprobe runs this session, under _meta_lock; test_library_index.gd reads it
+var _stamps := {}    # path -> [mtime, size] for each _meta entry probed or validated this session
+var _disk := {}      # path -> [mtime, size, meta] loaded from the index, not yet re-validated
+
+static func default_meta(path: String) -> Dictionary:
+	return {
+		"title": path.get_file().get_basename(), "artist": "", "album": "",
+		"sample_rate": 44100, "channels": 2, "bits": 16, "codec": path.get_extension().to_upper(),
+		"key": {"text": "", "pc": -1, "minor": false}, "duration": 0.0,
+	}
+
+## [mtime, size], or [] when the file cannot be opened. Opening a handle reads no audio, so
+## a OneDrive placeholder is not hydrated by being checked.
+static func file_stamp(path: String) -> Array:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if not f:
+		return []
+	var size := f.get_length()
+	f.close()
+	return [FileAccess.get_modified_time(path), size]
+
+## Main thread, before any worker exists. Every field is type-checked against default_meta,
+## because a stale or hand-damaged index must degrade to "probe again", never to a crash.
+func load_index(path := INDEX_PATH) -> int:
+	_disk.clear()
+	if not FileAccess.file_exists(path):
+		return 0
+	var f := FileAccess.open(path, FileAccess.READ)
+	if not f:
+		return 0
+	var blob: Variant = f.get_var()   # plain data only: get_var never instantiates objects
+	f.close()
+	if not (blob is Dictionary and blob.get("version") == INDEX_VERSION and blob.get("entries") is Dictionary):
+		return 0
+	var entries: Dictionary = blob["entries"]
+	for p in entries:
+		var e: Variant = entries[p]
+		if not (p is String and e is Array and (e as Array).size() == 3 and e[2] is Dictionary):
+			continue
+		var clean := default_meta(p)
+		var got: Dictionary = e[2]
+		for k in clean:
+			if got.has(k) and typeof(got[k]) == typeof(clean[k]):
+				clean[k] = got[k]
+		var key: Dictionary = clean["key"]
+		if not (key.get("pc") is int and key.get("minor") is bool and key.get("text") is String):
+			clean["key"] = default_meta(p)["key"]
+		_disk[p] = [e[0], e[1], clean]
+	return _disk.size()
+
+## An index entry promoted into the session cache if its file still matches, else null.
+## ponytail: one stat per indexed track on first use, on whichever thread asks -- for the
+## TRACKS readout that is the main thread. Validate on a worker if huge libraries ever stall.
+func _from_disk(path: String) -> Variant:
+	_meta_lock.lock()
+	var e: Variant = _disk.get(path)
+	_meta_lock.unlock()
+	if e == null:
+		return null
+	var stamp := file_stamp(path)
+	_meta_lock.lock()
+	_disk.erase(path)
+	var result: Variant = _meta.get(path)
+	if result == null and stamp.size() == 2 and stamp[0] == e[0] and stamp[1] == e[1]:
+		_meta[path] = e[2]
+		_stamps[path] = stamp
+		result = e[2]
+	_meta_lock.unlock()
+	return result
+
+## Writes what is known about `keep` (the library as scanned). Entries for anything else are
+## dropped, so a deleted or unchecked-and-forgotten track does not live in the index forever.
+func save_index(keep: Array[String], path := INDEX_PATH) -> Error:
+	var live := {}
+	for p in keep:
+		live[p] = true
+	var entries := {}
+	_meta_lock.lock()
+	for p in _meta:
+		if live.has(p) and _stamps.has(p):
+			entries[p] = [_stamps[p][0], _stamps[p][1], _meta[p]]
+	for p in _disk:   # indexed, not visited this session: still valid as far as anyone knows
+		if live.has(p) and not entries.has(p):
+			entries[p] = _disk[p]
+	_meta_lock.unlock()
+	var target := ProjectSettings.globalize_path(path)
+	var f := FileAccess.open(target + ".tmp", FileAccess.WRITE)
+	if not f:
+		return FileAccess.get_open_error()
+	f.store_var({"version": INDEX_VERSION, "entries": entries})
+	f.close()
+	if FileAccess.file_exists(target):
+		DirAccess.remove_absolute(target)   # a cache, not the config: a lost race only re-probes
+	return DirAccess.rename_absolute(target + ".tmp", target)
 
 # --- key tags ---------------------------------------------------------------
 ## The key comes from the file's own tag, read in the ffprobe pass above -- there is no
@@ -644,7 +649,7 @@ signal reversed_ready(path: String, stream: AudioStream)
 func request_reversed(path: String) -> void:
 	if path.is_empty() or _shutdown:
 		return
-	_reverse_tasks.append(WorkerThreadPool.add_task(func() -> void:
+	run_task(func() -> void:
 		if _shutdown:
 			return
 		var out := ProjectSettings.globalize_path("user://rev_%d.wav" % hash(path))
@@ -656,7 +661,7 @@ func request_reversed(path: String) -> void:
 				return
 		var stream := AudioStreamWAV.load_from_file(out)
 		if stream:
-			call_deferred("emit_signal", "reversed_ready", path, stream)))
+			call_deferred("emit_signal", "reversed_ready", path, stream))
 
 # --- offline spectral key estimation ------------------------------------------------
 ## Everything above is what runs at playtime, and stays true to its own rule: no DSP
@@ -678,26 +683,51 @@ var _spectral_cache := {}     # str(hash(path)) -> [pc, minor] -- loaded from li
 var _spectral_pending := {}   # path -> true, so a rescan never queues the same file twice
 var _spectral_queue: Array[String] = []   # waiting to be analysed, drained by ONE worker
 var _spectral_running := false
-var _spectral_task := -1
-var _reverse_tasks: Array[int] = []       # main thread only: request_reversed is UI-side
+## Every WorkerThreadPool task this engine starts -- decodes, preloads, reverse renders,
+## the spectral drain -- plus the duration sweeps player.gd routes through run_task.
+## Main thread only. The old shutdown() joined just the spectral and reverse tasks, so a
+## decode or a sweep still running when the tree was freed called back into a dead object.
+var _tasks: Array[int] = []
 
 ## Set by shutdown(). Every worker checks it between items, so a queue with hundreds of
 ## tracks left in it abandons them immediately instead of holding the process open.
 var _shutdown := false
 
-## Called before the scene tree frees this node. Without it, a worker can be midway
-## through writing _spectral_cache under _spectral_lock while the main thread tears the
-## engine down -- the lock outlives the object that owns it and the process wedges on
-## exit instead of closing. Waits only for what is genuinely in flight: _shutdown makes
-## the drain loop drop everything still queued rather than finish the backlog.
+## Starts `fn` on the pool and keeps its id for shutdown(). Finished ids are reaped on the
+## way in: the pool keeps a task's record until something waits on it, so an id nobody
+## ever joins is a small leak on every track change.
+func run_task(fn: Callable) -> void:
+	if _shutdown:
+		return
+	reap_tasks(_tasks)
+	_tasks.append(WorkerThreadPool.add_task(fn))
+
+func is_shut_down() -> bool:
+	return _shutdown
+
+static func reap_tasks(ids: Array[int]) -> void:
+	for k in range(ids.size() - 1, -1, -1):
+		if WorkerThreadPool.is_task_completed(ids[k]):
+			WorkerThreadPool.wait_for_task_completion(ids[k])
+			ids.remove_at(k)
+
+static func join_tasks(ids: Array[int]) -> void:
+	for id in ids:
+		WorkerThreadPool.wait_for_task_completion(id)
+	ids.clear()
+
+## Called before the scene tree frees this node: explicitly from player.gd's close
+## handler, and from _exit_tree for everything else (a headless test that just quits).
+## The flag goes up first, so every queued task returns on its first check, then ALL of
+## them are joined. Idempotent, so the second call on the way out is free.
+## ponytail: a task already inside ffmpeg cannot be interrupted, so closing mid-transcode
+## waits for that one process; killing it would need OS.create_process and a pid.
 func shutdown() -> void:
 	_shutdown = true
-	if _spectral_task != -1:
-		WorkerThreadPool.wait_for_task_completion(_spectral_task)
-		_spectral_task = -1
-	for id in _reverse_tasks:
-		WorkerThreadPool.wait_for_task_completion(id)
-	_reverse_tasks.clear()
+	join_tasks(_tasks)
+
+func _exit_tree() -> void:
+	shutdown()
 
 static func spectral_cache_key(path: String) -> String:
 	return str(hash(path))
@@ -746,7 +776,7 @@ func queue_spectral_key(path: String) -> void:
 			launch = true
 	_spectral_lock.unlock()
 	if launch:
-		_spectral_task = WorkerThreadPool.add_task(_drain_spectral_queue)
+		run_task(_drain_spectral_queue)
 
 ## The single worker. Takes the queue one path at a time and stops the moment it runs
 ## dry -- the running flag is cleared under the SAME lock as the empty check, so a path
@@ -800,12 +830,14 @@ func _run_spectral_key(path: String) -> Dictionary:
 func ticker_line(path: String) -> String:
 	var m := metadata(path)
 	var who: String = "%s - %s" % [m["artist"], m["title"]] if m["artist"] != "" else m["title"]
-	var served := 16  # AudioStreamWAV ceiling; see FIDELITY CEILING at the top
+	# what the mixer is actually handed: native FLAC and the mp3/ogg decoders deliver float,
+	# AudioStreamWAV is 16-bit. See FIDELITY at the top.
+	var engine_fmt := "16 BIT" if path.get_extension().to_lower() == "wav" else "FLOAT"
 	# the key rides along with the rest of the ffprobe result, so it is already there
 	# on the first frame of the track -- there is nothing to wait for and nothing to poll
 	var k: Dictionary = m.get("key", {})
 	var key_txt: String = "" if str(k.get("text", "")).is_empty() else "KEY %s // " % k["text"]
-	return "// %s // %s %d HZ %d BIT %s // %sENGINE %d HZ %d BIT // MIX %d HZ " % [
+	return "// %s // %s %d HZ %d BIT %s // %sENGINE %d HZ %s // MIX %d HZ " % [
 		who.to_upper(), m["codec"], m["sample_rate"], m["bits"],
 		"STEREO" if m["channels"] >= 2 else "MONO", key_txt,
-		m["sample_rate"], served, int(AudioServer.get_mix_rate())]
+		m["sample_rate"], engine_fmt, int(AudioServer.get_mix_rate())]

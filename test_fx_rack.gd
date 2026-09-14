@@ -9,6 +9,9 @@ extends SceneTree
 ##      no starved buffer and no silence gap;
 ##   3. enabling a module actually flips its slot, so "costs nothing" is not achieved
 ##      by the rack quietly doing nothing at all.
+##   5. CLEAR ALL with every module in at once: one pass switches all ten slots out (nine
+##      modules, TAPE being two effects), the count holds, and the Master analyser keeps
+##      the exact instance it bound -- nothing on any bus was rebuilt.
 ##   godot --headless --path . --script res://test_fx_rack.gd
 
 func _initialize() -> void:
@@ -116,6 +119,36 @@ func _initialize() -> void:
 			all_off = all_off and not AudioServer.is_bus_effect_enabled(bus, slot)
 	ok = ok and all_off
 	print("cleared rack leaves every slot switched out: %s" % all_off)
+
+	# 5. CLEAR ALL from a FULL rack, in one pass, with the analyser handle checked by identity
+	var master := AudioServer.get_bus_index("Master")
+	var handle = director.get("_spectrum")
+	var slots := 0
+	for type in FxRack.MODULES:
+		rack.add_module(type)
+		slots += (rack._idx[type] as Array).size()
+	for _f in 5:
+		await process_frame
+	var full := true
+	for type in FxRack.MODULES:
+		for slot in rack._idx[type]:
+			full = full and AudioServer.is_bus_effect_enabled(bus, slot)
+	rack.clear()
+	rack._process(0.0)   # exactly one _push, no frame in between
+	var one_pass := true
+	for type in FxRack.MODULES:
+		for slot in rack._idx[type]:
+			one_pass = one_pass and not AudioServer.is_bus_effect_enabled(bus, slot)
+	for _f in 10:
+		await process_frame
+	var handle_live := false
+	for i in AudioServer.get_bus_effect_count(master):
+		handle_live = handle_live or AudioServer.get_bus_effect_instance(master, i) == handle
+	var cleared: bool = slots == 10 and full and one_pass and handle_live \
+		and AudioServer.get_bus_effect_count(bus) == baseline and director.energy > 0.01
+	ok = ok and cleared
+	print("CLEAR ALL: %d slots all on -> one pass all off %s, count %d == %d, analyser handle live %s, energy %.4f: %s" % [
+		slots, one_pass, AudioServer.get_bus_effect_count(bus), baseline, handle_live, director.energy, cleared])
 
 	player.stop()
 	print("RESULT ", "PASS" if ok else "FAIL")

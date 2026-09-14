@@ -1,8 +1,13 @@
 extends SceneTree
-## The recorder against a live Master bus: it must capture real audio, drop NOTHING,
+## The recorder against a live Master bus: it must capture real audio, drop NOTHING even
+## across a STALL_MS main-thread stall mid-take, lose nothing the drop counter would miss,
 ## keep RAM flat (it streams to disk rather than accumulating an AudioStreamWAV), and
 ## produce a file ffmpeg will actually open.
 ##   godot --headless --path . --script res://test_recorder.gd
+
+## Main-thread stall injected mid-take -- about what a synchronous rescan of a large
+## library costs. The capture buffer only drains from _process, so this is the whole risk.
+const STALL_MS := 1200
 
 func _initialize() -> void:
 	Engine.max_fps = 60
@@ -45,14 +50,7 @@ func _initialize() -> void:
 		quit(1)
 		return
 
-	# record ~2 s of real bus output
-	var t0 := Time.get_ticks_msec()
-	while Time.get_ticks_msec() - t0 < 2000:
-		await process_frame
-	var captured := rec.frames_written
-	var dropped := rec.discarded
-
-	# WAV / 44100 / STANDARD
+	# WAV / 44100 / STANDARD, collected when the take is finalised
 	var done := [false]
 	var out_ok := [false]
 	var out_path := [""]
@@ -60,7 +58,20 @@ func _initialize() -> void:
 		done[0] = true
 		out_ok[0] = good
 		out_path[0] = path)
-	rec.stop(0, 0, 1)
+
+	# ~2 s of real bus output, a STALL_MS main-thread stall, then ~2 s more. The mixer keeps
+	# filling the capture buffer through the stall; nothing drains it until _process runs.
+	var t0 := Time.get_ticks_msec()
+	while Time.get_ticks_msec() - t0 < 2000:
+		await process_frame
+	OS.delay_msec(STALL_MS)
+	var t1 := Time.get_ticks_msec()
+	while Time.get_ticks_msec() - t1 < 2000:
+		await process_frame
+	var wall_s := float(Time.get_ticks_msec() - t0) / 1000.0
+	rec.stop(0, 0, 1)   # synchronous: drains what is left, patches the header, converts
+	var captured := rec.frames_written
+	var dropped := rec.discarded
 	guard = 0
 	while not done[0] and guard < 600:
 		await process_frame
@@ -74,6 +85,14 @@ func _initialize() -> void:
 	var clean := dropped == 0
 	ok = ok and clean
 	print("capture buffer dropped nothing: %s (discarded %d)" % [clean, dropped])
+
+	# nothing DROPPED is not the same as nothing LOST: the take has to span the whole
+	# wall-clock time, stall included, or audio went missing somewhere the counter misses
+	var expect := wall_s * AudioServer.get_mix_rate()
+	var whole := float(captured) >= expect * 0.95
+	ok = ok and whole
+	print("the take spans the whole wall-clock time, stall included: %s (%d of ~%d frames)" % [
+		whole, captured, int(expect)])
 
 	ok = ok and out_ok[0]
 	print("ffmpeg produced the requested file: %s (%s)" % [out_ok[0], out_path[0].get_file()])

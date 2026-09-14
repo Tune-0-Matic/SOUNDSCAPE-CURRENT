@@ -26,8 +26,13 @@ const FLUX_WINDOW := 43   # ~0.7 s at 60 fps, the adaptive threshold window
 
 ## The analyser reports over a trailing buffer, and that lag is NOT covered by the
 ## standard latency formula. Calibration knob: onsets are timestamped back by this
-## while the beat clock runs on true song time. 0.035 overcorrects to +42 ms.
-@export var onset_lag := 0.066
+## while the beat clock runs on true song time. Measured on test_director.gd's click
+## tracks at 60 FPS, as the mean phase error of emitted beats over each track's second
+## half: 0.036 -> +5 ms, 0.046 -> -5 ms, 0.056 -> -16 ms, 0.066 (the old value) -> -21 ms, averaged over 90/120/128/174 BPM.
+## ponytail: beats are emitted from _process, so that error includes up to a frame of
+## lateness and the value is calibrated at 60 FPS. Anything that must land ON the beat at
+## another cap should lead with time_to_beat() rather than react to the signal.
+@export var onset_lag := 0.041
 @export var bus := "Master"
 @export_range(1.0, 4.0) var sensitivity := 1.5
 @export var beats_per_bar := 4
@@ -47,6 +52,7 @@ var stereo := Vector2.ZERO   # summed left/right magnitude, for meters
 
 var _player: AudioStreamPlayer
 var _spectrum: AudioEffectSpectrumAnalyzerInstance
+var _slot := -1   # the analyser's bus slot, so set_tracking can switch it in and out
 var _edges := PackedFloat32Array()
 var _weight := PackedFloat32Array()
 var _prev := PackedFloat32Array()
@@ -58,6 +64,8 @@ var _phase := 0.0
 var _next_fit := 0.0
 var _fitting := false   # a sweep is out on a worker; do not queue a second
 var _fit_gen := 0       # bumped by reset(), so a fit for the previous track is discarded
+
+var _tasks: Array[int] = []   # sweep task ids: reaped as new ones start, joined in _exit_tree
 
 # Sizing lives in _init, not _ready: a node added during SceneTree._initialize does not
 # get _ready until the first idle frame, and attach() may legitimately be called before that.
@@ -71,6 +79,13 @@ func _init() -> void:
 
 func _ready() -> void:
 	_bind_analyser()  # in _ready so an inspector-set `bus` is already applied
+
+## A sweep still out on a worker when the tree is torn down calls back into a freed node.
+## Bumping the generation drops any result that lands late; the join makes sure none is
+## still running by the time this object goes away.
+func _exit_tree() -> void:
+	_fit_gen += 1
+	AudioEngine.join_tasks(_tasks)
 
 ## Inserting or removing a bus effect rebuilds every effect INSTANCE on that bus, which
 ## silently invalidates the analyser handle cached here -- levels just read 0.0 forever
@@ -96,6 +111,7 @@ func _bind_analyser() -> void:
 		AudioServer.add_bus_effect(b, fx)
 		slot = AudioServer.get_bus_effect_count(b) - 1
 	_spectrum = AudioServer.get_bus_effect_instance(b, slot)
+	_slot = slot
 
 func attach(p: AudioStreamPlayer) -> void:
 	_player = p
@@ -117,6 +133,38 @@ func reset() -> void:
 	_fit_gen += 1
 	_fitting = false
 
+## Analyser slot and tempo fit together, for a director that only matters while a feature is
+## on -- the per-deck BEAT SYNC trackers. Off, it costs neither an FFT on the audio thread nor
+## a sweep on a worker, and its stale lock is dropped.
+func set_tracking(on: bool) -> void:
+	track_tempo = on
+	var b := AudioServer.get_bus_index(bus)
+	if b >= 0 and _slot >= 0:
+		AudioServer.set_bus_effect_enabled(b, _slot, on)
+	if not on:
+		reset()
+
+## Seconds to move `slave`'s playhead so its next beat lands on `master`'s, or NAN when the
+## two cannot be aligned: either clock unlocked, or tempos further apart than `tol` -- phase
+## alignment without matching tempo holds for an instant and then drifts audibly apart.
+static func sync_seek(master: AudioDirector, slave: AudioDirector, tol: float) -> float:
+	if master.bpm <= 0.0 or slave.bpm <= 0.0 or master.confidence < 0.5 or slave.confidence < 0.5:
+		return NAN
+	if absf(slave.bpm / master.bpm - 1.0) > tol:
+		return NAN
+	return sync_offset(master.time_to_beat(), slave.time_to_beat(), 60.0 / master.bpm)
+
+## Pure: the smallest move, within half a period, that puts a beat due in `slave_ttb` onto one
+## due in `master_ttb`. Moving a playhead FORWARD by d brings its next beat d seconds sooner.
+static func sync_offset(master_ttb: float, slave_ttb: float, period: float) -> float:
+	return fposmod(slave_ttb - master_ttb + period * 0.5, period) - period * 0.5
+
+static func sync_test() -> bool:
+	return is_equal_approx(sync_offset(0.10, 0.25, 0.5), 0.15) \
+		and is_equal_approx(sync_offset(0.40, 0.05, 0.5), 0.15) \
+		and is_equal_approx(sync_offset(0.05, 0.40, 0.5), -0.15) \
+		and is_equal_approx(sync_offset(0.2, 0.2, 0.5), 0.0)
+
 ## True song position: mix-ahead and output latency both removed.
 func song_time() -> float:
 	if not _player or not _player.playing:
@@ -134,13 +182,35 @@ func time_to_beat() -> float:
 	var period := 60.0 / bpm
 	return period - fposmod(song_time() - _phase, period)
 
-func _process(_delta: float) -> void:
+## Idle decay, in wall-clock time rather than per frame. `*= 0.85` once per _process
+## ran 0.85^30 per second at 30 FPS and 0.85^144 at 144 -- the same "fade out" emptying
+## the display roughly five times faster on a fast machine, which is the frame-rate
+## dependence every other moving part here was already built to avoid.
+const IDLE_DECAY_PER_SEC := 0.01   # fraction of the level surviving after one second
+
+## Is there a player attached and actually producing sound? The visualizer asks so it
+## can hard-zero its bars instead of easing toward a zero it never quite reaches.
+func is_live() -> bool:
+	return _player != null and (_player.playing or _player.stream_paused)
+
+func _process(delta: float) -> void:
 	if not _spectrum:
 		return
 	if not _player or not _player.playing:
-		for i in BAND_COUNT:  # decay to silence instead of freezing the last frame
-			levels[i] *= 0.85
-		stereo *= 0.85
+		# STOPPED (or nothing attached at all) is not "quiet", it is silent: zero the
+		# array outright so an idle display holds no residue from the last track and
+		# anything reading these bands gets exact zeros rather than a decaying tail.
+		if not _player or not _player.stream_paused:
+			levels.fill(0.0)
+			stereo = Vector2.ZERO
+			energy = 0.0
+			return
+		# PAUSED keeps the picture but lets it fall away smoothly
+		var keep := pow(IDLE_DECAY_PER_SEC, delta)
+		for i in BAND_COUNT:
+			levels[i] *= keep
+		stereo *= keep
+		energy *= keep
 		return
 	var t := song_time()
 	_read_bands()
@@ -216,8 +286,9 @@ func _fit_tempo() -> void:
 	var snapshot := _onsets.duplicate()
 	var lo := min_bpm
 	var hi := max_bpm
-	WorkerThreadPool.add_task(func() -> void:
-		_apply_fit.bind(sweep_tempo(snapshot, lo, hi), gen).call_deferred())
+	AudioEngine.reap_tasks(_tasks)
+	_tasks.append(WorkerThreadPool.add_task(func() -> void:
+		_apply_fit.bind(sweep_tempo(snapshot, lo, hi), gen).call_deferred()))
 
 ## Phase-invariant periodicity fit: treat onsets as impulses and take the DFT
 ## magnitude at each candidate tempo. The argument hands us the grid phase for free.

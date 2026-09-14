@@ -1,5 +1,17 @@
-﻿.godot/
+.godot/
 export_presets.cfg
 .import/
 .DS_Store
 Thumbs.db
+
+# --- GDExtension (Phase 9) ---------------------------------------------------
+# Vendored dependency: cloned, never committed. See extension/STEP0.md for the
+# pinned commit -- that is what makes the build reproducible, not a checked-in copy.
+extension/godot-cpp/
+# SCons intermediates and the compiled library. bin/ is a build output directory;
+# the .gdextension file points at it, and it is rebuilt per platform per target.
+extension/.sconsign.dblite
+extension/**/*.o
+extension/**/*.os
+extension/**/*.obj
+bin/
