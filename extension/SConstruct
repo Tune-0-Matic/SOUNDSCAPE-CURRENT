@@ -56,8 +56,8 @@ if not os.path.isfile(os.path.join(godot_cpp_dir, "SConstruct")):
 # --- build tree: outside OneDrive ----------------------------------------------
 # Object files and the signature database are rewritten on every build, and the database
 # alone is ~15 MB. Inside the OneDrive-synced project that is a sync lock waiting to land
-# in the middle of a link. One subdirectory per target, so switching between debug and
-# release stops recompiling the other one's objects. Popped for the same reason as above.
+# in the middle of a link. One subdirectory per PLATFORM/TARGET/ARCH, so switching between
+# any two of them stops recompiling the other's objects. Popped for the same reason as above.
 build_root = os.path.abspath(ARGUMENTS.pop("build_dir", os.environ.get("SOUNDSCAPE_BUILD_DIR",
     os.path.join(os.path.dirname(os.path.abspath(godot_cpp_dir)), "soundscape_dsp_build"))))
 os.makedirs(build_root, exist_ok=True)
@@ -70,7 +70,12 @@ env = SConscript(os.path.join(godot_cpp_dir, "SConstruct"), {"api_version": "4.7
 
 # --- our sources --------------------------------------------------------------
 env.Append(CPPPATH=["src/"])
-build_dir = os.path.join(build_root, env["target"])
+# env["suffix"] is ".<platform>.<target>.<arch>", so this is one directory per build, and
+# never a shared one. Keyed on target alone it was not: a linux template_release build wrote
+# its objects over the windows template_release objects of the same name, and the next
+# windows link happily reused whichever set happened to be there. Nothing warns about that --
+# the object names are identical and SCons only sees timestamps and signatures.
+build_dir = os.path.join(build_root, env["suffix"].strip("."))
 objects = [
     env.SharedObject(os.path.join(build_dir, os.path.splitext(os.path.basename(str(s)))[0]), s)
     for s in Glob("src/*.cpp")

@@ -20,6 +20,22 @@ entry_symbol = "soundscape_dsp_init"
 compatibility_minimum = "4.7"
 reloadable = false
 
+;
+; THE KEY FORMAT IS LORE, and getting it wrong fails silently in the direction that hurts.
+; A key is a SET of feature tags, order irrelevant, and every tag must be present for the
+; entry to match. The tags that matter here:
+;
+;   editor + debug          the editor, and any `--headless --script` run (the whole test suite)
+;   template_debug + debug  an exported debug build
+;   template_release + release   an exported release build
+;
+; So `linux.debug.x86_64` covers the editor AND exported debug builds, which is what the
+; official godot-cpp template generates and why it is used below. Writing it as
+; `linux.x86_64.template_debug` looks more precise and is worse: the editor has no
+; `template_debug` tag, so the extension stops loading there entirely -- measured on
+; 2026-09-18, and the engine says only "No GDExtension library found for current OS and
+; architecture (windows.x86_64)" with no hint that the key shape is the reason.
+
 [libraries]
 
 windows.debug.x86_64 = "res://bin/libsoundscape_dsp.windows.template_debug.x86_64.dll"
