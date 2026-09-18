@@ -68,6 +68,28 @@ SConsignFile(os.path.join(build_root, ".sconsign"))
 # 4.8 from silently generating bindings this engine cannot load.
 env = SConscript(os.path.join(godot_cpp_dir, "SConstruct"), {"api_version": "4.7"})
 
+# --- the archive command, which is too long to run -----------------------------------
+# godot-cpp's static library is one `ar` invocation listing ~3,000 object files. Spelled out
+# in full that is far past what a shell will accept, and the build dies at the very last step
+# with "sh: Argument list too long" after ten minutes of compiling -- which is exactly what a
+# Linux CI run does under a path like
+# /home/runner/work/SOUNDSCAPE-CURRENT/SOUNDSCAPE-CURRENT/godot-cpp-src/gen/src/classes/.
+# Whether it trips depends on the length of the checkout path, so it can pass on one machine
+# and fail on another with no other difference.
+#
+# SCons already has the answer -- write the arguments to a temp file and pass @file -- and
+# godot-cpp already uses it for the web platform (tools/web.py), just not for linux/macos.
+# This is that same wrapping, applied where it is missing. It works after the fact because
+# godot-cpp's SConstruct returns the very env it created the library target with, and SCons
+# expands $ARCOM at build time rather than at definition time.
+#
+# Windows is left alone: MSVC's lib.exe and MinGW's ar are already driven through SCons's own
+# tempfile path there, and this build works.
+if env["platform"] not in ("windows", "web"):
+    env["ARCOM_POSIX"] = env["ARCOM"].replace("$TARGET", "$TARGET.posix").replace("$SOURCES", "$SOURCES.posix")
+    env["ARCOM"] = "${TEMPFILE(ARCOM_POSIX)}"
+    env["MAXLINELENGTH"] = 2048   # past this the arguments go to a file, not the command line
+
 # --- our sources --------------------------------------------------------------
 env.Append(CPPPATH=["src/"])
 # env["suffix"] is ".<platform>.<target>.<arch>", so this is one directory per build, and
