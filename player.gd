@@ -190,6 +190,11 @@ var _picture: VideoTest       # the MP4 picture over the visualizer (video_test.
 var _skin_ramp: Gradient      # the skin's picture palette, rebuilt on every skin switch
 var _crt_mat: ShaderMaterial   # %VizBox's material, captured once so OFF can null it out
 var _playbar_on := true    # bottom transport (scrub + deck) visible outside FULLSCREEN
+## Whether the scrub bar draws the track's shape behind the cue markers. On by default: the
+## overview is the point of having built it. Off restores the plain rail, which is what someone
+## who finds the silhouette busy behind their markers actually wants.
+var _show_playbar_wave := true
+var _playbar_wave_btn: Button
 var _playbar_btn: Button
 var _skip_secs := 5.0      # LEFT/RIGHT seek amount in seconds, 1..30, set in TBS
 var _skip_field: LineEdit
@@ -436,6 +441,10 @@ func _ready() -> void:
 		_listening_mode = clampi(int(_cfg_num(cfg, "visual", "listening_mode", 0.0)), 0,
 			AudioEngine.LISTENING_MODE_NAMES.size() - 1)
 		_playbar_on = _cfg_bool(cfg, "visual", "playbar", true)
+		# [display] rather than [visual] with the rest of the screen settings, as asked. Nothing
+		# else lives in that section yet; ConfigFile does not mind, and a missing section reads
+		# as the default.
+		_show_playbar_wave = _cfg_bool(cfg, "display", "playbar_waveform", true)
 		_visual_windowed = _cfg_bool(cfg, "visual", "visual_windowed", false)
 		_dual_deck = _cfg_bool(cfg, "visual", "dual_deck_mode", false)
 		_dual_visual = _cfg_bool(cfg, "visual", "dual_visual", false)
@@ -1246,6 +1255,7 @@ func _save() -> void:
 	cfg.set_value("visual", "listening_mode", _listening_mode)
 	cfg.set_value("visual", "video_color", int(_video_color))
 	cfg.set_value("visual", "playbar", _playbar_on)
+	cfg.set_value("display", "playbar_waveform", _show_playbar_wave)
 	cfg.set_value("visual", "visual_windowed", _visual_windowed)
 	cfg.set_value("visual", "dual_deck_mode", _dual_deck)
 	cfg.set_value("visual", "dual_visual", _dual_visual)
@@ -2849,7 +2859,8 @@ const SETTING_GROUPS := {
 		"ListeningModeRow"],
 	"LIBRARY": ["ShowMsRow"],
 	"DISPLAY": ["FeedSizeRow", "FpsRow", "LayoutRow", "ClockRow", "FontRow", "FontsRow",
-		"CursorRow", "CrtRow", "PlayBarRow", "VisualWinRow", "DualDeckRow", "FadeSpeedRow"],
+		"CursorRow", "CrtRow", "PlayBarRow", "PlayBarShapeRow", "VisualWinRow", "DualDeckRow",
+		"FadeSpeedRow"],
 	"VIDEO": ["IntroRow", "VideoTestRow", "VideoColorRow"],
 	"INPUT": ["SkipSecsRow"],
 	"ADVANCED": ["MessageLogRow", "CheatRow", "AutopsyPanel"],
@@ -2885,7 +2896,7 @@ static func settings_test() -> bool:
 	probe.name = "ListeningModeRow"
 	var hay := setting_haystack(probe)
 	probe.free()
-	return setting_group("FadeRow") == "AUDIO" 		and setting_group("Bind_play") == "INPUT" 		and setting_group("SkipSecsRow") == "INPUT" 		and setting_group("VideoColorRow") == "VIDEO" 		and setting_group("SomethingAddedLater") == "ADVANCED" 		and hay.contains("listening mode") and hay.contains("casual") and hay.contains("listeningmoderow")
+	return setting_group("PlayBarShapeRow") == "DISPLAY" 		and setting_group("PlayBarRow") == "DISPLAY" 		and setting_group("FadeRow") == "AUDIO" 		and setting_group("Bind_play") == "INPUT" 		and setting_group("SkipSecsRow") == "INPUT" 		and setting_group("VideoColorRow") == "VIDEO" 		and setting_group("SomethingAddedLater") == "ADVANCED" 		and hay.contains("listening mode") and hay.contains("casual") and hay.contains("listeningmoderow")
 
 ## Forty-two rows in one flat column, in the order they happened to be built: FADE, FADE TIME,
 ## PLAY DELAY, FEED SIZE, MAX FPS, BEAT, BOOST, LAYOUT, CLOCK, FONT... with ten keybinds in the
@@ -3112,6 +3123,19 @@ func _add_settings_rows() -> void:
 	_refresh_playbar_btn()
 	after = _playbar_btn.get_parent()
 
+	# NOT "PlayBarRow": that name is the show/hide toggle directly above. Two siblings with one
+	# name means Godot silently renames the second, and a renamed row stops matching
+	# SETTING_GROUPS and lands in ADVANCED instead of DISPLAY.
+	_playbar_wave_btn = _add_setting_row("PLAYBAR SHAPE", "PlayBarShapeRow", after)
+	_playbar_wave_btn.pressed.connect(func() -> void:
+		_show_playbar_wave = not _show_playbar_wave
+		_refresh_playbar_wave_btn()
+		if is_instance_valid(_cue_overlay):
+			_cue_overlay.queue_redraw()
+		_save_soon())
+	_refresh_playbar_wave_btn()
+	after = _playbar_wave_btn.get_parent()
+
 	_visual_win_btn = _add_setting_row("VISUAL EQ WINDOW", "VisualWinRow", after)
 	_visual_win_btn.toggle_mode = true
 	_visual_win_btn.button_pressed = _visual_windowed
@@ -3225,6 +3249,10 @@ func _set_video_test(on: bool) -> void:
 func _refresh_playbar_btn() -> void:
 	if is_instance_valid(_playbar_btn):
 		_playbar_btn.text = "[*] SHOWN" if _playbar_on else "[ ] HIDDEN"
+
+func _refresh_playbar_wave_btn() -> void:
+	if is_instance_valid(_playbar_wave_btn):
+		_playbar_wave_btn.text = "[ WAVEFORM ]" if _show_playbar_wave else "[ SOLID ]"
 
 func _commit_skip_secs() -> void:
 	_skip_secs = clampf(float(_skip_field.text), 1.0, 30.0)
@@ -6238,6 +6266,8 @@ func _draw_cues() -> void:
 ## also why WAVE_ALPHA is as low as it is. Mirrored about the middle of the strip, min below and
 ## max above, so a track with a loud left channel does not read as lopsided.
 func _draw_waveform(w: float, top: float) -> void:
+	if not _show_playbar_wave:
+		return   # before waveform_for(), so OFF does not start a build nobody will draw
 	var wave := _engine.waveform_for(_bar_path())
 	if wave.is_empty() or w <= 0.0:
 		return
