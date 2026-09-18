@@ -173,6 +173,20 @@ func _setup_master_curve() -> void:
 	if _mono_effect_idx >= at:
 		_mono_effect_idx += 1   # the fold sits after the limiter, which just moved one along
 
+## Switching modes is a CROSSFADE, not a switch. The curve is a 604-tap linear-phase FIR, so
+## cutting it in or out jumps the output by its 6.3 ms of latency -- a click, mid-track, every
+## time. The effect now crossfades internally against the undelayed input, so:
+##
+##   to CASUAL:     switch the effect IN at mix 0 (output is the input, sample for sample, so
+##                  nothing is audible at the switch) and ramp the mix up
+##   to AUDIOPHILE: ramp the mix down to 0, and only once it has arrived switch the effect OUT
+##                  -- by then it is passing the input through unchanged, so again nothing is
+##                  audible at the switch
+##
+## AUDIOPHILE therefore still ends bit-exact AND out of circuit at zero cost; the only thing
+## that changed is that getting there takes 150 ms instead of one block.
+var _curve_ramp := 0     # generation, so a fast double-toggle cannot have two timers racing
+
 func set_listening_mode(mode: int) -> void:
 	listening_mode = clampi(mode, 0, LISTENING_MODE_NAMES.size() - 1) as ListeningMode
 	var at := curve_slot()
@@ -180,11 +194,29 @@ func set_listening_mode(mode: int) -> void:
 		return
 	var m := AudioServer.get_bus_index("Master")
 	var on := listening_mode == ListeningMode.CASUAL
-	if AudioServer.is_bus_effect_enabled(m, at) == on:
-		return
+	_curve_ramp += 1
+	var mine := _curve_ramp
 	if on:
-		_curve.call("reset")   # or its first 8 ms would be whatever played the last time it was on
-	AudioServer.set_bus_effect_enabled(m, at, on)
+		if not AudioServer.is_bus_effect_enabled(m, at):
+			_curve.call("reset")   # or its first 8 ms would be whatever played the last time it was on
+			_curve.call("set_mix", 0.0)
+			AudioServer.set_bus_effect_enabled(m, at, true)
+		_curve.call("set_mix", 1.0)
+		return
+	if not AudioServer.is_bus_effect_enabled(m, at):
+		return   # already out of circuit; nothing to fade
+	_curve.call("set_mix", 0.0)
+	await get_tree().create_timer(float(_curve.call("get_ramp_sec")) + CURVE_RAMP_GRACE).timeout
+	# another switch happened while this was waiting: that one owns the bus now
+	if mine != _curve_ramp or listening_mode == ListeningMode.CASUAL:
+		return
+	var slot := curve_slot()
+	if slot >= 0:
+		AudioServer.set_bus_effect_enabled(AudioServer.get_bus_index("Master"), slot, false)
+
+## A little past the ramp, so the switch-out lands after the last partly-wet block rather than
+## on it. One mix block at 44.1 kHz is about 11 ms.
+const CURVE_RAMP_GRACE := 0.05
 
 ## The curve's slot on Master, found by identity; -1 without the extension.
 func curve_slot() -> int:
@@ -1143,7 +1175,24 @@ func ticker_line(path: String) -> String:
 	# on the first frame of the track -- there is nothing to wait for and nothing to poll
 	var k: Dictionary = m.get("key", {})
 	var key_txt: String = "" if str(k.get("text", "")).is_empty() else "KEY %s // " % k["text"]
-	return "// %s // %s %d HZ %d BIT %s // %sENGINE %d HZ %s // MIX %d HZ " % [
+	# The tail used to end at "MIX n HZ", which said what rate the mixer runs at but nothing
+	# about what is carrying it or what is in the way. The driver, the listening curve and
+	# whether the native path is even loaded are the three things worth knowing while a track
+	# is playing, and the ticker is where they are already being read.
+	return "// %s // %s %d HZ %d BIT %s // %sENGINE %d HZ %s // MIX %d HZ %s // %s // %s " % [
 		who.to_upper(), m["codec"], m["sample_rate"], m["bits"],
 		"STEREO" if m["channels"] >= 2 else "MONO", key_txt,
-		m["sample_rate"], engine_fmt, int(AudioServer.get_mix_rate())]
+		m["sample_rate"], engine_fmt, int(AudioServer.get_mix_rate()),
+		driver_name(), path_text(), LISTENING_MODE_NAMES[clampi(listening_mode, 0, LISTENING_MODE_NAMES.size() - 1)]]
+
+## The audio driver actually in use. Godot names the one it opened, which on Windows is WASAPI
+## and in a headless test run is Dummy -- a distinction worth being able to read off the screen.
+static func driver_name() -> String:
+	var driver := AudioServer.get_driver_name() if AudioServer.has_method("get_driver_name") else ""
+	return driver.to_upper() if not driver.is_empty() else "UNKNOWN DRIVER"
+
+## NATIVE when libsoundscape_dsp is carrying the decode and the resampling, GODOT when it is
+## not. Two words, and they are the difference between a bit-exact 24-bit path and Godot's own
+## 4-point cubic at -26 dB THD+N.
+static func path_text() -> String:
+	return "NATIVE DSP" if ClassDB.class_exists("SsFlacStream") else "GODOT DSP"

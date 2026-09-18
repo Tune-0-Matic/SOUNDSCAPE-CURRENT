@@ -28,9 +28,14 @@
 // Latency 604 frames (6.3 ms) at a 96 kHz mix, about the same time at any rate -- the price of linear
 // phase at 120 Hz, only paid while CASUAL is on. Measured response in test_ss_effect.gd 9.
 //
-// ponytail: switching modes jumps the output by that latency, a small click, and switching ON starts
-// from reset delay lines, 6 ms of silence. A crossfade between the two paths is the upgrade if the
-// toggle ever needs to be seamless mid-track.
+// SWITCHING IS A RAMP, not a jump. `mix` crossfades this curve against the UNDELAYED input, so at
+// mix 0 the output is the input sample for sample -- which is what lets AUDIOPHILE stay bit-exact
+// even with the effect still in circuit, and lets the bus switch it out afterwards with nothing
+// audible left to switch. Crossfading against the *delay-matched* dry would have been the textbook
+// choice and is wrong here: both ends of that fade are 6.3 ms displaced from the real signal, so
+// entering and leaving the fade are themselves the clicks this exists to remove. Against the
+// undelayed dry the fade combs briefly -- a 150 ms flange, which is smooth and musical -- and both
+// ends land exactly on the true signal.
 #ifndef SOUNDSCAPE_SS_CASUAL_H
 #define SOUNDSCAPE_SS_CASUAL_H
 
@@ -50,10 +55,18 @@ class SsCasualCurveInstance : public AudioEffectInstance {
 
 public:
 	static constexpr int kStages = 4;
+	/// How long a full 0 <-> 1 crossfade takes. Long enough that the comb sweep through it reads
+	/// as a flange rather than a transient, short enough that a mode switch still feels immediate.
+	static constexpr double kRampSec = 0.15;
 
 	struct Shared {
 		std::atomic<uint32_t> reset_epoch{ 0 }; // bumped by the main thread; each instance clears on a change
 		std::atomic<uint64_t> blocks{ 0 };
+		/// 0 = dry (bit-exact), 1 = the full curve. The instance slews toward this rather than
+		/// reading it per sample, so a main-thread write can never step the output.
+		std::atomic<float> mix_target{ 1.0f };
+		/// How far `mix` may move per frame. Set from the ramp time and the mix rate in setup().
+		std::atomic<float> mix_step{ 1.0f };
 	};
 
 	/// MAIN THREAD. Designs the curve for `p_mix_rate` and sizes every buffer.
@@ -91,6 +104,7 @@ private:
 	int _box_at = 0;
 	int _xd_at = 0;
 	int _h_at = 0;
+	float _mix = 1.0f;
 };
 
 class SsCasualCurve : public AudioEffect {
@@ -104,6 +118,15 @@ public:
 	void reset();
 	int get_latency_frames() const;
 	uint64_t get_blocks() const;
+	/// MAIN THREAD. Where the crossfade is heading: 0 dry, 1 the full curve. The audio thread
+	/// slews toward it over RAMP_SEC; it is never applied as a step.
+	void set_mix(float p_mix);
+	float get_mix() const;
+	/// True once the slew has arrived, so the caller knows when it is safe to switch the effect
+	/// out of the bus entirely.
+	bool mix_settled() const;
+
+	double get_ramp_sec() const { return SsCasualCurveInstance::kRampSec; }
 
 	Ref<AudioEffectInstance> _instantiate() override;
 

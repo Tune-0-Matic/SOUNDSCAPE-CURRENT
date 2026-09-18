@@ -1298,7 +1298,7 @@ func _write_cfg_async(cfg: ConfigFile) -> void:
 			_on_cfg_write_failed.call_deferred(error_string(err)))
 
 func _on_cfg_write_failed(reason: String) -> void:
-	push_warning("could not save %s: %s" % [_cfg, reason])
+	_log_fault("CONFIG SAVE FAILED", "%s: %s" % [_cfg, reason])
 	_note = "  //  CONFIG SAVE FAILED (%s)" % reason
 
 ## Nothing may outlive the write. A quit with a save still in flight would take the process
@@ -1494,7 +1494,7 @@ const MAX_AUTO_SKIPS := DeckController.MAX_AUTO_SKIPS
 func _on_track_failed(path: String, reason: String, deck: int) -> void:
 	_busy = false
 	_decks.failed_tracks[path] = reason
-	push_warning("cannot play %s: %s" % [path, reason])
+	_log_fault("CANNOT PLAY", "%s (%s)" % [path, reason])
 	match DeckController.fail_action(_decks.auto_advancing, deck == _engine.deck, _decks.fail_streak):
 		DeckController.Fail.REPORT:
 			_note = "  //  %s: %s" % [reason.to_upper(), path.get_file()]
@@ -1715,7 +1715,7 @@ func _process(delta: float) -> void:
 		_bpm_shown = 0.0
 	var hover := "  //  %s" % _hover.call() if _hover.is_valid() else ""
 	_status.text = "STATE: %s  //  %s  //  ERR: %04d%s%s" % [
-		_state(), _bpm_readout(), 0 if _note.is_empty() else 1, _note, hover]
+		_state(), _bpm_readout(), _log_errors, _note, hover]
 	if _recorder and _recorder.recording:
 		_refresh_rec()
 	# STATS is rebuilt at 4 Hz, and only while it can actually be seen -- current in the
@@ -1728,6 +1728,90 @@ func _process(delta: float) -> void:
 	if is_instance_valid(_autopsy) and _session_secs >= _autopsy_at and _autopsy.is_visible_in_tree():
 		_autopsy_at = _session_secs + STATS_PERIOD
 		_refresh_autopsy()
+
+# --- the system log --------------------------------------------------------
+## ERR: 0000 in the status bar used to be `0 if _note.is_empty() else 1` -- it counted whether
+## a note happened to be on screen, which made it a second copy of the note rather than an
+## error count. A track that would not decode, a take that hit a full disk and a config that
+## could not be written all read as ERR: 0000 while their note was clearing itself after four
+## seconds, and then there was no record that any of them had happened.
+##
+## So: a real count of real faults, and somewhere to read them. Notes are not faults, and
+## nothing here is written from a path that merely wants to say something on screen.
+const LOG_MAX := 500
+## What each entry is, which is also what the log window filters on.
+const LOG_ERROR := "ERROR"
+const LOG_WARN := "WARN"
+
+var _log: Array[Dictionary] = []   # {at (session secs), kind, what, detail}
+var _log_errors := 0               # ERROR entries only: what ERR: counts
+var _log_win: Window
+var _log_body: VBoxContainer
+var _log_head: Label
+
+## Records a fault. `what` is the short form the log lists; `detail` is whatever names the
+## specific file, path or error code. Kept even when the log window is closed -- the whole
+## point is that a fault survives the note that announced it.
+func _log_fault(what: String, detail := "", kind := LOG_ERROR) -> void:
+	_log.append({"at": _session_secs, "kind": kind, "what": what, "detail": detail})
+	if _log.size() > LOG_MAX:
+		# oldest first: a session that hits its cap has usually gone wrong in one way over
+		# and over, and the recent copies are the ones with the current paths in them
+		_log = _log.slice(_log.size() - LOG_MAX)
+	if kind == LOG_ERROR:
+		_log_errors += 1
+	push_warning("%s: %s %s" % [kind, what, detail])
+	if is_instance_valid(_log_win):
+		_fill_log()
+
+static func log_line(entry: Dictionary, clock: String) -> String:
+	var detail := str(entry.get("detail", ""))
+	return "%s  %-5s  %s%s" % [clock, entry.get("kind", LOG_ERROR), entry.get("what", ""),
+		"  //  %s" % detail if not detail.is_empty() else ""]
+
+## MESSAGE LOG, from SETTINGS > ADVANCED or by clicking ERR in the status bar.
+func _open_log_window() -> void:
+	if _refocus_asset("MESSAGE LOG"):
+		return
+	var win := _asset_window("MESSAGE LOG", PackedStringArray())
+	_log_win = win["window"]
+	_log_body = win["list"]
+	_log_head = win["status"]
+	_log_win.close_requested.connect(func() -> void:
+		_log_win = null
+		_log_body = null
+		_log_head = null)
+	var clear := Button.new()
+	clear.text = "CLEAR LOG"
+	clear.pressed.connect(func() -> void:
+		_log.clear()
+		_log_errors = 0
+		_fill_log())
+	(win["controls"] as Control).add_child(clear)
+	_fill_log()
+
+func _fill_log() -> void:
+	if not is_instance_valid(_log_body):
+		return
+	for child in _log_body.get_children():
+		child.queue_free()
+	if _log.is_empty():
+		var quiet := Label.new()
+		quiet.text = "NOTHING HAS GONE WRONG THIS SESSION."
+		_log_body.add_child(quiet)
+	else:
+		# newest first: the thing that just happened is the thing being looked for
+		for i in range(_log.size() - 1, -1, -1):
+			var entry := _log[i]
+			var line := Label.new()
+			line.text = log_line(entry, _hms(float(entry["at"])))
+			line.clip_text = true
+			if str(entry["kind"]) == LOG_ERROR:
+				line.add_theme_color_override("font_color", REC_ERROR_COLOR)
+			_log_body.add_child(line)
+	if is_instance_valid(_log_head):
+		_log_head.text = "%d ENTRIES  //  %d ERROR%s THIS SESSION" % [
+			_log.size(), _log_errors, "" if _log_errors == 1 else "S"]
 
 const STATS_PERIOD := 0.25
 var _stats_at := 0.0   # session time the STATS block is next due; zeroed on a tab switch
@@ -1889,11 +1973,14 @@ func _deck_is_live(which: int) -> bool:
 func _xfade_stat() -> String:
 	if _engine.both:
 		return "A+B (BOTH AT UNITY)"
+	# read from the same law set_crossfader writes, so the readout cannot describe a fade the
+	# buses are not doing -- it reported the old linear gains for a while after the curve
+	# became equal power, which is -3 dB out at centre
+	var gains := AudioEngine.deck_gains_db(_decks.crossfader)
 	return "%s  //  A %+.1f DB  //  B %+.1f DB" % [
 		("A" if _decks.crossfader < 0.02 else ("B" if _decks.crossfader > 0.98 else
 			"%d%%" % int(_decks.crossfader * 100.0))),
-		AudioEngine.deck_gain_db(1.0 - _decks.crossfader),
-		AudioEngine.deck_gain_db(_decks.crossfader)]
+		gains[0], gains[1]]
 
 ## Per-deck block. The ACTIVE deck reads through the same _len()/_pos()/_state() the
 ## transport uses, so the two can never disagree; a parked deck is read off its own
@@ -2757,7 +2844,7 @@ const SETTING_GROUPS := {
 		"CursorRow", "CrtRow", "PlayBarRow", "VisualWinRow", "DualDeckRow", "FadeSpeedRow"],
 	"VIDEO": ["IntroRow", "VideoTestRow", "VideoColorRow"],
 	"INPUT": ["SkipSecsRow"],
-	"ADVANCED": ["CheatRow", "AutopsyPanel"],
+	"ADVANCED": ["MessageLogRow", "CheatRow", "AutopsyPanel"],
 }
 
 var _setting_sections := {}   # group name -> the VBoxContainer holding its rows
@@ -2900,6 +2987,12 @@ func _add_setting_row(caption_text: String, row_name: String, after: Control,
 ## LAYOUT so they sit with the other display settings.
 func _add_settings_rows() -> void:
 	var layout_row: Control = %Layout.get_parent()
+	var log_btn := _add_setting_row("MESSAGE LOG", "MessageLogRow", layout_row)
+	log_btn.text = "[ OPEN ]"
+	log_btn.pressed.connect(_open_log_window)
+	_hover_note(log_btn, func() -> String:
+		return "EVERY FAULT THIS SESSION  //  %d ERROR%s SO FAR" % [_log_errors, "" if _log_errors == 1 else "S"])
+
 	_clock_btn = _add_setting_row("CLOCK", "ClockRow", layout_row)
 	_clock_btn.pressed.connect(func() -> void:
 		_clock_12h = not _clock_12h
@@ -4917,6 +5010,7 @@ func _setup_record_tab() -> void:
 	# usual four-second timer: every other note is something you can miss without losing
 	# anything, and this one is a recording that stopped while you thought it was running.
 	_recorder.failed.connect(func(path: String, reason: String) -> void:
+		_log_fault("RECORDING STOPPED", "%s (raw take kept as %s)" % [reason, path])
 		_note = "  //  [!] RECORDING STOPPED: %s  //  RAW TAKE KEPT AS %s" % [
 			reason.to_upper(), path.get_file()]
 		_refresh_rec())
@@ -5790,6 +5884,7 @@ func _show_info(path: String) -> void:
 func _delete_track(path: String) -> void:
 	var err := OS.move_to_trash(ProjectSettings.globalize_path(path))
 	if err != OK:
+		_log_fault("DELETE FAILED", "%s (%s)" % [path, error_string(err)])
 		_note = "  //  COULD NOT DELETE %s (%d)" % [path.get_file(), err]
 		_clear_note_later()
 		return

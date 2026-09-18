@@ -8,15 +8,20 @@ extends Control
 
 signal finished(user_name: String)
 
+## A POST reports what the machine FOUND. Every line below used to be a constant -- WASAPI
+## 96000HZ on a machine running ALSA at 48 kHz, 1920x1080 in a 1280x720 window, and a DSP chain
+## naming effects that no longer exist -- which made the one screen claiming to describe the
+## hardware the least trustworthy thing in the program. Each placeholder is now filled by
+## begin() from the thing it names.
 const LINES := [
-	"SOUNDSCAPE (HEADLESS HORSEMAN) BY ZFACTORPSX %s",   # application/config/version, in begin()
+	"SOUNDSCAPE (HEADLESS HORSEMAN) BY ZFACTORPSX %s",
 	"",
-	"MEM TEST 65536K ............ OK",
-	"DETECTING AUDIO DEVICE ..... WASAPI 96000HZ",
+	"MEM TEST %s ............ %s",
+	"DETECTING AUDIO DEVICE ..... %s",
 	"MOUNTING LIBRARY ........... %d TRACKS",
-	"LOADING DSP CHAIN .......... EQ21/SHELF/DRIVE",
-	"SPECTRUM ANALYSER .......... 32 BANDS",
-	"VIDEO MODE ................. 1920x1080",
+	"LOADING DSP CHAIN .......... %s",
+	"SPECTRUM ANALYSER .......... %d BANDS",
+	"VIDEO MODE ................. %s",
 	"CALIBRATING PHOSPHOR ....... OK",
 	"",
 ]
@@ -38,10 +43,65 @@ var _blink := 0.0
 @onready var _label: Label = $Text
 @onready var _bg: ColorRect = $BG
 
+## The audio device as the driver reports itself, with the rate the mixer is actually running.
+static func audio_line() -> String:
+	var driver := AudioServer.get_driver_name() if AudioServer.has_method("get_driver_name") else ""
+	if driver.is_empty():
+		driver = "UNKNOWN"
+	var out := "%s %dHZ" % [driver.to_upper(), int(AudioServer.get_mix_rate())]
+	var device := AudioServer.output_device
+	# "Default" says nothing the user does not already know; a named card is worth the room
+	if not device.is_empty() and device.to_lower() != "default":
+		out += " / %s" % device.to_upper()
+	return out
+
+## Physical memory, rounded the way a POST would write it. OS.get_memory_info() reports -1 for
+## what a platform will not say, and a made-up number is the thing this whole change is against.
+static func mem_line() -> Array:
+	var physical := int(OS.get_memory_info().get("physical", -1))
+	if physical <= 0:
+		return ["  UNKNOWN", "SKIPPED"]
+	return ["%7dK" % (physical / 1024), "OK"]
+
+## What is ACTUALLY in circuit, named in signal order. The native decoders and the sinc are
+## there only when libsoundscape_dsp loaded, and the limiter is read off the master bus rather
+## than assumed -- this line is the fastest way to tell a build that lost its extension.
+static func dsp_line() -> String:
+	var parts := PackedStringArray()
+	if ClassDB.class_exists("SsFlacStream"):
+		parts.append("FLAC/WAV/DSD")
+		parts.append("SINC")
+	else:
+		parts.append("GODOT DECODERS")
+	if ClassDB.class_exists("SsCasualCurve"):
+		parts.append("CURVE")
+	parts.append("EQ21")
+	var master := AudioServer.get_bus_index("Master")
+	if master >= 0:
+		for i in AudioServer.get_bus_effect_count(master):
+			if AudioServer.get_bus_effect(master, i) is AudioEffectHardLimiter:
+				parts.append("LIMITER")
+				break
+	return "/".join(parts)
+
+static func video_line() -> String:
+	var win := DisplayServer.window_get_size()
+	var screen := DisplayServer.screen_get_size()
+	var hz := int(roundf(DisplayServer.screen_get_refresh_rate()))
+	var out := "%dx%d" % [win.x, win.y]
+	if screen.x > 0 and screen != win:
+		out += " ON %dx%d" % [screen.x, screen.y]
+	if hz > 0:
+		out += " @%dHZ" % hz
+	return out
+
 func begin(saved_name: String, tracks: int) -> void:
 	user_name = saved_name
 	track_count = tracks
-	_buf = "\n".join(LINES) % [ProjectSettings.get_setting("application/config/version", ""), tracks]
+	var mem := mem_line()
+	_buf = "\n".join(LINES) % [
+		ProjectSettings.get_setting("application/config/version", ""),
+		mem[0], mem[1], audio_line(), tracks, dsp_line(), AudioDirector.BAND_COUNT, video_line()]
 	_started = true
 	_returning = not user_name.is_empty()
 	if _returning:

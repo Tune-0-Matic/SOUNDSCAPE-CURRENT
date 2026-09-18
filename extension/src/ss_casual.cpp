@@ -120,6 +120,9 @@ void SsCasualCurveInstance::setup(const std::shared_ptr<Shared> &p_shared, doubl
 		_xdelay[ch].assign(size_t(_d1), 0.0f);
 		_hist[ch].assign(size_t(2 * _n + _npad), 0.0f);
 	}
+	// one instance decides the ramp rate for everybody; the rate is the same for both
+	_shared->mix_step.store(float(1.0 / (kRampSec * p_mix_rate)), std::memory_order_relaxed);
+	_mix = _shared->mix_target.load(std::memory_order_relaxed);
 	_clear();
 }
 
@@ -135,6 +138,7 @@ void SsCasualCurveInstance::_clear() {
 	_box_at = 0;
 	_xd_at = 0;
 	_h_at = 0;
+	// NOT _mix: a reset clears what the delay lines hold, and a crossfade in flight is not that
 }
 
 void SsCasualCurveInstance::_process(const void *p_src_buffer, AudioFrame *r_dst_buffer, int32_t p_frame_count) {
@@ -149,6 +153,8 @@ void SsCasualCurveInstance::_process(const void *p_src_buffer, AudioFrame *r_dst
 		_clear(); // fills buffers sized in setup(): no allocation
 	}
 	const double inv_m = 1.0 / double(_m);
+	const float target = _shared->mix_target.load(std::memory_order_relaxed);
+	const float step = _shared->mix_step.load(std::memory_order_relaxed);
 	for (int32_t i = 0; i < p_frame_count; ++i) {
 		const float in[2] = { src[i].left, src[i].right };
 		const bool wrap = _box_at + 1 == _m;
@@ -183,8 +189,23 @@ void SsCasualCurveInstance::_process(const void *p_src_buffer, AudioFrame *r_dst
 		double out_l = 0.0;
 		double out_r = 0.0;
 		soundscape::dot8(_fir.data(), &_hist[0][size_t(_h_at)], &_hist[1][size_t(_h_at)], _npad, out_l, out_r);
-		r_dst_buffer[i].left = float(out_l);
-		r_dst_buffer[i].right = float(out_r);
+		// one step per frame toward the target, so a mode switch is a ramp however small the block
+		if (_mix != target) {
+			_mix = _mix < target ? (_mix + step < target ? _mix + step : target)
+								 : (_mix - step > target ? _mix - step : target);
+		}
+		if (_mix >= 1.0f) {
+			r_dst_buffer[i].left = float(out_l);
+			r_dst_buffer[i].right = float(out_r);
+		} else if (_mix <= 0.0f) {
+			// EXACTLY the input: the same float back out, not a multiply by 1.0 and an add of 0.0
+			r_dst_buffer[i].left = in[0];
+			r_dst_buffer[i].right = in[1];
+		} else {
+			const float dry = 1.0f - _mix;
+			r_dst_buffer[i].left = in[0] * dry + float(out_l) * _mix;
+			r_dst_buffer[i].right = in[1] * dry + float(out_r) * _mix;
+		}
 	}
 	_shared->blocks.fetch_add(1, std::memory_order_relaxed);
 }
@@ -219,6 +240,19 @@ uint64_t SsCasualCurve::get_blocks() const {
 	return _shared->blocks.load(std::memory_order_relaxed);
 }
 
+void SsCasualCurve::set_mix(float p_mix) {
+	_shared->mix_target.store(p_mix < 0.0f ? 0.0f : (p_mix > 1.0f ? 1.0f : p_mix), std::memory_order_relaxed);
+}
+
+float SsCasualCurve::get_mix() const {
+	return _shared->mix_target.load(std::memory_order_relaxed);
+}
+
+bool SsCasualCurve::mix_settled() const {
+	const float t = _shared->mix_target.load(std::memory_order_relaxed);
+	return t <= 0.0f || t >= 1.0f;
+}
+
 Ref<AudioEffectInstance> SsCasualCurve::_instantiate() {
 	Ref<SsCasualCurveInstance> instance;
 	instance.instantiate();
@@ -230,4 +264,8 @@ void SsCasualCurve::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("reset"), &SsCasualCurve::reset);
 	ClassDB::bind_method(D_METHOD("get_latency_frames"), &SsCasualCurve::get_latency_frames);
 	ClassDB::bind_method(D_METHOD("get_blocks"), &SsCasualCurve::get_blocks);
+	ClassDB::bind_method(D_METHOD("set_mix", "mix"), &SsCasualCurve::set_mix);
+	ClassDB::bind_method(D_METHOD("get_mix"), &SsCasualCurve::get_mix);
+	ClassDB::bind_method(D_METHOD("mix_settled"), &SsCasualCurve::mix_settled);
+	ClassDB::bind_method(D_METHOD("get_ramp_sec"), &SsCasualCurve::get_ramp_sec);
 }

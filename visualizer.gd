@@ -94,14 +94,26 @@ var _v := PackedFloat32Array()
 var _peak := PackedFloat32Array()
 var _db := PackedFloat32Array()
 var _hue := 0.0
+## WATERFALL and FIRE are the two modes that draw a FIELD rather than a set of rects, and both
+## now hand the GPU a magnitude per cell and let viz_field.gdshader decide every colour. What
+## the CPU used to do instead: a Color per cell per frame -- 32 x 96 for the waterfall, 56 x 40
+## and three lerps deep for the fire -- built on the main thread, written through
+## Image.set_pixel, and uploaded so the GPU could upscale it. One byte per cell replaces all of
+## it, and because the palette is applied in the shader every frame, changing gradient now
+## recolours the history that is already on screen instead of only the rows yet to arrive.
+var _wf_bytes := PackedByteArray()
 var _wf_img: Image
 var _wf_tex: ImageTexture
 var _wf_row := 0
+var _field_mat: ShaderMaterial
+var _pal_img: Image
+var _pal_tex: ImageTexture
 var _tun_phase := 0.0
 var _grid: Array[PackedFloat32Array] = []   # ring of past spectra, newest at _grid_head
 var _grid_head := 0
 var _step_accum := 0.0
 var _fire: PackedFloat32Array           # heat grid, FIRE_W * FIRE_H
+var _fire_bytes := PackedByteArray()
 var _fire_img: Image
 var _fire_tex: ImageTexture
 var _road_phase := 0.0
@@ -119,12 +131,40 @@ func _ready() -> void:
 		_grid.append(row)
 	_fire = PackedFloat32Array()
 	_fire.resize(FIRE_W * FIRE_H)
-	_fire_img = Image.create(FIRE_W, FIRE_H, false, Image.FORMAT_RGBA8)
+	_fire_bytes.resize(FIRE_W * FIRE_H)
+	_fire_img = Image.create_from_data(FIRE_W, FIRE_H, false, Image.FORMAT_R8, _fire_bytes)
 	_fire_tex = ImageTexture.create_from_image(_fire_img)
-	_wf_img = Image.create(n, WF_HEIGHT, false, Image.FORMAT_RGBA8)
-	_wf_img.fill(Color(0, 0, 0, 0))
+	_wf_bytes.resize(n * WF_HEIGHT)
+	_wf_img = Image.create_from_data(n, WF_HEIGHT, false, Image.FORMAT_R8, _wf_bytes)
 	_wf_tex = ImageTexture.create_from_image(_wf_img)
+	# PALETTE_STEPS colours sampled from the same color_at() every other mode uses, so gradients,
+	# the rainbow and the colour animations all reach these two modes with nothing special done
+	_pal_img = Image.create(PALETTE_STEPS, 1, false, Image.FORMAT_RGBA8)
+	_pal_tex = ImageTexture.create_from_image(_pal_img)
+	_field_mat = ShaderMaterial.new()
+	_field_mat.shader = load("res://viz_field.gdshader")
+	_field_mat.set_shader_parameter("palette", _pal_tex)
 	add_child(_car)  # child so its _process drives the suspension jitter
+
+## Wide enough that a gradient reads as a gradient across the display and narrow enough that
+## rebuilding it every frame is nothing: 64 colours against the 2,240 the fire used to build.
+const PALETTE_STEPS := 64
+
+## The colour strip the field shader samples, and the material the field modes draw with. Only
+## built while one of them is actually on screen.
+func _sync_field_material() -> void:
+	var field: bool = mode == Mode.WATERFALL or mode == Mode.FIRE
+	if material != _field_mat:
+		material = _field_mat if field else null
+	if not field:
+		return
+	for i in PALETTE_STEPS:
+		_pal_img.set_pixel(i, 0, color_at(float(i) / float(PALETTE_STEPS - 1)))
+	_pal_tex.update(_pal_img)
+	_field_mat.set_shader_parameter("field_mode", 0 if mode == Mode.WATERFALL else 1)
+	# the newest row is at _wf_row, so the shader rotates the ring rather than the CPU shifting
+	# WF_HEIGHT rows of pixels every frame
+	_field_mat.set_shader_parameter("scroll", float(_wf_row) / float(WF_HEIGHT))
 
 ## User gradients. Owned by player.gd, which loads/saves them as hex lists in
 ## library.cfg -- this class only samples them. Each is a real Gradient resource:
@@ -409,6 +449,7 @@ func _process(delta: float) -> void:
 		_tun_phase += delta * (0.35 + bass * 2.4) * lerpf(0.5, 2.2, speed)
 	elif mode == Mode.CRUISE:
 		_road_phase += delta * (2.0 + bass * 9.0) * lerpf(0.5, 2.0, speed)
+	_sync_field_material()
 	queue_redraw()
 
 ## One new row per REF_FPS step into a ring buffer -- driven by _due_steps, not by the
@@ -417,12 +458,13 @@ func _process(delta: float) -> void:
 ## 32*96 rects.
 func _push_waterfall() -> void:
 	var n := AudioDirector.BAND_COUNT
+	var at := _wf_row * n
 	for i in n:
-		var c := color_at(float(i) / float(maxi(n - 1, 1)))
-		# squared: linear alpha made every cell bright and the display read as a green wall
-		var v := _v[i] * _v[i]
-		_wf_img.set_pixel(i, _wf_row, Color(c.r * v, c.g * v, c.b * v, v * 0.9))
+		# squared here rather than in the shader: it is what gets STORED, and storing the
+		# squared value is what keeps the 8-bit step fine where the display is dark
+		_wf_bytes[at + i] = int(clampf(_v[i] * _v[i], 0.0, 1.0) * 255.0)
 	_wf_row = (_wf_row + 1) % WF_HEIGHT
+	_wf_img.set_data(n, WF_HEIGHT, false, Image.FORMAT_R8, _wf_bytes)
 	_wf_tex.update(_wf_img)
 
 func _draw() -> void:
@@ -463,14 +505,10 @@ func _draw_segments(mirror: bool) -> void:
 		if mirror:
 			draw_rect(Rect2(x, clampi(int(base + _peak[i] * full), 0, int(size.y) - 1), bw, 1), Color(c, 0.5))
 
+## One quad. It used to be two, because the ring buffer had to be drawn in the right order from
+## the CPU side; the shader wraps the read instead, from the `scroll` uniform.
 func _draw_waterfall() -> void:
-	var h := size.y
-	var older := WF_HEIGHT - _wf_row
-	# rows from _wf_row..end are the oldest, then 0.._wf_row wraps in beneath them
-	draw_texture_rect_region(_wf_tex, Rect2(0, 0, size.x, h * older / WF_HEIGHT),
-		Rect2(0, _wf_row, AudioDirector.BAND_COUNT, older))
-	draw_texture_rect_region(_wf_tex, Rect2(0, h * older / WF_HEIGHT, size.x, h * _wf_row / WF_HEIGHT),
-		Rect2(0, 0, AudioDirector.BAND_COUNT, _wf_row))
+	draw_texture_rect(_wf_tex, Rect2(0, 0, size.x, size.y), false)
 
 
 
@@ -719,16 +757,13 @@ func _step_fire(steps: int) -> void:
 				var l: float = _fire[below - 1] if x > 0 else _fire[below]
 				var r: float = _fire[below + 1] if x < FIRE_W - 1 else _fire[below]
 				_fire[y * FIRE_W + x] = (_fire[below] * 2.0 + l + r) * 0.25 * cool
-	var c := color()
-	for y in FIRE_H:
-		for x in FIRE_W:
-			var h: float = _fire[y * FIRE_W + x]
-			# black -> accent -> white, with the white stop held back to the top of the
-			# range so the flame body keeps its colour instead of blowing out
-			var col := Color.BLACK.lerp(c, minf(h * 1.8, 1.0))
-			col = col.lerp(Color.WHITE, clampf((h - 0.78) * 4.0, 0.0, 1.0))
-			col.a = clampf(h * 1.5, 0.0, 1.0)
-			_fire_img.set_pixel(x, y, col)
+	# ponytail: the automaton itself stays on the CPU. It is 2,240 cells of a sequential
+	# bottom-up recurrence, and moving it would mean a SubViewport with feedback to hold the
+	# previous frame -- real machinery for a loop this size. What left the CPU is the part that
+	# was actually costing: the per-cell colour. Revisit if the grid ever grows.
+	for i in FIRE_W * FIRE_H:
+		_fire_bytes[i] = int(clampf(_fire[i], 0.0, 1.0) * 255.0)
+	_fire_img.set_data(FIRE_W, FIRE_H, false, Image.FORMAT_R8, _fire_bytes)
 	_fire_tex.update(_fire_img)
 
 func _draw_fire() -> void:

@@ -167,12 +167,13 @@ func _residue(viz: Visualizer, mode: int) -> float:
 			for row in viz._grid:
 				for v in row:
 					most = maxf(most, v)
+		# both fields hold a MAGNITUDE per cell now, one byte each, and the shader decides
+		# every colour -- so what is left on screen is read from the buffer that feeds the
+		# GPU rather than from a colour the CPU no longer computes
 		Visualizer.Mode.WATERFALL:
-			for y in Visualizer.WF_HEIGHT:
-				for x in AudioDirector.BAND_COUNT:
-					most = maxf(most, viz._wf_img.get_pixel(x, y).a)
+			for b in viz._wf_bytes:
+				most = maxf(most, float(b) / 255.0)
 		Visualizer.Mode.FIRE:
-			for y in Visualizer.FIRE_H:
-				for x in Visualizer.FIRE_W:
-					most = maxf(most, viz._fire_img.get_pixel(x, y).a)
+			for b in viz._fire_bytes:
+				most = maxf(most, float(b) / 255.0)
 	return most

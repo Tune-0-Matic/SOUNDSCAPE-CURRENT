@@ -270,9 +270,16 @@ func _casual_curve() -> bool:
 		and AudioServer.get_bus_effect(m, at + 1) is AudioEffectHardLimiter and not AudioServer.is_bus_effect_enabled(m, at)
 	engine.set_listening_mode(AudioEngine.ListeningMode.CASUAL)
 	var latency_ms := engine.curve_latency_ms()
-	var casual: bool = AudioServer.is_bus_effect_enabled(m, at) and latency_ms > 6.0 and latency_ms < 6.6
+	var fx: Object = engine.get("_curve")
+	# switching IN is immediate and starts at mix 0, so the switch itself is inaudible: the
+	# effect is in circuit passing the input through, and the fade happens after it
+	var casual: bool = AudioServer.is_bus_effect_enabled(m, at) and latency_ms > 6.0 and latency_ms < 6.6 		and is_equal_approx(float(fx.call("get_mix")), 1.0)
 	engine.set_listening_mode(AudioEngine.ListeningMode.AUDIOPHILE)
-	var direct: bool = not AudioServer.is_bus_effect_enabled(m, at) and engine.curve_latency_ms() == 0.0
+	# and switching OUT is a fade FIRST: the target drops at once, the effect stays in circuit
+	# until the ramp has arrived, and only then leaves
+	var fading: bool = AudioServer.is_bus_effect_enabled(m, at) and is_equal_approx(float(fx.call("get_mix")), 0.0)
+	await create_timer(float(fx.call("get_ramp_sec")) + 0.3).timeout
+	var direct: bool = not AudioServer.is_bus_effect_enabled(m, at) and engine.curve_latency_ms() == 0.0 and fading
 	var fold := int(engine.get("_mono_effect_idx"))
 	engine.set_mono(true)
 	var mono: bool = AudioServer.get_bus_effect(m, fold) is AudioEffectStereoEnhance and AudioServer.is_bus_effect_enabled(m, fold) \
@@ -280,7 +287,7 @@ func _casual_curve() -> bool:
 	engine.set_mono(false)
 	var placement := placed and casual and direct and mono
 	ok = ok and placement
-	print("7. Master slot %d ahead of the limiter, out %s; CASUAL in, %.2f ms late %s; AUDIOPHILE out %s; MONO still the fold %s: %s" % [
+	print("7. Master slot %d ahead of the limiter, out %s; CASUAL in at mix 0 then up, %.2f ms late %s; AUDIOPHILE fades to mix 0 and only then leaves %s; MONO still the fold %s: %s" % [
 		at, placed, latency_ms, casual, direct, mono, placement])
 
 	# ---- a bus of its own: the curve, then a capture ----------------------------------
