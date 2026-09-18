@@ -14,7 +14,7 @@ var _cfg: String = "user://library_dev.cfg" if OS.has_feature("editor") else "us
 
 ## Typed reads out of library.cfg. The file is plain text a user can and will hand-edit,
 ## and a value of the WRONG TYPE is not the clamped-away nuisance an out-of-range number
-## is: it throws at that line, which aborts the rest of _load(), leaves _a and _audio
+## is: it throws at that line, which aborts the rest of _load(), leaves the deck players
 ## unbound, and then _process throws on a null stream every frame for the rest of the
 ## session. Measured: a single `folders="x"` line produced 451 errors in 45 frames and a
 ## permanently dead window. Wrong type now reads as "absent" and falls back, which is the
@@ -61,20 +61,13 @@ const META_SORTS := ["ARTIST", "ALBUM", "KEY"]
 
 @export_file("*.ogv") var video_path := ""
 
-## The active deck's two players. Which pair these point at is what "switching decks"
-## means; everything downstream (_crossfade, _stop, the scrub readouts) is written
-## against them and needed no changes to become deck-aware.
-var _a: AudioStreamPlayer
-var _b: AudioStreamPlayer
-var _deck_pair := [[], []]      # deck -> [engine primary, scene spare]
-var _deck_live := [null, null]  # deck -> which side of its pair was last live
-var _deck_cur := ["", ""]       # deck -> the path it holds
+## WHICH DECK IS DOING WHAT. The player pairs, the live references, the crossfader, the
+## per-deck REV flag and the auto-advance failure counter belong to this, not to the UI --
+## see deck_controller.gd. Added to the tree in _ready because its crossfade drives a Tween.
+var _decks := DeckController.new()
 var _eq_decks: Array = []       # deck -> Equalizer; the UI rack binds to one at a time
 var _deck_btn: Button
 var _xfade: ProgressBar
-## Whichever player currently owns playback. Everything downstream -- transport,
-## scrub, the spectrum feed -- reads this, so a crossfade only has to reassign it.
-var _audio: AudioStreamPlayer    # whichever side of the active pair is sounding
 @onready var _video: VideoStreamPlayer = %Video
 @onready var _scrub: ProgressBar = %Scrub
 @onready var _vol: ProgressBar = %Vol
@@ -98,22 +91,11 @@ var _audio: AudioStreamPlayer    # whichever side of the active pair is sounding
 var _eq: Equalizer               # the ACTIVE deck's rack; see _bind_deck
 @onready var _tabs: TabContainer = %Tabs
 
-var _folders: Array[String] = []
-## Every audio file found on disk, before the folder checkboxes get a say. `_paths` is the
-## ACTIVE library carved out of this, and it is _paths that feeds the rows, the queue and
-## every index in _row_paths -- so nothing downstream had to learn about the filter.
-var _all_paths: Array[String] = []
-var _paths: Array[String] = []
-## Checked directories, as a set rather than the Array the config stores: this is asked
-## once per track on every re-filter, and Array.has() there is the classic quadratic trap.
-var _enabled_folders := {}
-## Directories present at the LAST scan. The enabled set alone cannot tell "the user
-## switched this off" from "this did not exist yet" -- both are simply absent from it --
-## and treating the second as the first is what made a freshly added album invisible.
-var _known_folders := {}
-## Distinguishes "no saved list, so default everything on" from "the user genuinely
-## unchecked everything". Without it, unchecking the lot silently re-enables it on restart.
-var _enabled_known := false
+## WHERE THE LIBRARY LIVES. Roots, the walked paths, the index, the sort orders, the search
+## filters and everything the user made (playlists, cues, RENAME tags) belong to this, not to
+## the UI -- see library_model.gd. player.gd owns the ItemLists and the folder Tree and asks
+## the model what to put in them. Added to the tree in _ready so its scan worker can report.
+var _library := LibraryModel.new()
 var _current := ""
 var _dragging := false
 ## Which bar the left button actually went down on, or null. Godot forwards an
@@ -161,30 +143,17 @@ var _hover: Callable    # live value readout for the fader under the pointer, or
 ## TRK A and TRK B are two CRATES over the one library: each keeps its own search, sort and
 ## playlist, its own row order and its own row maps. Crate 0 is TRK A (deck A), crate 1 is
 ## TRK B (deck B). Everything below indexed by crate is one entry per list.
-var _sorts := [0, 0]            # crate -> index into SORTS
-var _mtime := {}
-var _sortkey := {}   # path -> meta_sort_key, rebuilt per sort pass for the metadata sorts
-## Current SEARCH text per crate, matched against each row's pre-folded lowercase haystack.
-var _filters := ["", ""]
-## The library's rows: one entry per _paths index, holding the row string and a pre-folded
-## lowercase haystack so a search keystroke never re-derives either. Sort-independent now --
-## each crate keeps its own order in _orders.
-var _index: Array[Dictionary] = []
-var _path_pos := {}   # path -> its position in _index/_paths, rebuilt alongside _index
-var _orders := [[], []]         # crate -> _paths in that crate's sort order
-## FOLDER view inserts unselectable header rows, so list rows and _paths indices stop
+## FOLDER view inserts unselectable header rows, so list rows and _library.paths indices stop
 ## lining up. These two keep the mapping in both directions, per crate; in every other view
 ## they are simply the identity, so nothing downstream needs to branch.
 var _row_paths := [PackedInt32Array(), PackedInt32Array()]
 var _path_rows := [PackedInt32Array(), PackedInt32Array()]
-var _shown := [[], []]          # crate -> the paths its list shows, in row order: its queue
 var _unknown := [[], []]        # crate -> shown tracks never probed, for the duration sweep
 var _busy := false
 var _flash := 0.0
 var _viz_cfg := {}
 var _skin := "WIN98"
 var _eq_cfg_decks := [{}, {}]   # deck -> saved Equalizer state
-var _crossfader := 0.0
 var _builtin_font: Font   # the compiled-in PX437, so BUILT-IN can be restored
 var _total_secs := 0.0     # lifetime, carried across sessions
 var _session_secs := 0.0
@@ -245,11 +214,6 @@ var _user_name := ""
 ## if the feature is ever put back.
 var _tbs: Array[String] = []
 # --- playlists and cue markers (schema documented above _setup_menus) ------
-var _playlists := {}    # NAME -> Array of absolute paths
-var _pl_cues := {}      # NAME -> { path -> Array of cue Dictionaries }
-var _cues := {}         # path -> Array of cue Dictionaries, global scope
-var _labels := {}       # path -> display name, from RENAME TAG
-var _crate_pl := ["", ""]   # crate -> its selected playlist, "" = the whole library
 var _menu_crate := 0        # which crate the open track or playlist menu was raised from
 var _mark_mode := false # deliberately NOT persisted; see _setup_menus
 var _menu_ctx := {}     # what the one PopupMenu is currently about
@@ -261,9 +225,6 @@ var _drag_cue := {}     # the marker whose tab is held, {} when none
 var _drag_from_x := 0.0 # where that press landed, for the click-vs-drag test
 var _drag_moved := false
 var _audition_gen := 0
-var _fade_on := true
-var _fade_ms := 1000
-var _delay_ms := 250
 var _max_fps := FPS_DEFAULT
 var _layout := 0       # 0 auto, 1 force landscape, 2 force portrait
 var _portrait := false
@@ -300,18 +261,22 @@ var _volume := 80.0
 var _boost := 0        # 0..100 on the dial; 0 is unity, no boost
 
 func _ready() -> void:
+	_decks.name = "Decks"
+	_decks.engine = _engine
+	_decks.director = _director
+	add_child(_decks)
+	_library.name = "Library"
+	_library.engine = _engine
+	add_child(_library)
+	_library.scan_progress.connect(_on_scan_progress)
+	_library.scan_finished.connect(_on_scan_finished)
 	assert(_fmt(61.0) == "01:01" and _ratio_at(-9.0, 100.0) == 0.0 and _ratio_at(999.0, 100.0) == 1.0)
-	assert(_is_track("A.MP3") and _is_track("b.flac") and _is_track("c.DSF") and not _is_track("cover.jpg"))
-	assert(not _is_track("clip.MP4") and _is_track("clip.MP4", true) and not _is_track("clip.mp4.jpg", true))
+	assert(LibraryModel.model_test())   # path rules, sort keys, track ids, RELOCATE, id migration
 	assert(rev_landing("STOPPED", 3.0, 10.0, 10.0) == [false, false, 7.0] and rev_landing("PAUSED", 3.0, 10.0, 10.0) == [true, true, 7.0] and rev_landing("PLAYING", 12.0, 10.0, 10.0) == [true, false, 0.0])
-	assert(_cmp_by("NAME", "z/a.mp3", "a/b.mp3") and _cmp_by("PATH", "a/b.mp3", "z/a.mp3"))
-	assert(_cmp_by("TYPE", "b.flac", "a.mp3") and not _cmp_by("TYPE", "a.mp3", "b.flac"))
 	# shuffle must not hand back the track already playing, except in a one-track queue
 	assert(AudioEngine.peek_next(2, AudioEngine.Repeat.ALL, true, 5, 2) != 2)
 	assert(AudioEngine.peek_next(0, AudioEngine.Repeat.ALL, true, 1, 0) == 0)
 	assert(AudioEngine.peek_next(4, AudioEngine.Repeat.OFF, false, 5, 0) == -1)
-	assert(Equalizer.cut_test())   # DJ filter dead-centre and both sweep ends
-	assert(Equalizer.pitch_test())     # TAPE x KEY SHIFT, and unity staying unity
 	assert(Equalizer.flat_test())      # a flat curve bypasses EQ21 instead of processing
 	assert(Equalizer.from_dict_test()) # junk config members clamp instead of throwing
 	assert(asset_test())               # cursor thumbnail cap keeps aspect at both extremes
@@ -328,15 +293,13 @@ func _ready() -> void:
 	assert(_viz.fps_lerp_test())        # visualizer speed is the same at any FPS
 	assert(wheel_test())                # wheel steps: fine, coarse, and the accelerator
 	assert(clock_test())                # 12-hour wrap: midnight and noon are both 12
-	assert(roots_test())                # library root nesting and path normalisation
 	assert(count_test())                # TRACKS readout: both branches, partial marker
 	assert(cue_test())                  # marker hit-testing and cue id allocation
-	assert(fail_test())                 # skip past an unplayable track, stop after a run of them
+	assert(DeckController.deck_test())  # cue mirroring under REV, and the skip-and-stop rule
 	assert(ts_test())                   # MM:SS:MS formatting and its round trip
 	assert(key_test())                  # reserved keys, collisions, and clearing
 	assert(AudioEngine.deck_test())     # crossfader gain law and its silence floor
 	assert(write_in_test())             # which rows the write-in is allowed to touch
-	assert(sort_key_test())             # ARTIST/ALBUM/KEY order, unknowns last
 	assert(AudioDirector.sync_test())   # beat-sync offset wraps to the nearest beat
 	# same source as the BIOS POST line and STATS VERSION, so one bump in project.godot moves all three
 	$Margin/Main/TopHeaderBar/HB/Title.text += " %s" % ProjectSettings.get_setting("application/config/version", "")
@@ -350,15 +313,15 @@ func _ready() -> void:
 	var corrupt := load_cfg_safe(cfg, _cfg)
 	_first_run = cfg.get_sections().is_empty()
 	if not cfg.get_sections().is_empty():
-		_folders.assign(_cfg_arr(cfg, "library", "folders"))
+		_library.folders.assign(_cfg_arr(cfg, "library", "folders"))
 		# an older config can hold un-normalised or nested roots; collapse them once here
 		# so the folder tree never renders the same directory twice
-		_dedupe_roots()
+		_library.dedupe_roots()
 		# has_section_key, not an is_empty() check: "saved, and the user turned everything
 		# off" has to survive a restart, and an empty Array cannot say that on its own
-		_enabled_known = cfg.has_section_key("library", "enabled_folders")
+		_library.enabled_known = cfg.has_section_key("library", "enabled_folders")
 		for dir in _cfg_arr(cfg, "library", "enabled_folders"):
-			_enabled_folders[dir] = true
+			_library.enabled_folders[dir] = true
 		# A config written before known_folders existed has no record of what the last
 		# scan saw, so it falls back to the enabled set. The consequence is deliberate:
 		# a folder that was switched off looks new once and comes back on. That is the
@@ -366,9 +329,9 @@ func _ready() -> void:
 		# a folder reappearing is one click to undo while a missing album is invisible.
 		for dir in _cfg_arr(cfg, "library", "known_folders",
 				_cfg_arr(cfg, "library", "enabled_folders")):
-			_known_folders[dir] = true
-		_sorts[0] = clampi(int(_cfg_num(cfg, "library", "sort", 0.0)), 0, SORTS.size() - 1)
-		_sorts[1] = clampi(int(_cfg_num(cfg, "library", "sort_b", float(_sorts[0]))), 0, SORTS.size() - 1)
+			_library.known_folders[dir] = true
+		_library.sorts[0] = clampi(int(_cfg_num(cfg, "library", "sort", 0.0)), 0, SORTS.size() - 1)
+		_library.sorts[1] = clampi(int(_cfg_num(cfg, "library", "sort_b", float(_library.sorts[0]))), 0, SORTS.size() - 1)
 		_viz_cfg = _cfg_dict(cfg, "visual", "viz")
 		_viz_cfg_b = _cfg_dict(cfg, "visual", "viz_b")
 		_skin = _cfg_str(cfg, "visual", "skin", "WIN98")
@@ -376,7 +339,7 @@ func _ready() -> void:
 		# straight into the deck the user was already listening on
 		_eq_cfg_decks[0] = _cfg_dict(cfg, "eq", "state")
 		_eq_cfg_decks[1] = _cfg_dict(cfg, "eq", "state_b")
-		_crossfader = clampf(_cfg_num(cfg, "audio", "crossfader", 0.0), 0.0, 1.0)
+		_decks.crossfader = clampf(_cfg_num(cfg, "audio", "crossfader", 0.0), 0.0, 1.0)
 		_beat_sync = _cfg_bool(cfg, "audio", "beat_sync", false)
 		_engine.deck = clampi(int(_cfg_num(cfg, "audio", "deck", 0.0)), 0, 1)
 		_engine.set_both(_cfg_bool(cfg, "audio", "both", false))
@@ -384,24 +347,35 @@ func _ready() -> void:
 		_total_secs = _cfg_num(cfg, "stats", "total_seconds", 0.0)
 		_user_name = _cfg_str(cfg, "stats", "user_name")
 		_tbs.assign(_cfg_arr(cfg, "library", "tbs"))
-		_playlists = _cfg_dict(cfg, "playlists", "list")
-		_pl_cues = _cfg_dict(cfg, "playlists", "cues")
-		_cues = _cfg_dict(cfg, "cues", "tracks")
-		_labels = _cfg_dict(cfg, "library", "track_labels")
+		# All four are keyed by TRACK ID. A config written before ids existed keyed them by
+		# absolute path, so it is converted on the way in -- once, here -- and saved back in
+		# the new shape. A path that is no longer in the library keeps its own key rather
+		# than being dropped: an unplugged drive must not eat a user's cues.
+		_library.playlists = _library.migrate_keys(_cfg_dict(cfg, "playlists", "list"))
+		for name in _library.playlists:
+			var ids: Array = []
+			for entry in (_library.playlists[name] as Array):
+				ids.append(_library.id_for(str(entry)) if str(entry).contains("/") else entry)
+			_library.playlists[name] = ids
+		_library.pl_cues = _cfg_dict(cfg, "playlists", "cues")
+		for name in _library.pl_cues:
+			_library.pl_cues[name] = _library.migrate_keys(_library.pl_cues[name])
+		_library.cues = _library.migrate_keys(_cfg_dict(cfg, "cues", "tracks"))
+		_library.labels = _library.migrate_keys(_cfg_dict(cfg, "library", "track_labels"))
 		# a playlist deleted by hand out of the config must not leave the list showing
 		# an empty scope with no way back to ALL TRACKS
 		for c in 2:
 			var pl := _cfg_str(cfg, "library", ["playlist", "playlist_b"][c])
-			_crate_pl[c] = pl if _playlists.has(pl) else ""
+			_library.crate_pl[c] = pl if _library.playlists.has(pl) else ""
 		# @onready, so _engine is already bound by the time the _ready body runs
 		_engine.shuffle = _cfg_bool(cfg, "library", "shuffle", false)
 		_engine.repeat = clampi(int(_cfg_num(cfg, "library", "repeat", float(AudioEngine.Repeat.ALL))),
 			0, 2) as AudioEngine.Repeat
 		_volume = clampf(_cfg_num(cfg, "audio", "volume", VOLUME_DEFAULT), 0.0, 100.0)
 		_boost = clampi(int(_cfg_num(cfg, "audio", "boost", 0.0)), 0, 100)
-		_fade_on = _cfg_bool(cfg, "audio", "fade", FADE_ON_DEFAULT)
-		_fade_ms = clampi(int(_cfg_num(cfg, "audio", "fade_ms", FADE_MS_DEFAULT)), FADE_MS_MIN, FADE_MS_MAX)
-		_delay_ms = clampi(int(_cfg_num(cfg, "audio", "play_delay_ms", DELAY_MS_DEFAULT)), DELAY_MS_MIN, DELAY_MS_MAX)
+		_decks.fade_on = _cfg_bool(cfg, "audio", "fade", FADE_ON_DEFAULT)
+		_decks.fade_ms = clampi(int(_cfg_num(cfg, "audio", "fade_ms", FADE_MS_DEFAULT)), FADE_MS_MIN, FADE_MS_MAX)
+		_decks.delay_ms = clampi(int(_cfg_num(cfg, "audio", "play_delay_ms", DELAY_MS_DEFAULT)), DELAY_MS_MIN, DELAY_MS_MAX)
 		_feed = clampi(int(_cfg_num(cfg, "visual", "feed_size", 0.0)), 0, FEED_NAMES.size() - 1)
 		# split_offset was the old pixel key; it has no meaning across orientations, so a
 		# config written before this simply starts from the middle.
@@ -525,11 +499,13 @@ func _ready() -> void:
 		_hover_note(add_music, func() -> String:
 			return "PICK A MUSIC FOLDER  //  OR DRAG FOLDERS STRAIGHT ONTO THE WINDOW")
 		search.text_changed.connect(func(t: String) -> void:
-			_filters[crate] = t.strip_edges()
+			_library.filters[crate] = t.strip_edges()
 			_refill(crate))
 	get_window().files_dropped.connect(_on_files_dropped)
 	%RemoveFolder.pressed.connect(_remove_folder)
 	%Rescan.pressed.connect(_rescan)
+	_scan_btn = %Rescan
+	_add_relocate_button()
 	%Sort.pressed.connect(_cycle_sort.bind(0))
 	%SortB.pressed.connect(_cycle_sort.bind(1))
 	%Reboot.pressed.connect(_on_reboot)
@@ -553,9 +529,9 @@ func _ready() -> void:
 	_engine.set_listening_mode(_listening_mode)
 	if _visual_windowed:
 		_toggle_visual_window(true)
-	%Sort.text = "SORT: %s" % SORTS[_sorts[0]]
-	%SortB.text = "SORT: %s" % SORTS[_sorts[1]]
-	_dialog.dir_selected.connect(_add_folder)
+	%Sort.text = "SORT: %s" % SORTS[_library.sorts[0]]
+	%SortB.text = "SORT: %s" % SORTS[_library.sorts[1]]
+	_dialog.dir_selected.connect(func(d: String) -> void: _add_folder(d))
 	_folder_tree.item_edited.connect(_on_folder_tree_item_edited)
 	_folder_tree.gui_input.connect(_on_folder_tree_input)
 	for deck in 2:
@@ -572,23 +548,23 @@ func _ready() -> void:
 		# press-time state. _pos()/_len() answer for whichever backend is live, so all of it is
 		# read BEFORE the swap.
 		var land := rev_landing(_state(), _pos(), _len(), stream.get_length())
-		# A crossfade owns _audio's volume and ends by stopping the outgoing player and
+		# A crossfade owns _decks.audio's volume and ends by stopping the outgoing player and
 		# nulling its stream -- so a REV that swapped the stream mid-fade would either be
 		# ramped by a fade that no longer means anything or stopped outright a moment
 		# later. Cancel it first and settle the level.
 		_kill_fade(_engine.deck)
-		_audio.volume_db = ACTIVE_DB
+		_decks.audio.volume_db = ACTIVE_DB
 		if _vid():
 			# a video's audio cannot be swapped out from under its picture: pushing the
-			# reversed track onto _audio would play both at once, out of sync
+			# reversed track onto _decks.audio would play both at once, out of sync
 			_video.stop()
 			_video.stream = null
-		_audio.stream = stream
+		_decks.audio.stream = stream
 		if land[0]:
 			# at the MIRRORED position, so REV picks up where you were rather than dropping
 			# you at the top of the reversed file
-			_audio.play(land[2])
-			_audio.stream_paused = land[1]
+			_decks.audio.play(land[2])
+			_decks.audio.stream_paused = land[1]
 		_sync_attach(_engine.deck)
 		_set_reversed(_engine.deck, true)
 		_refresh_rev_btn()
@@ -639,7 +615,7 @@ func _ready() -> void:
 	_picture.color_mode = _video_color
 	%VizStack.add_sibling(_picture)   # the same screen cell: sized with the visualizer, docked or windowed
 	_engine.video_ready.connect(_picture.open)
-	_director.attach(_audio)
+	_director.attach(_decks.audio)
 	_director.beat.connect(func(_i: int) -> void: _flash = 0.10)
 	_scrub.gui_input.connect(_on_scrub_input)
 	_vol.gui_input.connect(_on_vol_input)
@@ -680,8 +656,8 @@ func _ready() -> void:
 		_save())
 	_start_intro()
 	_save()   # write a full config immediately, so nothing depends on a later edit
-	if _paths.is_empty() and not _video.stream:
-		_audio.stream = _demo_tone()
+	if _library.paths.is_empty() and not _video.stream:
+		_decks.audio.stream = _demo_tone()
 	_stop()
 	if not corrupt.is_empty():
 		# not cleared on a timer: the intro and POST cover the status bar for the first
@@ -692,133 +668,83 @@ func _ready() -> void:
 
 # --- library --------------------------------------------------------------
 func _cycle_sort(crate: int) -> void:
-	_sorts[crate] = (_sorts[crate] + 1) % SORTS.size()
-	([%Sort, %SortB][crate] as Button).text = "SORT: %s" % SORTS[_sorts[crate]]
+	_library.sorts[crate] = (_library.sorts[crate] + 1) % SORTS.size()
+	([%Sort, %SortB][crate] as Button).text = "SORT: %s" % SORTS[_library.sorts[crate]]
 	_save()
 	# re-sort this crate only; no reason to re-walk the disk or touch the other list
-	_orders[crate] = _sorted(SORTS[_sorts[crate]])
+	_library.orders[crate] = _library.sorted(SORTS[_library.sorts[crate]])
 	_refill(crate)
 	if crate == 0:
 		_write_in()
 
-func _cmp_by(mode: String, a: String, b: String) -> bool:
-	match mode:
-		"ARTIST", "ALBUM", "KEY":
-			return str(_sortkey.get(a, a)).naturalnocasecmp_to(str(_sortkey.get(b, b))) < 0
-		"NAME":
-			return a.get_file().naturalcasecmp_to(b.get_file()) < 0
-		"TYPE":
-			var d := a.get_extension().nocasecmp_to(b.get_extension())
-			return d < 0 if d != 0 else a.naturalcasecmp_to(b) < 0
-		"DATE":
-			var ta: int = _mtime.get(a, 0)
-			var tb: int = _mtime.get(b, 0)
-			return ta > tb if ta != tb else a.naturalcasecmp_to(b) < 0  # newest first
-	return a.naturalcasecmp_to(b) < 0  # PATH and FOLDER: keeps directories contiguous
-
-## The string a metadata sort orders by. Unknown values sort LAST ("~" is past every letter
-## and digit), and the path breaks ties, so the order is total and stable across refills.
-## Keys order round the Camelot wheel -- 1A 1B 2A ... -- which is the order a DJ mixes in.
-static func meta_sort_key(mode: String, meta: Dictionary, path: String) -> String:
-	match mode:
-		"ARTIST":
-			var artist := str(meta.get("artist", "")).to_lower()
-			return "%s\t%s\t%s" % [artist if artist else "~", str(meta.get("album", "")).to_lower(), path]
-		"ALBUM":
-			var album := str(meta.get("album", "")).to_lower()
-			return "%s\t%s" % [album if album else "~", path]
-		"KEY":
-			var k: Dictionary = meta.get("key", {})
-			var pc := int(k.get("pc", -1))
-			if pc < 0:
-				return "~\t" + path
-			return "%s\t%s" % [AudioEngine.camelot(pc, bool(k.get("minor", false))).lpad(3, "0"), path]
-	return path
-
-static func sort_key_test() -> bool:
-	var k := func(mode: String, m: Dictionary) -> String: return meta_sort_key(mode, m, "p")
-	var before := func(a: String, b: String) -> bool: return a.naturalnocasecmp_to(b) < 0
-	return before.call(k.call("KEY", {"key": {"pc": 2, "minor": true}}), k.call("KEY", {"key": {"pc": 9, "minor": true}})) \
-		and before.call(k.call("KEY", {"key": {"pc": 9, "minor": true}}), k.call("KEY", {"key": {"pc": 0, "minor": false}})) \
-		and before.call(k.call("KEY", {"key": {"pc": 0, "minor": false}}), k.call("KEY", {})) \
-		and before.call(k.call("ARTIST", {"artist": "abba"}), k.call("ARTIST", {"artist": "Zed"})) \
-		and before.call(k.call("ARTIST", {"artist": "Zed"}), k.call("ARTIST", {})) \
-		and before.call(k.call("ALBUM", {"album": "A"}), k.call("ALBUM", {}))
-
-## SCAN SONGS: re-walks every root from disk. Reports what the selected folder holds
-## afterwards, so the button visibly did something even when the count has not changed.
+## SCAN SONGS: re-walks every root from disk, on a WORKER. The walk used to run right here
+## on the main thread, so a cold network share or a sleeping external drive froze the whole
+## program -- picture, meters, transport and all -- for as long as the filesystem took to
+## answer, with no way to stop it. Now the button starts it, the note reports where it has
+## got to, and pressing it again stops it.
 func _rescan() -> void:
+	if _library.scanning():
+		_library.stop_scan()
+		_note = "  //  SCAN STOPPED"
+		_clear_note_later()
+		_refresh_scan_btn()
+		return
 	var sel := _folder_tree.get_selected()
-	var watch: String = sel.get_metadata(0) if sel else ""
-	_all_paths.clear()
-	for f in _folders:
-		_walk(f, _all_paths)
+	_scan_watch = sel.get_metadata(0) if sel else ""
+	_library.video_test = _video_test
+	_library.scan()
+	_refresh_scan_btn()
+
+## Where the scan had got to when the last frame drew. Only the directory is worth showing:
+## a total is not knowable until the walk has finished, and a fake percentage is worse than
+## the truth.
+func _on_scan_progress(done: int, _total: int, where: String) -> void:
+	_note = "  //  SCANNING %s  //  %d TRACKS" % [where.get_file().to_upper(), done]
+
+func _on_scan_finished(_found: int, cancelled: bool) -> void:
+	_refresh_scan_btn()
+	if cancelled:
+		return
 	_build_folder_tree()
-	_apply_folder_filter()
+	_library.apply_folder_filter()
+	_after_reindex()
 	# Offline spectral key estimation: one background worker task per track, gated
 	# inside queue_spectral_key by the persistent cache AND by whether the file even
 	# has a tag (checked on the worker, not here) -- so a rescan of an already-processed
 	# library queues thousands of calls that all return in a hash lookup, not a re-run.
-	for path in _all_paths:
+	for path in _library.all_paths:
 		_engine.queue_spectral_key(path)
-	if watch.is_empty():
-		_note = "  //  SCANNED %d TRACKS" % _paths.size()
+	if _scan_watch.is_empty():
+		_note = "  //  SCANNED %d TRACKS" % _library.paths.size()
 	else:
 		var n := 0
-		for path in _paths:
-			if path.begins_with(watch):
+		for path in _library.paths:
+			if path.begins_with(_scan_watch):
 				n += 1
-		_note = "  //  %s: %d TRACKS" % [watch.get_file().to_upper(), n]
+		_note = "  //  %s: %d TRACKS" % [_scan_watch.get_file().to_upper(), n]
 	_clear_note_later()
+
+var _scan_watch := ""
+var _scan_btn: Button
+
+func _refresh_scan_btn() -> void:
+	if is_instance_valid(_scan_btn):
+		_scan_btn.text = "STOP SCAN" if _library.scanning() else "SCAN SONGS"
 
 ## Everything that is invariant under a search keystroke: the sort, the per-folder track
 ## counts, the queue hand-off, and the row strings themselves. Typing used to re-run all of
 ## it per character -- an O(n log n) sort plus an O(folders x tracks) prefix scan -- so it
 ## is split out here and called only when the library or the sort order actually changes.
-## `_index` stays index-aligned with `_paths`, which is what `_row_paths` and the queues mean.
+## `_library.index` stays index-aligned with `_library.paths`, which is what `_row_paths` and the queues mean.
 func _reindex() -> void:
-	_index.clear()
-	_path_pos.clear()
-	for path in _paths:
-		var dir := path.get_base_dir()
-		# a RENAME TAG override stands in for the filename in BOTH row forms, flat and
-		# folder-grouped, and so is also what SEARCH matches against: a track you renamed
-		# is findable by the name you gave it
-		var file: String = _labels.get(path, path.get_file())
-		var row := "%s/%s" % [dir.get_file(), file]
-		# folded once here rather than on every keystroke for every track
-		_index.append({"dir": dir, "file": file, "row": row, "hay": row.to_lower()})
-		# path -> its _index/_paths position, so a playlist's OWN order can look each of
-		# its tracks up in O(1) instead of _paths.find() per entry, per keystroke
-		_path_pos[path] = _index.size() - 1
-	# each crate sorts its own copy; the same mode twice is one sort shared, not two
-	for crate in 2:
-		_orders[crate] = _orders[0] if crate == 1 and _sorts[1] == _sorts[0] else _sorted(SORTS[_sorts[crate]])
-	# the queue hand-off moved into _refill(): the queue is the VISIBLE list now, and
-	# the visible list is what a search keystroke changes
+	_library.reindex()
+	_after_reindex()
+
+## The UI half of a reindex: the queue hand-off moved into _refill(), because the queue is
+## the VISIBLE list now and the visible list is what a search keystroke changes.
+func _after_reindex() -> void:
 	_refill()
 	_write_in()
-
-## _paths in `mode`'s order, as a new array. Stats and metadata keys are gathered once per
-## pass here, not once per comparison.
-func _sorted(mode: String) -> Array[String]:
-	_mtime.clear()
-	if mode == "DATE":
-		for p in _paths:
-			_mtime[p] = FileAccess.get_modified_time(p)
-	_sortkey.clear()
-	if mode in META_SORTS:
-		for p in _paths:
-			var m := _engine.cached_meta(p)
-			if mode == "KEY" and int((m.get("key", {}) as Dictionary).get("pc", -1)) < 0:
-				var est := _engine.spectral_key_for(p)   # an untagged track sorts by its estimate
-				if not est.is_empty():
-					m = m.duplicate()
-					m["key"] = {"pc": est["pc"], "minor": est["minor"]}
-			_sortkey[p] = meta_sort_key(mode, m, p)
-	var out: Array[String] = _paths.duplicate()
-	out.sort_custom(func(a: String, b: String) -> bool: return _cmp_by(mode, a, b))
-	return out
 
 ## Rebuilds the visible list of one crate, or of both with no argument, matching that crate's
 ## filter against the cached lowercase haystack. Cheap enough to run on every keystroke.
@@ -839,7 +765,7 @@ func _refill(crate := -1) -> void:
 	# visible keeps playing from where it was, and one that is filtered out simply hands
 	# the next advance to the top of the new queue.
 	if crate < 0 or crate == _engine.deck:
-		_engine.set_queue(_shown[_engine.deck], _current)
+		_engine.set_queue(_library.shown[_engine.deck], _current)
 	# both crates' unprobed tracks in one sweep: a sweep supersedes the last, so sweeping only
 	# the crate that changed would cancel the other one's
 	var todo: Array[String] = []
@@ -853,24 +779,32 @@ func _refill(crate := -1) -> void:
 
 func _fill(crate: int) -> void:
 	var list: ItemList = [_tracks, _tracks_b][crate]
-	var playlist: String = _crate_pl[crate]
+	var playlist: String = _library.crate_pl[crate]
 	list.clear()
 	var row_path := PackedInt32Array()
 	var path_row := PackedInt32Array()
-	path_row.resize(_index.size())
+	path_row.resize(_library.index.size())
 	path_row.fill(-1)          # a filtered-out track has no row at all
-	var needle: String = (_filters[crate] as String).to_lower()
+	var needle: String = (_library.filters[crate] as String).to_lower()
 	# Viewing a playlist shows ITS OWN stored order, not the crate's SORT -- that is what
 	# MOVE UP/DOWN in the track menu rearranges, and there would be nothing to see it
 	# rearrange if this still iterated the sorted library regardless. Folder grouping is a
 	# library concept and does not apply to a playlist's deliberate order.
-	var grouped: bool = SORTS[_sorts[crate]] == "FOLDER" and playlist.is_empty()
+	var grouped: bool = SORTS[_library.sorts[crate]] == "FOLDER" and playlist.is_empty()
 	# .assign(), NOT a direct assignment: ConfigFile hands back an UNTYPED Array, and
 	# GDScript refuses untyped -> Array[String] outright ("Trying to assign an array of
 	# type Array"). A playlist built this session is already typed and worked; one
 	# reloaded from library.cfg threw here and took the whole track list down with it.
 	var order: Array[String] = []
-	order.assign(_orders[crate] if playlist.is_empty() else _playlists.get(playlist, []))
+	if playlist.is_empty():
+		order.assign(_library.orders[crate])
+	else:
+		# a playlist stores IDS; what it shows is wherever those tracks are today, and an id
+		# the library no longer holds simply has no row
+		for id in (_library.playlists.get(playlist, []) as Array):
+			var at := _library.path_for(str(id))
+			if not at.is_empty():
+				order.append(at)
 	var header := theme.get_color("font_color", "Green")
 	var last_dir := ""
 	var shown: Array[String] = []
@@ -878,10 +812,10 @@ func _fill(crate: int) -> void:
 	var unknown: Array[String] = []
 	var pl_num := 0
 	for path in order:
-		var i: int = _path_pos.get(path, -1)
+		var i: int = _library.path_pos.get(path, -1)
 		if i < 0:
 			continue   # a playlist entry whose file is no longer on disk
-		var e: Dictionary = _index[i]
+		var e: Dictionary = _library.index[i]
 		# matched against folder + filename, which is what the row actually shows
 		if not needle.is_empty() and not (e["hay"] as String).contains(needle):
 			continue
@@ -908,31 +842,31 @@ func _fill(crate: int) -> void:
 		if path_row[i] < 0:
 			path_row[i] = list.item_count - 1
 		row_path.append(i)
-		shown.append(_paths[i])
+		shown.append(_library.paths[i])
 		# cached only -- an unprobed track is counted as unknown here and swept below,
 		# never probed inline: one ffprobe per row would stall the keystroke that asked
-		var m := _engine.cached_meta(_paths[i])
+		var m := _engine.cached_meta(_library.paths[i])
 		if m.is_empty():
-			unknown.append(_paths[i])
+			unknown.append(_library.paths[i])
 		else:
 			secs += float(m.get("duration", 0.0))
 	# assigned back whole: a packed array read out of an Array is a copy
 	_row_paths[crate] = row_path
 	_path_rows[crate] = path_row
-	_shown[crate] = shown
+	_library.shown[crate] = shown
 	_unknown[crate] = unknown
 	if crate == 0:   # the count line lives under TRK A
 		# the playlist name wins the readout when both are on: it is the scope you chose and
 		# stays chosen, where a search is transient
 		var scope := playlist if not playlist.is_empty() else ("FILTERED" if not needle.is_empty() else "")
-		_count.text = count_text(_paths.size(), shown.size(), _folders.size(), secs,
+		_count.text = count_text(_library.paths.size(), shown.size(), _library.folders.size(), secs,
 			scope, not unknown.is_empty())
 
 ## Each list highlights ITS deck's track, not whichever deck happens to be driven. A track
 ## filtered out of that crate's view simply has no row to select.
 func _mark_decks() -> void:
 	for deck in 2:
-		var i: int = _path_pos.get(_current if deck == _engine.deck else _deck_cur[deck], -1)
+		var i: int = _library.path_pos.get(_current if deck == _engine.deck else _decks.deck_cur[deck], -1)
 		var path_row: PackedInt32Array = _path_rows[deck]
 		if i >= 0 and i < path_row.size() and path_row[i] >= 0:
 			([_tracks, _tracks_b][deck] as ItemList).select(path_row[i])
@@ -1000,33 +934,22 @@ func _sweep_durations(todo: Array[String]) -> void:
 			if token == _sweep_token and not _engine.is_shut_down():
 				# what the sweep learned is kept for the next launch, and a metadata sort
 				# re-sorts now that the missing artists, albums and keys are known
-				_engine.save_index(_all_paths)
-				if SORTS[_sorts[0]] in META_SORTS or SORTS[_sorts[1]] in META_SORTS:
+				_engine.save_index(_library.all_paths)
+				if SORTS[_library.sorts[0]] in META_SORTS or SORTS[_library.sorts[1]] in META_SORTS:
 					_reindex()
 				else:
 					_refill()).call_deferred())
 
-func _walk(dir: String, out: Array[String]) -> void:
-	for f in DirAccess.get_files_at(dir):
-		if _is_track(f, _video_test):
-			out.append(dir.path_join(f))
-	for d in DirAccess.get_directories_at(dir):
-		_walk(dir.path_join(d), out)
-
-## Returns whether `dir` actually joined the library. `apply` false leaves the save and the
-## rescan to the caller, so a drop of several folders costs one of each rather than one per.
+## Whether `dir` actually joined the library. What may join is LibraryModel's rule; the note
+## about what happened belongs here, with the rest of the UI. `apply` false leaves the save and
+## the rescan to the caller, so a drop of several folders costs one of each rather than one per.
 func _add_folder(dir: String, apply := true) -> bool:
-	dir = _norm_root(dir)
-	for root in _folders:
-		if _is_under(dir, root):
-			# already inside a root, so its tracks are in the library either way
-			_note = "  //  ALREADY COVERED BY %s" % root.get_file().to_upper()
-			_clear_note_later()
-			return false
-	_folders.append(dir)
-	_dedupe_roots()   # the new root may swallow ones that were already there
-	# a newly added root is on by default, like every folder in a fresh library
-	_enabled_folders[dir] = true
+	var got := _library.add_folder(dir)
+	if not got["added"]:
+		# already inside a root, so its tracks are in the library either way
+		_note = "  //  ALREADY COVERED BY %s" % str(got["covered_by"]).get_file().to_upper()
+		_clear_note_later()
+		return false
 	if apply:
 		_save()
 		_rescan()
@@ -1051,61 +974,14 @@ func _on_files_dropped(files: PackedStringArray) -> void:
 		return   # a folder that was already covered left its own note
 	_save()
 	_rescan()
-	_note = "  //  ADDED %d FOLDER%s  //  %d TRACKS" % [added, "" if added == 1 else "S", _paths.size()]
+	_note = "  //  ADDED %d FOLDER%s  //  %d TRACKS" % [added, "" if added == 1 else "S", _library.paths.size()]
 	_clear_note_later()
-
-## Normalises a library root: backslashes to forward slashes, "." and ".." resolved, no
-## trailing separator -- except on a bare drive, where "D:" alone is not a usable path.
-static func _norm_root(dir: String) -> String:
-	var out := dir.replace("\\", "/").simplify_path()
-	if out.length() > 1 and out.ends_with("/") and not out.ends_with(":/"):
-		out = out.left(out.length() - 1)
-	return out
-
-## True when `child` IS `parent` or sits underneath it. Case-insensitive, because Windows
-## paths are; the separator is required so "C:/Music2" is not read as a child of
-## "C:/Music".
-static func _is_under(child: String, parent: String) -> bool:
-	var c := child.to_lower()
-	var p := parent.to_lower().trim_suffix("/")
-	return c == p or c.begins_with(p + "/")
-
-## Collapses the root list: normalised, de-duplicated case-insensitively, and with any
-## root that lives inside another dropped.
-##
-## Nested roots are not merely redundant. _build_folder_tree walks each root separately,
-## so "C:/Music" and "C:/Music/Rock" both render a Rock branch -- two checkboxes for one
-## directory, whose filter state then depends on which copy was clicked last.
-func _dedupe_roots() -> void:
-	var kept: Array[String] = []
-	for raw in _folders:
-		var dir := _norm_root(raw)
-		var redundant := false
-		for i in range(kept.size() - 1, -1, -1):
-			if _is_under(dir, kept[i]):
-				redundant = true      # covered by a root already kept
-				break
-			if _is_under(kept[i], dir):
-				kept.remove_at(i)     # this root swallows one we had
-		if not redundant:
-			kept.append(dir)
-	_folders = kept
-
-## Self-check for the path rules, asserted from _ready with the rest.
-static func roots_test() -> bool:
-	return _is_under("C:/Music/Rock", "C:/Music") \
-		and _is_under("c:/music/rock", "C:/MUSIC") \
-		and _is_under("C:/Music", "C:/Music") \
-		and not _is_under("C:/Music2", "C:/Music") \
-		and not _is_under("C:/Music", "C:/Music/Rock") \
-		and _norm_root("C:\\Music\\Rock\\") == "C:/Music/Rock" \
-		and _norm_root("D:/") == "D:/"
 
 
 # --- folder tree -----------------------------------------------------------
 ## The tree is derived from the walked track paths, NOT from a second recursive DirAccess
 ## pass. Every directory worth showing is one that holds audio or leads to one, and that
-## set is already implied by _all_paths -- a folder with no music anywhere under it is not
+## set is already implied by _library.all_paths -- a folder with no music anywhere under it is not
 ## something anyone wants to filter by, and walking the disk twice to find it is wasted IO.
 ##
 ## Rebuilt only from _rescan(), never from _reindex(): folder counts change when the disk
@@ -1115,7 +991,7 @@ func _build_folder_tree() -> void:
 	_folder_tree.clear()
 	var counts := _folder_counts()
 	var root := _folder_tree.create_item()
-	for base in _folders:
+	for base in _library.folders:
 		var made := {base: _folder_item(root, base, counts)}
 		for d in _dirs_under(base):
 			# _dirs_under sorts, and for path strings a parent always sorts before its
@@ -1134,9 +1010,9 @@ func _folder_item(parent: TreeItem, path: String, counts: Dictionary) -> TreeIte
 	# was absent from the enabled set exactly like a folder the user had unticked, so it
 	# was created unchecked and _apply_folder_filter dropped every track under it -- the
 	# album simply never appeared, with no error anywhere.
-	item.set_checked(0, not _enabled_known                 # fresh library: all on
-		or not _known_folders.has(path)                    # never seen before: new, on
-		or _enabled_folders.has(path))                     # seen before and left on
+	item.set_checked(0, not _library.enabled_known                 # fresh library: all on
+		or not _library.known_folders.has(path)                    # never seen before: new, on
+		or _library.enabled_folders.has(path))                     # seen before and left on
 	return item
 
 ## Recursive track count for every directory, in one pass up each track's ancestor chain:
@@ -1145,7 +1021,7 @@ func _folder_item(parent: TreeItem, path: String, counts: Dictionary) -> TreeIte
 ## only ever had two rows. A tree has one row per directory.
 func _folder_counts() -> Dictionary:
 	var counts := {}
-	for path in _all_paths:
+	for path in _library.all_paths:
 		var dir := path.get_base_dir()
 		while true:
 			counts[dir] = counts.get(dir, 0) + 1
@@ -1160,7 +1036,7 @@ func _folder_counts() -> Dictionary:
 func _dirs_under(base: String) -> Array[String]:
 	var seen := {}
 	var prefix := base + "/"
-	for path in _all_paths:
+	for path in _library.all_paths:
 		if not path.begins_with(prefix):
 			continue
 		var dir := path.get_base_dir()
@@ -1181,7 +1057,7 @@ func _on_folder_tree_item_edited() -> void:
 		return
 	_set_subtree_checked(item, item.is_checked(0))
 	_sync_enabled_from_tree()
-	_apply_folder_filter()
+	_library.apply_folder_filter()
 	_save()
 
 static func _set_subtree_checked(item: TreeItem, on: bool) -> void:
@@ -1210,11 +1086,11 @@ func _on_folder_tree_input(e: InputEvent) -> void:
 ## Reads the tree back into the set. Iterative rather than recursive purely because the
 ## hidden root has no metadata and would need special-casing in a recursive version.
 func _sync_enabled_from_tree() -> void:
-	_enabled_folders.clear()
+	_library.enabled_folders.clear()
 	# rebuilt rather than added to, so directories that have been deleted from disk drop
 	# out of the known set instead of accumulating in the config forever
-	_known_folders.clear()
-	_enabled_known = true
+	_library.known_folders.clear()
+	_library.enabled_known = true
 	var stack: Array[TreeItem] = []
 	if _folder_tree.get_root():
 		stack.append(_folder_tree.get_root())
@@ -1222,25 +1098,18 @@ func _sync_enabled_from_tree() -> void:
 		var item: TreeItem = stack.pop_back()
 		var meta = item.get_metadata(0)
 		if meta != null:
-			_known_folders[meta] = true   # it exists now; the next scan has seen it
+			_library.known_folders[meta] = true   # it exists now; the next scan has seen it
 			if item.is_checked(0):
-				_enabled_folders[meta] = true
+				_library.enabled_folders[meta] = true
 		var child := item.get_first_child()
 		while child:
 			stack.append(child)
 			child = child.get_next()
 
 ## Unchecking a folder removes its tracks from the LIBRARY, not merely from the visible
-## list. _paths feeds the play queue as well as the rows, so a track in an unchecked folder
+## list. _library.paths feeds the play queue as well as the rows, so a track in an unchecked folder
 ## must not be reachable with NEXT either -- which is why the filter lives here and not in
-## _refill(), which is only ever a view of _paths and is also what SEARCH filters.
-func _apply_folder_filter() -> void:
-	_paths.clear()
-	for path in _all_paths:
-		if _enabled_folders.has(path.get_base_dir()):
-			_paths.append(path)
-	_reindex()
-
+## _refill(), which is only ever a view of _library.paths and is also what SEARCH filters.
 ## Transient status text: the note sits in the status bar rather than a popup, so it
 ## needs clearing or it would still be there ten minutes later.
 func _clear_note_later() -> void:
@@ -1259,15 +1128,56 @@ func _remove_folder() -> void:
 	if not sel:
 		return
 	var gone: String = sel.get_metadata(0)
-	if not gone in _folders:
+	if not gone in _library.folders:
 		_note = "  //  SELECT A ROOT FOLDER TO REMOVE"
 		_clear_note_later()
 		return
-	_folders.erase(gone)
+	_library.folders.erase(gone)
 	_save()
 	_rescan()
 	_note = "  //  REMOVED %s" % gone.get_file().to_upper()
 	_clear_note_later()
+
+## RELOCATE FOLDER: the library moved and the paths in the config did not. Typing the new
+## location re-points every root that sat under the old one, in one step, instead of removing
+## and re-adding each root and losing the folder checkboxes with them.
+##
+## Cues, RENAME tags and playlists need no part in this and are not touched. They are keyed by
+## track id (LibraryModel.track_id), and an id does not know where the file is -- which is the
+## entire reason they are keyed by id. Moving a library used to orphan every one of them.
+func _add_relocate_button() -> void:
+	var host: Control = %RemoveFolder.get_parent()
+	var btn := Button.new()
+	btn.name = "RelocateFolder"
+	btn.text = "RELOCATE"
+	btn.tooltip_text = "The library moved to another drive or folder: re-point its roots without losing your cues, tags or playlists."
+	btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	host.add_child(btn)
+	host.move_child(btn, %RemoveFolder.get_index() + 1)
+	btn.pressed.connect(_relocate_folder)
+
+func _relocate_folder() -> void:
+	if _library.folders.is_empty():
+		_note = "  //  NO LIBRARY FOLDERS TO RELOCATE"
+		_clear_note_later()
+		return
+	var sel := _folder_tree.get_selected()
+	var guess: String = sel.get_metadata(0) if sel else ""
+	if not guess in _library.folders:
+		guess = _library.folders[0]
+	_ask("RELOCATE: OLD PATH", guess, func(old_path: String) -> void:
+		if old_path.strip_edges().is_empty():
+			return
+		_ask("RELOCATE: NEW PATH", old_path, func(new_path: String) -> void:
+			var moved := _library.relocate(old_path, new_path)
+			if moved == 0:
+				_note = "  //  NOTHING UNDER %s" % old_path.to_upper()
+				_clear_note_later()
+				return
+			_save()
+			_rescan()
+			_note = "  //  RELOCATED %d ROOT%s TO %s" % [moved, "" if moved == 1 else "S", new_path.to_upper()]
+			_clear_note_later()))
 
 func _save() -> void:
 	# REBOOT has already moved the config aside; a periodic or debounced save landing in
@@ -1277,25 +1187,25 @@ func _save() -> void:
 	if _rebooting or not is_node_ready():
 		return
 	var cfg := ConfigFile.new()
-	cfg.set_value("library", "folders", _folders)
-	cfg.set_value("library", "enabled_folders", _enabled_folders.keys())
-	cfg.set_value("library", "known_folders", _known_folders.keys())
-	cfg.set_value("library", "sort", _sorts[0])
-	cfg.set_value("library", "sort_b", _sorts[1])
+	cfg.set_value("library", "folders", _library.folders)
+	cfg.set_value("library", "enabled_folders", _library.enabled_folders.keys())
+	cfg.set_value("library", "known_folders", _library.known_folders.keys())
+	cfg.set_value("library", "sort", _library.sorts[0])
+	cfg.set_value("library", "sort_b", _library.sorts[1])
 	cfg.set_value("library", "tbs", _tbs)
-	cfg.set_value("library", "track_labels", _labels)
-	cfg.set_value("library", "playlist", _crate_pl[0])
-	cfg.set_value("library", "playlist_b", _crate_pl[1])
-	cfg.set_value("playlists", "list", _playlists)
-	cfg.set_value("playlists", "cues", _pl_cues)
-	cfg.set_value("cues", "tracks", _cues)
+	cfg.set_value("library", "track_labels", _library.labels)
+	cfg.set_value("library", "playlist", _library.crate_pl[0])
+	cfg.set_value("library", "playlist_b", _library.crate_pl[1])
+	cfg.set_value("playlists", "list", _library.playlists)
+	cfg.set_value("playlists", "cues", _library.pl_cues)
+	cfg.set_value("cues", "tracks", _library.cues)
 	cfg.set_value("library", "shuffle", _engine.shuffle)
 	cfg.set_value("library", "repeat", int(_engine.repeat))
 	cfg.set_value("audio", "volume", _volume)
 	cfg.set_value("audio", "boost", _boost)
-	cfg.set_value("audio", "fade", _fade_on)
-	cfg.set_value("audio", "fade_ms", _fade_ms)
-	cfg.set_value("audio", "play_delay_ms", _delay_ms)
+	cfg.set_value("audio", "fade", _decks.fade_on)
+	cfg.set_value("audio", "fade_ms", _decks.fade_ms)
+	cfg.set_value("audio", "play_delay_ms", _decks.delay_ms)
 	cfg.set_value("audio", "track_tempo", _director.track_tempo)
 	# never persist FULLSCREEN: it would boot into a UI with no visible way out
 	cfg.set_value("visual", "feed_size", _feed_prev if _feed == Feed.FULLSCREEN else _feed)
@@ -1352,7 +1262,7 @@ func _save() -> void:
 		cfg.set_value("spectral_keys", k, spectral_snapshot[k])
 	cfg.set_value("eq", "state", _eq_decks[0].to_dict())
 	cfg.set_value("eq", "state_b", _eq_decks[1].to_dict())
-	cfg.set_value("audio", "crossfader", _crossfader)
+	cfg.set_value("audio", "crossfader", _decks.crossfader)
 	cfg.set_value("audio", "beat_sync", _beat_sync)
 	cfg.set_value("audio", "deck", _engine.deck)
 	cfg.set_value("audio", "both", _engine.both)
@@ -1364,10 +1274,37 @@ func _save() -> void:
 		cfg.set_value("visual", pair[0], {
 			"mode": int(v.mode), "color": v.color_index, "sens": v.sensitivity,
 			"tilt": v.tilt_db, "height": v.height_scale, "speed": v.speed})
-	var err := save_cfg_atomic(cfg, _cfg)
-	if err != OK:
-		push_warning("could not save %s: %s" % [_cfg, error_string(err)])
-		_note = "  //  CONFIG SAVE FAILED (%s)" % error_string(err)
+	_write_cfg_async(cfg)
+
+## The config is BUILT on the main thread -- every value above is read straight off live state,
+## and snapshotting it anywhere else would be a data race -- but the three file operations that
+## follow are not. A library with thousands of cached spectral keys, a few hundred cues and a
+## setlist serialises to a file big enough that ConfigFile.save() plus two renames is a visible
+## hitch, and _save_soon fires it every time a fader moves, a cue is dropped or a track is
+## filed. The finished ConfigFile is handed to a worker, which nothing else touches.
+##
+## One at a time, and in order: two overlapping writers would race over the same .tmp and .bak.
+var _cfg_task := -1
+
+func _write_cfg_async(cfg: ConfigFile) -> void:
+	if _cfg_task != -1:
+		WorkerThreadPool.wait_for_task_completion(_cfg_task)
+	var path := _cfg
+	_cfg_task = WorkerThreadPool.add_task(func() -> void:
+		var err := save_cfg_atomic(cfg, path)
+		if err != OK:
+			_on_cfg_write_failed.call_deferred(error_string(err)))
+
+func _on_cfg_write_failed(reason: String) -> void:
+	push_warning("could not save %s: %s" % [_cfg, reason])
+	_note = "  //  CONFIG SAVE FAILED (%s)" % reason
+
+## Nothing may outlive the write. A quit with a save still in flight would take the process
+## down mid-rename, which is exactly the window save_cfg_atomic exists to close.
+func _finish_cfg_write() -> void:
+	if _cfg_task != -1:
+		WorkerThreadPool.wait_for_task_completion(_cfg_task)
+		_cfg_task = -1
 
 ## The config on disk is never half-written. The new file goes to .tmp first; only once
 ## that write has fully succeeded does the live file move aside to .bak and the .tmp take
@@ -1424,7 +1361,9 @@ func _notification(what: int) -> void:
 		_save()
 		if _engine:
 			_engine.shutdown()
-			_engine.save_index(_all_paths)   # after the join, so no worker is still writing _meta
+			_engine.save_index(_library.all_paths)   # after the join, so no worker is still writing _meta
+		_library.stop_scan()   # a walk still running has nothing left to report to
+		_finish_cfg_write()    # the config write is on a worker; the process may not outrun it
 	# A drag begins somewhere and ends somewhere; Godot tells every Control about both
 	# but never says where. So the tab under the cursor is noted at the start, and at the
 	# end the cursor is asked again -- if the drag was not consumed by anything (the tab
@@ -1471,7 +1410,7 @@ func _notification(what: int) -> void:
 		Engine.max_fps = _max_fps
 
 # --- playback (decoding, metadata and preload live in AudioEngine) ---------
-## `i` indexes the ENGINE QUEUE, which is the visible list -- not _paths. The two are the
+## `i` indexes the ENGINE QUEUE, which is the visible list -- not _library.paths. The two are the
 ## same array until a search narrows it, and bounds-checking against the wrong one is how
 ## a filtered queue would load the wrong track.
 ##
@@ -1481,7 +1420,7 @@ func _notification(what: int) -> void:
 func _open(i: int, auto := false) -> void:
 	if i < 0 or i >= _engine.queue.size():
 		return
-	_auto_advancing = auto
+	_decks.auto_advancing = auto
 	_video.stream = null
 	# The outgoing track is NOT stopped here any more. Stopping up front cut to silence
 	# the instant a track was picked and held it until the decode landed -- which for an
@@ -1504,19 +1443,19 @@ func _on_track_ready(path: String, stream: AudioStream, _meta: Dictionary, deck:
 		return
 	_note = ""
 	_current = path
-	_fail_streak = 0        # something played: whatever came before it was a run of bad files
-	_auto_advancing = false
+	_decks.fail_streak = 0        # something played: whatever came before it was a run of bad files
+	_decks.auto_advancing = false
 	_refresh_rev_btn()
-	if _fade_on and _audio.playing:
+	if _decks.fade_on and _decks.audio.playing:
 		_crossfade(stream, deck)
 	else:
 		_stop()
-		_audio.stream = stream  # already decoded on a worker, or handed over from preload
-		_audio.volume_db = ACTIVE_DB
-		_audio.play()
+		_decks.audio.stream = stream  # already decoded on a worker, or handed over from preload
+		_decks.audio.volume_db = ACTIVE_DB
+		_decks.audio.play()
 	# the spectrum feed follows whichever player is live, and attach() resets the tempo
 	# lock for us -- it is per-track, and carrying it over would fight the new song
-	_director.attach(_audio)
+	_director.attach(_decks.audio)
 	_sync_attach(deck)   # a new track on this deck: its tracker starts a fresh lock
 	_arm_picture(path, stream)
 	_ticker.text = _engine.ticker_line(path)
@@ -1543,18 +1482,8 @@ func _video_palette() -> Gradient:
 	var gi: int = _viz.gradient_index()
 	return _gradients[gi] if gi >= 0 and gi < _gradients.size() else _skin_ramp
 
-## How many unplayable tracks in a row end the set rather than being skipped past. Three is
-## enough to step over a broken file or two mid-playlist, and few enough that a whole folder
-## gone offline -- an unplugged drive, a cloud library with nothing downloaded -- stops the
-## program on the third rather than tearing through a thousand tracks announcing each one.
-const MAX_AUTO_SKIPS := 3
-
-## Set while the load in flight came from a track ENDING. Consumed by _on_track_ready and
-## _on_track_failed, which are the two ways that load can finish.
-var _auto_advancing := false
-var _fail_streak := 0
-## path -> why, for this session. The STATS column prints the count; the log carries each one.
-var _failed_tracks := {}
+## The skip-and-stop rule, and the counters it reads, belong to DeckController.
+const MAX_AUTO_SKIPS := DeckController.MAX_AUTO_SKIPS
 
 ## A decode that did not produce a stream. On a track the user picked, that is a note and
 ## nothing else. During AUTO-ADVANCE it used to be the end of the set: one FLAC on a build
@@ -1562,63 +1491,40 @@ var _failed_tracks := {}
 ## disk, and playback simply stopped behind a note that cleared itself four seconds later.
 func _on_track_failed(path: String, reason: String, deck: int) -> void:
 	_busy = false
-	_failed_tracks[path] = reason
+	_decks.failed_tracks[path] = reason
 	push_warning("cannot play %s: %s" % [path, reason])
-	match fail_action(_auto_advancing, deck == _engine.deck, _fail_streak):
-		Fail.REPORT:
+	match DeckController.fail_action(_decks.auto_advancing, deck == _engine.deck, _decks.fail_streak):
+		DeckController.Fail.REPORT:
 			_note = "  //  %s: %s" % [reason.to_upper(), path.get_file()]
 			_clear_note_later()
-		Fail.SKIP:
-			_fail_streak += 1
+		DeckController.Fail.SKIP:
+			_decks.fail_streak += 1
 			_note = "  //  SKIPPED %s (%s)" % [path.get_file(), reason.to_upper()]
 			_clear_note_later()
 			_next(true)
-		Fail.STOP:
-			_auto_advancing = false
-			_fail_streak = 0
+		DeckController.Fail.STOP:
+			_decks.auto_advancing = false
+			_decks.fail_streak = 0
 			_stop(deck)
 			# left on screen: playback has stopped, and the reason is the only way to tell that
 			# from the end of a queue
 			_note = "  //  [!] PLAYBACK STOPPED: %d TRACKS IN A ROW WOULD NOT PLAY  //  LAST %s (%s)" % [
 				MAX_AUTO_SKIPS, path.get_file(), reason.to_upper()]
 
-enum Fail { REPORT, SKIP, STOP }
-
-## What a track that would not decode should DO, given who asked for it and how many failed
-## before it. A track somebody PICKED is never skipped past -- the failure is reported and the
-## deck stays where it is -- and neither is a failure on the deck nobody is driving. Pure, so
-## the rule is checkable without a deck, a file or an audio device.
-static func fail_action(auto: bool, same_deck: bool, streak: int) -> Fail:
-	if not auto or not same_deck:
-		return Fail.REPORT
-	return Fail.STOP if streak + 1 >= MAX_AUTO_SKIPS else Fail.SKIP
-
-static func fail_test() -> bool:
-	return fail_action(false, true, 0) == Fail.REPORT \
-		and fail_action(false, true, MAX_AUTO_SKIPS) == Fail.REPORT \
-		and fail_action(true, false, 0) == Fail.REPORT \
-		and fail_action(true, true, 0) == Fail.SKIP \
-		and fail_action(true, true, MAX_AUTO_SKIPS - 2) == Fail.SKIP \
-		and fail_action(true, true, MAX_AUTO_SKIPS - 1) == Fail.STOP
-
-## A decode that finished after the user switched decks. The parked deck gets exactly what
-## the live one would -- a crossfade when FADE is on and it is sounding, a straight swap
-## otherwise -- on its own players and its own tween, so the live deck's stream is never
-## interrupted, faded or re-pointed. The note is the only thing the live side sees.
 func _load_parked(deck: int, path: String, stream: AudioStream) -> void:
-	if _fade_on and _live_player(deck).playing:
+	if _decks.fade_on and _live_player(deck).playing:
 		_crossfade(stream, deck)
 	else:
 		_kill_fade(deck)
 		var pl := _live_player(deck)
-		for other: AudioStreamPlayer in _deck_pair[deck]:
+		for other: AudioStreamPlayer in _decks.pair[deck]:
 			other.stop()
 			other.stream_paused = false
 			other.volume_db = ACTIVE_DB
 		pl.stream = stream
 		pl.play()
-		_deck_live[deck] = pl
-	_deck_cur[deck] = path
+		_decks.deck_live[deck] = pl
+	_decks.deck_cur[deck] = path
 	_sync_attach(deck)
 	_mark_decks()
 	_note = "  //  LOADED ON %s: %s" % [AudioEngine.DECK_NAMES[deck], path.get_file()]
@@ -1637,13 +1543,13 @@ func _prev() -> void:
 ## deck to load it must not blank the bar, the markers and the analyser under the music you
 ## can hear. The first track loaded on the focused deck takes the bar back.
 func _bar_deck() -> int:
-	if _audio.stream or _vid():
+	if _decks.audio.stream or _vid():
 		return _engine.deck
 	var other := _live_player(1 - _engine.deck)
 	return 1 - _engine.deck if other.stream and (other.playing or other.stream_paused) else _engine.deck
 
 func _bar() -> AudioStreamPlayer: return _live_player(_bar_deck())
-func _bar_path() -> String: return _current if _bar_deck() == _engine.deck else _deck_cur[1 - _engine.deck]
+func _bar_path() -> String: return _current if _bar_deck() == _engine.deck else _decks.deck_cur[1 - _engine.deck]
 
 func _vid() -> bool: return _video.stream != null
 func _len() -> float: return _video.get_stream_length() if _vid() else (_bar().stream.get_length() if _bar().stream else 0.0)
@@ -1681,7 +1587,7 @@ func _play() -> void:
 func _stop(deck := _engine.deck) -> void:
 	_kill_fade(deck)   # this deck's fade only; the other deck keeps its own
 	_video.stop()
-	for pl: AudioStreamPlayer in _deck_pair[deck]:
+	for pl: AudioStreamPlayer in _decks.pair[deck]:
 		pl.stop()
 		pl.stream_paused = false
 		pl.volume_db = ACTIVE_DB
@@ -1766,7 +1672,7 @@ func _process(delta: float) -> void:
 	_clock.text = _clock_text()
 	_nosignal.visible = _state() == "STOPPED"
 	_nosignal.text = "[ LOADING ]" if _busy else "[ NO SIGNAL ]"
-	_picture.follow(_audio, _video_palette(), VideoTest.kick(_director.levels[0], _viz.db_floor()))
+	_picture.follow(_decks.audio, _video_palette(), VideoTest.kick(_director.levels[0], _viz.db_floor()))
 	%VizStack.visible = not _picture.visible   # an MP4 picture takes the visualizer's place
 	_session_secs += delta
 	_total_secs += delta
@@ -1833,8 +1739,8 @@ func _refresh_stats() -> void:
 		"VERSION.%s" % ProjectSettings.get_setting("application/config/version", ""),
 		"USER....%s" % (_user_name if _user_name else "-"),
 		"SOURCE..%s" % _src(),
-		"LIBRARY.%d" % _paths.size(),
-		"FAILED..%d" % _failed_tracks.size(),
+		"LIBRARY.%d" % _library.paths.size(),
+		"FAILED..%d" % _decks.failed_tracks.size(),
 		"MOUSE...[H] %s" % ("HIDDEN" if _cursor_hidden else "SHOWN"),
 		"VOLUME..%03d%%" % int(_vol.value),
 		"XFADE...%s" % _xfade_stat(),
@@ -1862,7 +1768,7 @@ func _refresh_stats() -> void:
 ## themselves -- never from what the settings say they should be.
 func _refresh_autopsy() -> void:
 	var which := _engine.deck
-	var player: AudioStreamPlayer = _deck_live[which] if _deck_live[which] else _engine.deck_player(which)
+	var player: AudioStreamPlayer = _decks.deck_live[which] if _decks.deck_live[which] else _engine.deck_player(which)
 	var stream: AudioStream = player.stream if is_instance_valid(player) else null
 	var meta := _engine.cached_meta(_current) if _current else {}
 	var mix := int(AudioServer.get_mix_rate())
@@ -1982,18 +1888,18 @@ func _xfade_stat() -> String:
 	if _engine.both:
 		return "A+B (BOTH AT UNITY)"
 	return "%s  //  A %+.1f DB  //  B %+.1f DB" % [
-		("A" if _crossfader < 0.02 else ("B" if _crossfader > 0.98 else
-			"%d%%" % int(_crossfader * 100.0))),
-		AudioEngine.deck_gain_db(1.0 - _crossfader),
-		AudioEngine.deck_gain_db(_crossfader)]
+		("A" if _decks.crossfader < 0.02 else ("B" if _decks.crossfader > 0.98 else
+			"%d%%" % int(_decks.crossfader * 100.0))),
+		AudioEngine.deck_gain_db(1.0 - _decks.crossfader),
+		AudioEngine.deck_gain_db(_decks.crossfader)]
 
 ## Per-deck block. The ACTIVE deck reads through the same _len()/_pos()/_state() the
 ## transport uses, so the two can never disagree; a parked deck is read off its own
-## player, since _audio only ever points at the live one.
+## player, since _decks.audio only ever points at the live one.
 func _deck_stat_lines(which: int) -> Array[String]:
 	var live := _engine.deck == which
-	var path: String = _current if live else _deck_cur[which]
-	var player: AudioStreamPlayer = _deck_live[which] if _deck_live[which] \
+	var path: String = _current if live else _decks.deck_cur[which]
+	var player: AudioStreamPlayer = _decks.deck_live[which] if _decks.deck_live[which] \
 		else _engine.deck_player(which)
 	var dl := 0.0
 	var dp := 0.0
@@ -2186,10 +2092,6 @@ func _time_text(t: float) -> String:
 		return ts_text(t)
 	return _hms(t) if t >= 3600.0 else _fmt(t)
 
-## A file the library takes: audio always, an .mp4 only while Video TEST is on.
-static func _is_track(f: String, video := false) -> bool:
-	var ext := f.get_extension().to_lower()
-	return ext in EXTS or (video and ext == "mp4")
 
 static func _ratio_at(x: float, w: float) -> float:
 	return clampf(x / maxf(w, 1.0), 0.0, 1.0)
@@ -2471,7 +2373,7 @@ func _on_viz_bar(e: InputEvent, bar: ProgressBar) -> void:
 func _on_row_activated(row: int, deck: int) -> void:
 	var row_path: PackedInt32Array = _row_paths[deck]
 	if row >= 0 and row < row_path.size() and row_path[row] >= 0:
-		_open_deck(deck, _paths[row_path[row]])
+		_open_deck(deck, _library.paths[row_path[row]])
 
 ## Plays `path` on `deck` whichever deck is driven, and never changes which one that is:
 ## %TracksA always loads deck A, %TracksB deck B. The driven deck goes through _open as ever;
@@ -3085,7 +2987,7 @@ func _set_video_test(on: bool) -> void:
 			_stop()
 		AudioEngine.purge_video_cache()
 	_rescan()
-	_engine.save_index(_all_paths)   # the index forgets them now, not at the next close
+	_engine.save_index(_library.all_paths)   # the index forgets them now, not at the next close
 	_save()
 
 func _refresh_playbar_btn() -> void:
@@ -3670,36 +3572,35 @@ static func _restore_unique_names(root: Node) -> void:
 
 
 # --- crossfade -------------------------------------------------------------
-const ACTIVE_DB := 0.0
-const SILENT_DB := -80.0
+## The transition itself is DeckController's; these are the limits the SETTINGS fields clamp
+## to, and the levels the transport writes directly when it is not fading.
+const ACTIVE_DB := DeckController.ACTIVE_DB
+const SILENT_DB := DeckController.SILENT_DB
 const FADE_MS_MIN := 100
 const FADE_MS_MAX := 10000
-const DELAY_MS_MIN := 0
+const DELAY_MS_MIN := DeckController.DELAY_MS_MIN
 const DELAY_MS_MAX := 2000
-## The incoming ramp is never allowed to collapse to nothing: if PLAY DELAY is set at or
-## past FADE TIME the delay is pulled back so this much fade-in always survives, which is
-## what keeps an over-long delay from turning the transition into a hard cut.
-const MIN_FADE_IN_MS := 100
+const MIN_FADE_IN_MS := DeckController.MIN_FADE_IN_MS
 
 func _setup_fade() -> void:
 	%Fade.pressed.connect(func() -> void:
-		_fade_on = not _fade_on
-		%Fade.text = "FADE: %s" % ("ON" if _fade_on else "OFF")
+		_decks.fade_on = not _decks.fade_on
+		%Fade.text = "FADE: %s" % ("ON" if _decks.fade_on else "OFF")
 		_save())
 	%FadeMs.text_submitted.connect(func(_s: String) -> void: _commit_fade_ms())
 	%FadeMs.focus_exited.connect(_commit_fade_ms)
 	%DelayMs.text_submitted.connect(func(_s: String) -> void: _commit_delay_ms())
 	%DelayMs.focus_exited.connect(_commit_delay_ms)
-	%Fade.text = "FADE: %s" % ("ON" if _fade_on else "OFF")
-	%FadeMs.text = str(_fade_ms)
-	%DelayMs.text = str(_delay_ms)
+	%Fade.text = "FADE: %s" % ("ON" if _decks.fade_on else "OFF")
+	%FadeMs.text = str(_decks.fade_ms)
+	%DelayMs.text = str(_decks.delay_ms)
 
 ## Clamped on commit rather than per keystroke, so typing "2" on the way to "2500"
 ## does not get rewritten to the 100 ms floor under the cursor.
 func _commit_fade_ms() -> void:
-	_fade_ms = clampi(int(%FadeMs.text), FADE_MS_MIN, FADE_MS_MAX)
-	%FadeMs.text = str(_fade_ms)
-	%DelayMs.text = str(_delay_ms)
+	_decks.fade_ms = clampi(int(%FadeMs.text), FADE_MS_MIN, FADE_MS_MAX)
+	%FadeMs.text = str(_decks.fade_ms)
+	%DelayMs.text = str(_decks.delay_ms)
 	_save()
 
 ## Equal-length ramps on one deck's two players. The deck's live reference swaps at the
@@ -3712,70 +3613,28 @@ func _commit_fade_ms() -> void:
 ## `deck` is explicit and everything below belongs to it -- its pair, its live player, its
 ## tween -- so a fade on the parked deck and a fade on the live deck never touch each other.
 func _crossfade(stream: AudioStream, deck: int) -> void:
-	_kill_fade(deck)
-	var outgoing := _live_player(deck)
-	var pair: Array = _deck_pair[deck]
-	var incoming: AudioStreamPlayer = pair[1] if outgoing == pair[0] else pair[0]
-
-	# clamped so delay + fade-in always fits inside FADE TIME; both ramps therefore
-	# finish together and the whole transition still lasts exactly FADE TIME
-	var delay_ms: int = clampi(_delay_ms, DELAY_MS_MIN, maxi(_fade_ms - MIN_FADE_IN_MS, 0))
-	var fade_s := float(_fade_ms) / 1000.0
-	var delay_s := float(delay_ms) / 1000.0
-	var in_s: float = maxf(fade_s - delay_s, float(MIN_FADE_IN_MS) / 1000.0)
-
-	# armed but silent and NOT playing: starting it now would advance the playhead
-	# during the delay, so the track would be mid-intro by the time it is audible
-	incoming.stream = stream
-	incoming.volume_db = SILENT_DB
-	incoming.stream_paused = false
-
-	var tw := create_tween().set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-	_fade_tweens[deck] = tw
-	tw.set_parallel(true)
-	# T = 0: the outgoing track starts falling immediately, over the full fade time
-	tw.tween_property(outgoing, "volume_db", SILENT_DB, fade_s)
-	# T = PLAY DELAY: the incoming track starts, and only then begins its ramp
-	tw.tween_callback(func() -> void:
-		incoming.volume_db = SILENT_DB
-		incoming.play()
-		# the deck's own live reference always moves; the transport, scrub and analyser
+	_decks.crossfade(stream, deck, func(d: int, incoming: AudioStreamPlayer) -> void:
+		# the deck's own live reference already moved; the transport, scrub and analyser
 		# hand over only when this deck is the one being looked at
-		_deck_live[deck] = incoming
-		_sync_attach(deck, incoming)
-		if _engine.deck == deck:
-			_audio = incoming
-			_director.attach(_audio)).set_delay(delay_s)
-	tw.tween_property(incoming, "volume_db", ACTIVE_DB, in_s).set_delay(delay_s)
-	# chain() waits for every parallel step, so this is the true end of the transition
-	tw.chain().tween_callback(func() -> void:
-		outgoing.stop()
-		outgoing.volume_db = ACTIVE_DB
-		outgoing.stream = null)
-
-## One crossfade tween PER DECK. A single shared one let STOP, a new track or REV on one
-## deck kill the other deck's fade mid-flight -- both of that deck's players left sounding
-## at partial volume with nothing left to stop the outgoing one -- and switching decks
-## cleared a shared "fading" flag, re-arming auto-advance in the middle of a transition.
-var _fade_tweens: Array[Tween] = [null, null]
+		_sync_attach(d, incoming)
+		if _engine.deck == d:
+			_decks.audio = incoming
+			_director.attach(_decks.audio))
 
 func _fade_running(deck: int) -> bool:
-	return _fade_tweens[deck] != null and _fade_tweens[deck].is_valid()
+	return _decks.fading(deck)
 
 func _kill_fade(deck: int) -> void:
-	if _fade_running(deck):
-		_fade_tweens[deck].kill()
+	_decks.kill_fade(deck)
 
-## The player a deck is sounding through: `_audio` for the live deck, the recorded live
+## The player a deck is sounding through: `_decks.audio` for the live deck, the recorded live
 ## player -- or the primary, if it never played -- for the parked one.
 func _live_player(deck: int) -> AudioStreamPlayer:
-	if deck == _engine.deck:
-		return _audio
-	return _deck_live[deck] if _deck_live[deck] else _deck_pair[deck][0]
+	return _decks.live(deck)
 
 func _commit_delay_ms() -> void:
-	_delay_ms = clampi(int(%DelayMs.text), DELAY_MS_MIN, DELAY_MS_MAX)
-	%DelayMs.text = str(_delay_ms)
+	_decks.delay_ms = clampi(int(%DelayMs.text), DELAY_MS_MIN, DELAY_MS_MAX)
+	%DelayMs.text = str(_decks.delay_ms)
 	_save()
 
 ## Every stylebox state a Button can draw. Overriding only normal/hover/pressed is what
@@ -4553,7 +4412,7 @@ func _begin_boot() -> void:
 		return                      # already handed over; a skip and the end can race
 	%IntroVid.stop()
 	%Intro.visible = false
-	%Boot.begin(_user_name, _paths.size())
+	%Boot.begin(_user_name, _library.paths.size())
 
 ## Any key or click skips the logo. Handled here rather than in boot.gd because the
 ## boot screen has not been handed control yet.
@@ -5267,14 +5126,12 @@ func _fx_module(parent: Control, title: String) -> VBoxContainer:
 
 # --- key readout -----------------------------------------------------------
 ## Short form for the STATS column, which has no room for the arrow.
+## The track's key as tagged or estimated. There is no transposition to fold in any more:
+## KEY SHIFT went with the fixed rack, and FxRack has no pitch module, so what the file says
+## is what is playing.
 func _key_stat() -> String:
 	var t: String = str(_key.get("text", ""))
-	if t.is_empty():
-		return "--"
-	var semi := int(roundf(_eq.fx["key_semi"]))
-	if semi == 0 or int(_key.get("pc", -1)) < 0:
-		return t
-	return AudioEngine.key_label(AudioEngine.key_shifted(_key["pc"], semi), _key["minor"])
+	return "--" if t.is_empty() else t
 
 static func _hz(hz: float) -> String:
 	# the unit was missing below 1 kHz, so a rack row read "FREQ 800" directly above
@@ -5336,7 +5193,7 @@ func _setup_menus() -> void:
 				_menu_crate = crate
 				_popup_playlist_menu())
 		picker.item_selected.connect(func(i: int) -> void:
-			_crate_pl[crate] = "" if i == 0 else picker.get_item_text(i)
+			_library.crate_pl[crate] = "" if i == 0 else picker.get_item_text(i)
 			_refill(crate)
 			if crate == 0:
 				_write_in()   # the write-in is TRK A's
@@ -5394,10 +5251,10 @@ func _refresh_playlists() -> void:
 		var picker: OptionButton = [%Playlist, %PlaylistB][crate]
 		picker.clear()
 		picker.add_item("ALL TRACKS")
-		for name in _playlists:
+		for name in _library.playlists:
 			picker.add_item(name)
 		# index 0 is ALL TRACKS, so a playlist sits one past its position in the dictionary
-		var at := _playlists.keys().find(_crate_pl[crate])
+		var at := _library.playlists.keys().find(_library.crate_pl[crate])
 		picker.selected = at + 1 if at >= 0 else 0
 
 # --- context menu ----------------------------------------------------------
@@ -5436,13 +5293,13 @@ func _on_item_clicked(row: int, _at: Vector2, button: int, crate: int) -> void:
 	if row < 0 or row >= row_path.size() or row_path[row] < 0:
 		return   # a FOLDER-mode header row is not a track
 	_menu_crate = crate   # REMOVE FROM / MOVE UP act on THIS list's playlist
-	_popup_track_menu(_paths[row_path[row]])
+	_popup_track_menu(_library.paths[row_path[row]])
 
 func _popup_track_menu(path: String) -> void:
 	_menu_ctx = {"kind": "track", "path": path}
 	%PlMenu.clear()
-	for i in _playlists.size():
-		%PlMenu.add_item(_playlists.keys()[i], PL_FIRST + i)
+	for i in _library.playlists.size():
+		%PlMenu.add_item(_library.playlists.keys()[i], PL_FIRST + i)
 	%PlMenu.add_separator()
 	%PlMenu.add_item("+ NEW PLAYLIST", MENU_NEW_PL)
 	%Menu.clear()
@@ -5450,8 +5307,8 @@ func _popup_track_menu(path: String) -> void:
 	%Menu.add_item("RENAME TAG", MENU_RENAME)
 	# offered only where it can do something, and it is the only way back out of a
 	# mis-click on ADD TO PLAYLIST
-	var playlist: String = _crate_pl[_menu_crate]
-	if not playlist.is_empty() and path in _playlists.get(playlist, []):
+	var playlist: String = _library.crate_pl[_menu_crate]
+	if not playlist.is_empty() and _library.id_for(path) in _library.playlists.get(playlist, []):
 		%Menu.add_item("REMOVE FROM %s" % playlist, MENU_UNFILE)
 		# manual rearrangement: only meaningful while VIEWING the playlist the track is
 		# actually filed in, which not is_empty() + the membership check above both cover
@@ -5509,9 +5366,9 @@ func _popup_cue_menu(cue: Dictionary) -> void:
 ## Which store this marker lives in. Read rather than remembered: the scope IS where the
 ## cue is, and a second copy of that fact in the cue record could disagree with it.
 func _cue_is_local(cue: Dictionary) -> bool:
-	if _crate_pl[_bar_deck()].is_empty():
+	if _library.crate_pl[_bar_deck()].is_empty():
 		return false
-	return cue in ((_pl_cues.get(_crate_pl[_bar_deck()], {}) as Dictionary).get(_bar_path(), []) as Array)
+	return cue in ((_library.pl_cues.get(_library.crate_pl[_bar_deck()], {}) as Dictionary).get(_library.id_for(_bar_path()), []) as Array)
 
 ## A 12 px colour chip for a menu item. Cached per colour, because a menu rebuild would
 ## otherwise allocate a texture per swatch every time a marker is clicked.
@@ -5526,7 +5383,7 @@ func _swatch(c: Color) -> ImageTexture:
 ## RMB on the playlist picker. ALL TRACKS is not a playlist and has nothing to delete,
 ## so the menu simply does not open there.
 func _popup_playlist_menu() -> void:
-	var playlist: String = _crate_pl[_menu_crate]
+	var playlist: String = _library.crate_pl[_menu_crate]
 	if playlist.is_empty():
 		return
 	_menu_ctx = {"kind": "playlist", "playlist": playlist}
@@ -5538,11 +5395,11 @@ func _popup_playlist_menu() -> void:
 ## nowhere else, which is why this one asks first. Tracks are untouched: a playlist is a
 ## view of the library, never a container for it.
 func _delete_playlist(name: String) -> void:
-	_playlists.erase(name)
-	_pl_cues.erase(name)
+	_library.playlists.erase(name)
+	_library.pl_cues.erase(name)
 	for crate in 2:
-		if _crate_pl[crate] == name:
-			_crate_pl[crate] = ""   # back to ALL TRACKS rather than a scope that no longer exists
+		if _library.crate_pl[crate] == name:
+			_library.crate_pl[crate] = ""   # back to ALL TRACKS rather than a scope that no longer exists
 	_refresh_playlists()
 	_refill()
 	_cue_overlay.queue_redraw()
@@ -5565,52 +5422,52 @@ func _on_menu_id(id: int) -> void:
 	elif id >= COLOR_FIRST:
 		_set_cue_color(cue, (_viz.PRESETS[id - COLOR_FIRST] as Color).to_html(false))
 	elif id >= PL_FIRST:
-		_file_track(_playlists.keys()[id - PL_FIRST], path)
+		_file_track(_library.playlists.keys()[id - PL_FIRST], path)
 	elif id == MENU_DECK_A:
 		_play_on_deck_a(path)
 	elif id == MENU_NEW_PL:
-		_ask("NEW PLAYLIST", "PLAYLIST %d" % (_playlists.size() + 1),
+		_ask("NEW PLAYLIST", "PLAYLIST %d" % (_library.playlists.size() + 1),
 			func(name: String) -> void:
-				if name.is_empty() or _playlists.has(name):
+				if name.is_empty() or _library.playlists.has(name):
 					return
-				_playlists[name] = []
+				_library.playlists[name] = []
 				_refresh_playlists()
 				_file_track(name, path)
 				_save())
 	elif id == MENU_RENAME:
-		_ask("RENAME TAG", _labels.get(path, path.get_file()), func(name: String) -> void:
+		_ask("RENAME TAG", _library.labels.get(_library.id_for(path), path.get_file()), func(name: String) -> void:
 			if name.is_empty():
-				_labels.erase(path)   # cleared back to the filename on disk
+				_library.labels.erase(_library.id_for(path))   # cleared back to the filename on disk
 			else:
-				_labels[path] = name
+				_library.labels[_library.id_for(path)] = name
 			_reindex()   # the row text and the search haystack are both built there
 			_save_soon())
 	elif id == MENU_UNFILE:
-		(_playlists[_crate_pl[_menu_crate]] as Array).erase(path)
+		(_library.playlists[_library.crate_pl[_menu_crate]] as Array).erase(_library.id_for(path))
 		_refill()
 		_save_soon()
 	elif id == MENU_PL_UP or id == MENU_PL_DOWN:
 		var order: Array[String] = []
-		order.assign(_playlists.get(_crate_pl[_menu_crate], []))
-		setlist_move(order, order.find(path), -1 if id == MENU_PL_UP else 1)
-		_playlists[_crate_pl[_menu_crate]] = order
+		order.assign(_library.playlists.get(_library.crate_pl[_menu_crate], []))
+		setlist_move(order, order.find(_library.id_for(path)), -1 if id == MENU_PL_UP else 1)
+		_library.playlists[_library.crate_pl[_menu_crate]] = order
 		_refill()
 		_save_soon()
 	elif id == MENU_MAKE_PLAYLIST:
 		var folder: String = _menu_ctx.get("path", "")
 		_ask("MAKE PLAYLIST", folder.get_file(), func(name: String) -> void:
-			if name.is_empty() or _playlists.has(name):
+			if name.is_empty() or _library.playlists.has(name):
 				return
 			# direct children only -- sub-folders are ignored, same rule the checkbox
 			# filter uses one level down
 			var tracks: Array[String] = []
-			for p in _all_paths:
+			for p in _library.all_paths:
 				if p.get_base_dir() == folder:
-					tracks.append(p)
-			_playlists[name] = tracks
+					tracks.append(_library.id_for(p))
+			_library.playlists[name] = tracks
 			# opened in the driven deck's crate (DIRS belongs to neither list), set before
 			# _refresh_playlists so that picker selects the new one
-			_crate_pl[_engine.deck] = name
+			_library.crate_pl[_engine.deck] = name
 			_refresh_playlists()
 			_refill()
 			_write_in()
@@ -5657,16 +5514,17 @@ func _on_menu_id(id: int) -> void:
 			func(raw: String) -> void: _set_cue_key(cue, raw), 1)
 	elif id == MENU_PL_DELETE:
 		_confirm("DELETE PLAYLIST %s\nAND ITS %d CUE SETS?" % [_menu_ctx.get("playlist", ""),
-			(_pl_cues.get(_menu_ctx.get("playlist", ""), {}) as Dictionary).size()],
+			(_library.pl_cues.get(_menu_ctx.get("playlist", ""), {}) as Dictionary).size()],
 			_delete_playlist.bind(_menu_ctx.get("playlist", "")))
 
 func _file_track(name: String, path: String) -> void:
-	var list: Array = _playlists.get(name, [])
-	if path in list:
+	var list: Array = _library.playlists.get(name, [])
+	var id := _library.id_for(path)
+	if id in list:
 		_note = "  //  ALREADY IN %s" % name
 	else:
-		list.append(path)
-		_playlists[name] = list
+		list.append(id)
+		_library.playlists[name] = list
 		_note = "  //  FILED UNDER %s" % name
 	_clear_note_later()
 	_refill()   # the track may have just entered the active scope
@@ -5738,12 +5596,13 @@ func _delete_track(path: String) -> void:
 		return
 	# the file is gone, so every reference to it is dead weight that would be re-saved
 	# forever otherwise
-	_cues.erase(path)
-	_labels.erase(path)
-	for name in _playlists:
-		(_playlists[name] as Array).erase(path)
-	for name in _pl_cues:
-		(_pl_cues[name] as Dictionary).erase(path)
+	var gone := _library.id_for(path)
+	_library.cues.erase(gone)
+	_library.labels.erase(gone)
+	for name in _library.playlists:
+		(_library.playlists[name] as Array).erase(gone)
+	for name in _library.pl_cues:
+		(_library.pl_cues[name] as Dictionary).erase(gone)
 	_note = "  //  MOVED TO RECYCLE BIN: %s" % path.get_file()
 	_clear_note_later()
 	_save()      # the disk has already changed; the config must not be able to disagree
@@ -5758,9 +5617,10 @@ const CUE_GRAB := 5.0
 ## scoped to the playlist that is currently active. A cue lives in exactly one of the
 ## two, which is what makes the scope menu a move rather than a copy.
 func _cues_for(path: String) -> Array:
-	var out: Array = (_cues.get(path, []) as Array).duplicate()
-	if not _crate_pl[_bar_deck()].is_empty():
-		out.append_array((_pl_cues.get(_crate_pl[_bar_deck()], {}) as Dictionary).get(path, []))
+	var id := _library.id_for(path)
+	var out: Array = (_library.cues.get(id, []) as Array).duplicate()
+	if not _library.crate_pl[_bar_deck()].is_empty():
+		out.append_array((_library.pl_cues.get(_library.crate_pl[_bar_deck()], {}) as Dictionary).get(id, []))
 	return out
 
 static func cue_x(t: float, length: float, w: float) -> float:
@@ -5833,23 +5693,12 @@ static func cue_test() -> bool:
 		and cue_too_close(cues, 30.03, MIN_CUE_GAP_SEC) \
 		and not cue_too_close(cues, 30.10, MIN_CUE_GAP_SEC) \
 		and not cue_too_close([], 30.0, MIN_CUE_GAP_SEC) \
-		and rev_cue_test()
+		and DeckController.rev_cue_test()
 		# keys moved out to key_test() when the rules grew past "is it a letter"
 
 ## REV mirrors what is SOUNDING, never what is stored. A marker at 30 s of a 120 s track sits at
 ## 90 s of the reversed render, and a marker dropped at 90 s of that render is the same 30 s of
 ## the track -- the round trip that stops REV from rewriting the cue store.
-static func rev_cue_test() -> bool:
-	var mirrored := cue_stream_time(30.0, 120.0, true)
-	return is_equal_approx(cue_stream_time(30.0, 120.0, false), 30.0) \
-		and is_equal_approx(mirrored, 90.0) \
-		and is_equal_approx(cue_stream_time(mirrored, 120.0, true), 30.0) \
-		and is_equal_approx(cue_stream_time(0.0, 120.0, true), 120.0) \
-		and is_equal_approx(cue_stream_time(120.0, 120.0, true), 0.0) \
-		and is_equal_approx(cue_stream_time(150.0, 120.0, true), 0.0) \
-		and is_equal_approx(cue_stream_time(-5.0, 120.0, true), 120.0) \
-		and is_equal_approx(cue_stream_time(30.0, 0.0, true), 30.0)   # no length: nothing to mirror
-
 ## The tab is the marker's handle: the line is 2 px and nothing can reliably hit 2 px,
 ## so the clickable part is a wider cap at the top. Drawn INSIDE the bar rather than
 ## above it -- the scrub bar is 16 px tall in a tight HBox, and a cap that overhung the
@@ -6025,8 +5874,9 @@ func _add_cue(at: float) -> void:
 		_note = "  //  TOO CLOSE TO AN EXISTING MARKER"
 		_clear_note_later()
 		return
-	var store := _cue_store(not _crate_pl[_bar_deck()].is_empty())
-	var list: Array = store.get(_bar_path(), [])
+	var store := _cue_store(not _library.crate_pl[_bar_deck()].is_empty())
+	var bar_id := _library.id_for(_bar_path())
+	var list: Array = store.get(bar_id, [])
 	var cue := {
 		"id": next_cue_id(_cues_for(_bar_path())),
 		"time": clampf(at, 0.0, _len()),
@@ -6037,7 +5887,7 @@ func _add_cue(at: float) -> void:
 		"color": theme.get_color("font_color", "Green").to_html(false),
 	}
 	list.append(cue)
-	store[_bar_path()] = list
+	store[bar_id] = list
 	_note = "  //  %s @ %s" % [cue["label"], _time_text(float(cue["time"]))]
 	_clear_note_later()
 	_cue_overlay.queue_redraw()
@@ -6048,22 +5898,23 @@ func _add_cue(at: float) -> void:
 ## silently writing the cue somewhere the user cannot see it.
 func _cue_store(playlist_scope: bool) -> Dictionary:
 	if not playlist_scope:
-		return _cues
-	if not _pl_cues.has(_crate_pl[_bar_deck()]):
-		_pl_cues[_crate_pl[_bar_deck()]] = {}
-	return _pl_cues[_crate_pl[_bar_deck()]]
+		return _library.cues
+	if not _library.pl_cues.has(_library.crate_pl[_bar_deck()]):
+		_library.pl_cues[_library.crate_pl[_bar_deck()]] = {}
+	return _library.pl_cues[_library.crate_pl[_bar_deck()]]
 
 func _move_cue(cue: Dictionary, to_playlist: bool) -> void:
-	if to_playlist and _crate_pl[_bar_deck()].is_empty():
+	if to_playlist and _library.crate_pl[_bar_deck()].is_empty():
 		_note = "  //  NO PLAYLIST SELECTED"
 		_clear_note_later()
 		return
 	_pull_cue(cue)
 	var store := _cue_store(to_playlist)
-	var list: Array = store.get(_bar_path(), [])
+	var bar_id := _library.id_for(_bar_path())
+	var list: Array = store.get(bar_id, [])
 	list.append(cue)
-	store[_bar_path()] = list
-	_note = "  //  %s -> %s" % [cue["label"], _crate_pl[_bar_deck()] if to_playlist else "ALL TRACKS"]
+	store[bar_id] = list
+	_note = "  //  %s -> %s" % [cue["label"], _library.crate_pl[_bar_deck()] if to_playlist else "ALL TRACKS"]
 	_clear_note_later()
 	_cue_overlay.queue_redraw()
 	_save_soon()
@@ -6170,14 +6021,15 @@ func _delete_cue(cue: Dictionary) -> void:
 ## ever held a cue keeps a `path: []` entry in library.cfg forever, and the file grows
 ## with tracks that have nothing to say.
 func _pull_cue(cue: Dictionary) -> void:
-	(_cues.get(_bar_path(), []) as Array).erase(cue)
-	if (_cues.get(_bar_path(), []) as Array).is_empty():
-		_cues.erase(_bar_path())
-	for name in _pl_cues:
-		var d := _pl_cues[name] as Dictionary
-		(d.get(_bar_path(), []) as Array).erase(cue)
-		if (d.get(_bar_path(), []) as Array).is_empty():
-			d.erase(_bar_path())
+	var bar_id := _library.id_for(_bar_path())
+	(_library.cues.get(bar_id, []) as Array).erase(cue)
+	if (_library.cues.get(bar_id, []) as Array).is_empty():
+		_library.cues.erase(bar_id)
+	for name in _library.pl_cues:
+		var d := _library.pl_cues[name] as Dictionary
+		(d.get(bar_id, []) as Array).erase(cue)
+		if (d.get(bar_id, []) as Array).is_empty():
+			d.erase(bar_id)
 
 ## A 500 ms taste of a cue: seek, play, pause. The generation counter is what keeps a
 ## second audition from being cut short by the first one's timer -- shift-clicking along
@@ -6202,26 +6054,26 @@ func _audition(cue: Dictionary) -> void:
 ## between consecutive tracks, so each deck gets the engine's primary plus one of the two
 ## players already in player.tscn as its spare.
 ##
-## What "switching decks" does is re-point `_a`, `_b`, `_audio`, `_current` and `_eq` at
+## What "switching decks" does is re-point `_decks.audio`, `_current` and `_eq` at
 ## the other deck's set. Every piece of transport code downstream was already written
 ## against those, so the scrub bar, the fade, the cue markers and the whole rack became
 ## deck-aware without being touched.
 ##
 ## The deck you leave keeps playing. That is the entire point of two decks, and it is why
-## _stop() -- which walks `[_a, _b]` -- only ever stops the deck you are looking at.
+## _stop() -- which walks that deck's own pair -- only ever stops the deck you are looking at.
 func _setup_decks() -> void:
 	%AudioA.bus = _engine.deck_bus(0)
 	%AudioB.bus = _engine.deck_bus(1)
-	_deck_pair[0] = [_engine.deck_player(0), %AudioA]
-	_deck_pair[1] = [_engine.deck_player(1), %AudioB]
-	for i in _deck_pair.size():
-		for pl: AudioStreamPlayer in _deck_pair[i]:
+	_decks.pair[0] = [_engine.deck_player(0), %AudioA]
+	_decks.pair[1] = [_engine.deck_player(1), %AudioB]
+	for i in _decks.pair.size():
+		for pl: AudioStreamPlayer in _decks.pair[i]:
 			# the outgoing player of a crossfade must not trigger auto-advance, and
 			# neither must the deck nobody is driving
 			pl.finished.connect(func() -> void:
-				if pl == _audio and not _fade_running(_engine.deck):
+				if pl == _decks.audio and not _fade_running(_engine.deck):
 					_next(true))   # the queue moving on, not a click
-	_engine.set_crossfader(_crossfader)
+	_engine.set_crossfader(_decks.crossfader)
 	_bind_deck(_engine.deck)
 	_setup_deck_ui()
 
@@ -6268,7 +6120,7 @@ func _setup_deck_ui() -> void:
 			_engine.set_both(false)
 		_set_crossfader(_ratio_at(e.position.x, _xfade.size.x)))
 	_xfade.gui_input.connect(func(e: InputEvent) -> void:
-		var w := _bar_wheel(e, _crossfader, BAR_WHEEL_COARSE)
+		var w := _bar_wheel(e, _decks.crossfader, BAR_WHEEL_COARSE)
 		if w >= 0.0:
 			if _engine.both:
 				_engine.set_both(false)
@@ -6295,14 +6147,14 @@ func _setup_deck_ui() -> void:
 		return "DUAL DECK MODE %s  //  DECK A TRACKS | FEED | DECK B" % ("ON" if _dual_deck else "OFF"))
 	_hover_note(_xfade, func() -> String:
 		return "CROSSFADER: %s  //  %s %+.1f DB  //  %s %+.1f DB" % [
-			("A" if _crossfader < 0.02 else ("B" if _crossfader > 0.98 else "%d%%" % int(_crossfader * 100.0))),
-			AudioEngine.DECK_NAMES[0], AudioEngine.deck_gain_db(1.0 - _crossfader),
-			AudioEngine.DECK_NAMES[1], AudioEngine.deck_gain_db(_crossfader)])
+			("A" if _decks.crossfader < 0.02 else ("B" if _decks.crossfader > 0.98 else "%d%%" % int(_decks.crossfader * 100.0))),
+			AudioEngine.DECK_NAMES[0], AudioEngine.deck_gain_db(1.0 - _decks.crossfader),
+			AudioEngine.DECK_NAMES[1], AudioEngine.deck_gain_db(_decks.crossfader)])
 	_refresh_deck_ui()
 
 func _set_crossfader(x: float) -> void:
-	_crossfader = clampf(x, 0.0, 1.0)
-	_engine.set_crossfader(_crossfader)
+	_decks.crossfader = clampf(x, 0.0, 1.0)
+	_engine.set_crossfader(_decks.crossfader)
 	_refresh_deck_ui()
 	_save_soon()
 
@@ -6336,23 +6188,14 @@ func _select_deck(which: int) -> void:
 
 # --- reverse playback ---------------------------------------------------------
 var _rev_btn: Button
-## REV is PER DECK. One shared flag meant reversing deck A also bracketed deck B's button and
-## switched deck B's cue mirroring on, so markers on the deck that was still playing forwards
-## were drawn, grabbed and jumped to mirrored. The deck you are not driving keeps playing
-## whatever it was playing, in whichever direction it was playing it.
-var _reversed_deck_a := false
-var _reversed_deck_b := false
 ## Which deck A+B was entered from, so leaving it puts you back where you were.
 var _deck_before_both := 0
 
 func _is_reversed(deck: int) -> bool:
-	return _reversed_deck_b if deck == 1 else _reversed_deck_a
+	return _decks.is_reversed(deck)
 
 func _set_reversed(deck: int, on: bool) -> void:
-	if deck == 1:
-		_reversed_deck_b = on
-	else:
-		_reversed_deck_a = on
+	_decks.set_reversed(deck, on)
 
 ## A cue's time is ALWAYS stored against the track as recorded, forwards. While a deck plays the
 ## reversed render, that same instant sits at `length - t` in what is actually sounding -- so
@@ -6365,9 +6208,7 @@ func _cue_stream(t: float) -> float:
 ## The pure rule, so it is checkable without a deck or a track. Its own inverse: applying it to a
 ## stream time hands back the stored time, which is why one function serves both directions.
 static func cue_stream_time(t: float, length: float, reversed: bool) -> float:
-	if not reversed or length <= 0.0:
-		return t
-	return clampf(length - t, 0.0, length)
+	return DeckController.cue_stream_time(t, length, reversed)
 
 ## AudioStreamPlayer has no negative pitch_scale, so this is a real reversed FILE,
 ## produced once by ffmpeg and cached. That takes a moment on a long track, which is
@@ -6411,7 +6252,7 @@ func _refresh_deck_ui() -> void:
 		_deck_btn.text = "[A+B]" if _engine.both else (
 			"[A] B" if _engine.deck == 0 else "A [B]")
 	if is_instance_valid(_xfade):
-		_xfade.value = _crossfader * 100.0
+		_xfade.value = _decks.crossfader * 100.0
 
 # --- BEAT SYNC ------------------------------------------------------------------------
 ## One beat tracker per deck, on that deck's own bus, so the two grids can be compared. The
@@ -6481,8 +6322,8 @@ func _align_decks() -> void:
 func _switch_deck(which: int) -> void:
 	if which == _engine.deck:
 		return
-	_deck_cur[_engine.deck] = _current
-	_deck_live[_engine.deck] = _audio
+	_decks.deck_cur[_engine.deck] = _current
+	_decks.deck_live[_engine.deck] = _decks.audio
 	# a fade that is mid-flight belongs to the deck being parked; let it finish on its own
 	# players rather than dragging the tween across the switch
 	_engine.set_deck(which)
@@ -6492,16 +6333,14 @@ func _switch_deck(which: int) -> void:
 	_save_soon()
 
 func _bind_deck(which: int) -> void:
-	_a = _deck_pair[which][0]
-	_b = _deck_pair[which][1]
-	_audio = _deck_live[which] if _deck_live[which] else _a
-	_current = _deck_cur[which]
+	_decks.audio = _decks.deck_live[which] if _decks.deck_live[which] else _decks.pair[which][0]
+	_current = _decks.deck_cur[which]
 	_eq = _eq_decks[which] if _eq_decks.size() > which else _eq
 	if _eq:
 		# DRIVE is a global colour control rather than a channel strip, so it follows you
 		# onto whichever deck you are driving
 		_eq.set_boost(_boost_gain())
-	_director.attach(_bar())   # the bar's player, not _audio: an empty deck would blank it
+	_director.attach(_bar())   # the bar's player, not _decks.audio: an empty deck would blank it
 	_refresh_deck_ui()
 	_refresh_rev_btn()   # REV belongs to the deck, so the button changes with it
 	if not _current.is_empty():
@@ -6509,9 +6348,9 @@ func _bind_deck(which: int) -> void:
 		_ticker.text = _engine.ticker_line(_current)
 	if is_instance_valid(_cue_overlay):
 		_cue_overlay.queue_redraw()
-	if not _index.is_empty():
+	if not _library.index.is_empty():
 		# the queue becomes this deck's crate view; neither list needs rebuilding for that
-		_engine.set_queue(_shown[which], _current)
+		_engine.set_queue(_library.shown[which], _current)
 		_mark_decks()
 
 # --- runtime assets: fonts, cursors, and the write-in ------------------------

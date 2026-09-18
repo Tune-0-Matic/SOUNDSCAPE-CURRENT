@@ -45,11 +45,12 @@ func _initialize() -> void:
 		FileAccess.open(lib.path_join(f), FileAccess.WRITE).close()
 	var ok := true
 
-	# 1. OFF, then ON
-	var p := PanelContainer.new()
-	p.set_script(load("res://player.gd"))
+	# 1. OFF, then ON. The walk belongs to LibraryModel now, and what counts as a track is
+	# its rule, so the gate is checked where it lives rather than through a detached UI node.
+	var model := LibraryModel.new()
+	model.folders = [lib]
 	var off: Array[String] = []
-	p.call("_walk", lib, off)
+	model.call("_walk", lib, off, false)
 	var engine := AudioEngine.new()
 	engine.video_dir = renders
 	var pictures := [0]
@@ -58,9 +59,8 @@ func _initialize() -> void:
 	engine.request_video(mp4)
 	await create_timer(0.3).timeout
 	var on: Array[String] = []
-	p.set("_video_test", true)
-	p.call("_walk", lib, on)
-	p.free()
+	model.call("_walk", lib, on, true)
+	model.free()
 	var gated: bool = off.size() == 3 and _mp4s(off) == 0 and on.size() == 5 and _mp4s(on) == 2 \
 		and refused and pictures[0] == 0 and _files(renders) == 0
 	ok = ok and gated

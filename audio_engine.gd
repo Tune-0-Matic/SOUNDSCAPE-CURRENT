@@ -251,20 +251,51 @@ func set_crossfader(x: float) -> void:
 	crossfader = clampf(x, 0.0, 1.0)
 	if both:
 		return
+	var gains := deck_gains_db(crossfader)
 	for i in DECK_BUSES.size():
-		var gain: float = (1.0 - crossfader) if i == 0 else crossfader
 		var b := AudioServer.get_bus_index(DECK_BUSES[i])
 		if b >= 0:
-			AudioServer.set_bus_volume_db(b, deck_gain_db(gain))
+			AudioServer.set_bus_volume_db(b, gains[i])
+
+## EQUAL POWER, not equal amplitude, and the difference is audible on every blend. Two decks
+## playing different music are UNCORRELATED signals, so their POWERS add where their
+## amplitudes do not. The old law faded each side linearly, which put both decks at 0.5
+## amplitude dead centre: that sums to sqrt(0.5^2 + 0.5^2) = 0.707 of full power, a -3 dB hole
+## in the middle of the sweep. Every DJ knows that dip as the crossfader eating the mix
+## halfway across, and the fix is the standard one -- cos/sin, which hold cos^2 + sin^2 = 1
+## across the whole travel. Each deck sits at -3.01 dB at centre and the PAIR stays at unity,
+## so a blend is as loud as either deck on its own.
+##
+## `x` is 0 (all deck A) to 1 (all deck B). Returns [deck A dB, deck B dB].
+static func deck_gains_db(x: float) -> Array:
+	var t := clampf(x, 0.0, 1.0) * 0.5 * PI
+	return [deck_gain_db(cos(t)), deck_gain_db(sin(t))]
 
 static func deck_gain_db(gain: float) -> float:
 	return DECK_SILENT_DB if gain <= 0.001 else linear_to_db(gain)
 
 static func deck_test() -> bool:
+	var ends := deck_gains_db(0.0)
+	var other := deck_gains_db(1.0)
+	var mid := deck_gains_db(0.5)
+	# the invariant that matters, and the one the old linear law failed in the middle: the
+	# PAIR sits at unity power everywhere along the sweep
+	var flat := true
+	for i in 21:
+		var at := deck_gains_db(float(i) * 0.05)
+		var power := 0.0
+		for g in at:
+			if g > DECK_SILENT_DB:
+				power += pow(db_to_linear(g), 2.0)
+		flat = flat and absf(power - 1.0) < 1e-5
 	return is_equal_approx(deck_gain_db(1.0), 0.0) \
 		and deck_gain_db(0.0) == DECK_SILENT_DB \
 		and absf(deck_gain_db(0.5) - (-6.0206)) < 0.01 \
-		and deck_gain_db(0.25) < deck_gain_db(0.5)
+		and deck_gain_db(0.25) < deck_gain_db(0.5) \
+		and is_equal_approx(ends[0], 0.0) and ends[1] == DECK_SILENT_DB \
+		and is_equal_approx(other[1], 0.0) and other[0] == DECK_SILENT_DB \
+		and absf(mid[0] - (-3.0103)) < 0.001 and absf(mid[1] - (-3.0103)) < 0.001 \
+		and flat
 
 # --- queue ----------------------------------------------------------------
 ## `current` re-anchors the play position after the queue is rebuilt. Re-sorting or
@@ -677,11 +708,18 @@ func metadata(path: String) -> Dictionary:
 ## keys for everything else are dictionary reads, which is what lets TRACKS sort by ARTIST,
 ## ALBUM and KEY the moment the library appears.
 const INDEX_PATH := "user://library_index.dat"
-const INDEX_VERSION := 1
+## 2 added the id map. A version-1 file is still read: it simply carries no ids, and every
+## track in it is assigned one on the next scan. Refusing it would throw away a whole
+## library's cached durations, tags and keys to gain nothing.
+const INDEX_VERSION := 2
+const INDEX_VERSIONS_READ := [1, 2]
 
 var probes := 0      # ffprobe runs this session, under _meta_lock; test_library_index.gd reads it
 var _stamps := {}    # path -> [mtime, size] for each _meta entry probed or validated this session
 var _disk := {}      # path -> [mtime, size, meta] loaded from the index, not yet re-validated
+## path -> track id (LibraryModel.track_id). Lives here because it is saved with the index and
+## for the same reason: it is derived from the file, and re-deriving it costs a stat per track.
+var track_ids := {}
 
 static func default_meta(path: String) -> Dictionary:
 	return {
@@ -711,8 +749,14 @@ func load_index(path := INDEX_PATH) -> int:
 		return 0
 	var blob: Variant = f.get_var()   # plain data only: get_var never instantiates objects
 	f.close()
-	if not (blob is Dictionary and blob.get("version") == INDEX_VERSION and blob.get("entries") is Dictionary):
+	if not (blob is Dictionary and blob.get("version") in INDEX_VERSIONS_READ and blob.get("entries") is Dictionary):
 		return 0
+	track_ids.clear()
+	var ids: Variant = blob.get("ids")
+	if ids is Dictionary:
+		for p in ids:
+			if p is String and ids[p] is String:
+				track_ids[p] = ids[p]
 	var entries: Dictionary = blob["entries"]
 	for p in entries:
 		var e: Variant = entries[p]
@@ -768,7 +812,11 @@ func save_index(keep: Array[String], path := INDEX_PATH) -> Error:
 	var f := FileAccess.open(target + ".tmp", FileAccess.WRITE)
 	if not f:
 		return FileAccess.get_open_error()
-	f.store_var({"version": INDEX_VERSION, "entries": entries})
+	var ids := {}
+	for p in track_ids:
+		if live.has(p):
+			ids[p] = track_ids[p]
+	f.store_var({"version": INDEX_VERSION, "entries": entries, "ids": ids})
 	f.close()
 	if FileAccess.file_exists(target):
 		DirAccess.remove_absolute(target)   # a cache, not the config: a lost race only re-probes

@@ -126,12 +126,12 @@ func _initialize() -> void:
 	window.free()
 
 	# player.gd asserts its pure rules at boot, and nothing in the suite boots player.tscn, so the
-	# two Phase 1 ones are run here as well: cue times mirroring while a deck is reversed, and what
-	# an unplayable track does depending on who asked for it.
-	var script := load("res://player.gd")
-	var rules: bool = script.rev_cue_test() and script.fail_test()
+	# ones that would otherwise never run are run here: cue times mirroring while a deck is
+	# reversed, what an unplayable track does depending on who asked for it, and the equal-power
+	# crossfader law. They moved to DeckController and AudioEngine when player.gd was split up.
+	var rules: bool = DeckController.deck_test() and AudioEngine.deck_test() and LibraryModel.model_test()
 	ok = ok and rules
-	print("cue mirroring and auto-advance fault rules (rev_cue_test, fail_test): %s" % rules)
+	print("deck rules (REV cue mirroring, auto-advance faults), the equal-power crossfader and the library model: %s" % rules)
 
 	print("RESULT ", "PASS" if ok else "FAIL")
 	quit(0 if ok else 1)
