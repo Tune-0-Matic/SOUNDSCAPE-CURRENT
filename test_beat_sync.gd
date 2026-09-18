@@ -2,13 +2,14 @@ extends SceneTree
 ## Runnable check for BEAT SYNC (AudioDirector.sync_seek), on real audio on two deck buses:
 ##   1. two 120 BPM click tracks, deck B started 150 ms out of phase: both per-deck trackers
 ##      lock, and the measured grid offset between the decks is ~150 ms
-##   2. one sync_seek nudge brings the two decks' clicks within 20 ms of each other
+##   2. the median of READINGS sync_seek nudges brings the two decks' clicks within 15 ms
 ##   3. a 128 BPM deck against a 120 BPM one is refused (NAN): no time-stretch, no false sync
 ## "Grid offset" is measured from the PLAYBACK POSITIONS, where the clicks really are -- not
 ## from the trackers being tested.
 ##   godot --headless --path . --script res://test_beat_sync.gd
 
 const FPS := 60
+const READINGS := 9
 
 func _click_track(track_bpm: float, secs: float) -> AudioStreamWAV:
 	var sr := 44100
@@ -61,7 +62,7 @@ func _initialize() -> void:
 	players[0].play()
 	players[1].play(0.15)   # deck B runs 150 ms ahead in the track: its clicks land 150 ms early
 	for i in 2:
-		trackers[i].set_tracking(true)
+		trackers[i].set_tracking(true, true)
 		trackers[i].attach(players[i])
 	var ok := true
 
@@ -75,20 +76,35 @@ func _initialize() -> void:
 	print("1. both decks locked after %.1f s (A %.2f BPM, B %.2f BPM); measured grid gap %+.1f ms: %s" % [
 		float(guard) / FPS, trackers[0].bpm, trackers[1].bpm, before * 1000.0, locked])
 
-	# several frames of settling after the lock, so the fitted phase is not a first guess
-	for _f in FPS * 2:
+	# settle until the tempo fit has a full HISTORY window of onsets: a lock on a partial window
+	# still reads up to ~0.9 BPM off, which leaves its phase ~20 ms wrong at the window's end.
+	# Then READINGS sync_seek readings half a second apart, each judged against the positions in
+	# the same frame. One reading can catch a tracker mid-correction; the median one is applied.
+	while players[0].get_playback_position() < AudioDirector.HISTORY:
 		await process_frame
-	var nudge := AudioDirector.sync_seek(trackers[0], trackers[1], 0.015)
-	var usable := not is_nan(nudge)
+	var nudges: Array[float] = []
+	var errs: Array[float] = []
+	for k in READINGS:
+		for _f in (30 if k > 0 else 0):
+			await process_frame
+		var n := AudioDirector.sync_seek(trackers[0], trackers[1], 0.015)
+		if not is_nan(n):
+			nudges.append(n)
+			errs.append(fposmod(n + _grid_gap(players[0], players[1], period) + period * 0.5, period) - period * 0.5)
+	var usable := nudges.size() == READINGS
+	nudges.sort()
+	errs.sort()
+	var nudge: float = nudges[READINGS / 2] if usable else 0.0
 	if usable:
 		players[1].seek(players[1].get_playback_position() + nudge)
 	for _f in 20:
 		await process_frame
 	var after := _grid_gap(players[0], players[1], period)
-	var aligned := usable and absf(after) < 0.020
+	var aligned := usable and absf(after) < 0.015
 	ok = ok and aligned
-	print("2. sync nudged deck B %+.1f ms; grid gap now %+.1f ms (want < 20): %s" % [
-		nudge * 1000.0 if usable else 0.0, after * 1000.0, aligned])
+	print("2. %d sync readings, error %+.1f to %+.1f ms; median nudged deck B %+.1f ms; grid gap now %+.1f ms (want < 15): %s" % [
+		nudges.size(), errs[0] * 1000.0 if usable else 0.0, errs[-1] * 1000.0 if usable else 0.0,
+		nudge * 1000.0, after * 1000.0, aligned])
 
 	# 3. a real tempo mismatch is refused
 	players[1].stream = _click_track(128.0, 40.0)

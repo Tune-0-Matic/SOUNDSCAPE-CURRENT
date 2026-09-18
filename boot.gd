@@ -9,7 +9,7 @@ extends Control
 signal finished(user_name: String)
 
 const LINES := [
-	"SOUNDSCAPE (HEADLESS HORSEMAN) BY ZFACTORPSX v1.0",
+	"SOUNDSCAPE (HEADLESS HORSEMAN) BY ZFACTORPSX %s",   # application/config/version, in begin()
 	"",
 	"MEM TEST 65536K ............ OK",
 	"DETECTING AUDIO DEVICE ..... WASAPI 96000HZ",
@@ -41,7 +41,7 @@ var _blink := 0.0
 func begin(saved_name: String, tracks: int) -> void:
 	user_name = saved_name
 	track_count = tracks
-	_buf = "\n".join(LINES) % tracks
+	_buf = "\n".join(LINES) % [ProjectSettings.get_setting("application/config/version", ""), tracks]
 	_started = true
 	_returning = not user_name.is_empty()
 	if _returning:

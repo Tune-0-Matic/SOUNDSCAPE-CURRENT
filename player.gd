@@ -5,7 +5,6 @@ extends PanelContainer
 ## Build number, shown at the head of the STATS panel. One constant rather than a literal
 ## at the readout, so the next bump is one edit -- boot.gd's POST banner and
 ## export_presets.cfg still carry their own copies and have to be bumped alongside it.
-const VERSION := "V1.3 BETA"
 
 ## The editor and an exported build share user:// on this machine, so an editor save
 ## would otherwise be the first thing a shipped player sees. A different filename per
@@ -46,7 +45,7 @@ static func _cfg_bool(cfg: ConfigFile, sect: String, key: String, fallback: bool
 static func _cfg_vec2(cfg: ConfigFile, sect: String, key: String, fallback: Vector2) -> Vector2:
 	var v: Variant = cfg.get_value(sect, key, fallback)
 	return v if v is Vector2 else fallback
-const EXTS := ["mp3", "wav", "ogg", "flac"]
+const EXTS := ["mp3", "wav", "ogg", "flac", "dsf", "dff"]
 ## Shipped defaults, named rather than spelled out at each use. Every one of these was
 ## previously written twice -- once as a config fallback, once (or not at all) in the
 ## factory reset -- and "or not at all" is exactly how REBOOT came to leave six settings
@@ -86,7 +85,10 @@ var _audio: AudioStreamPlayer    # whichever side of the active pair is sounding
 @onready var _ticker: Label = %Ticker
 @onready var _clock: Label = %Clock
 @onready var _nosignal: Label = %NoSignal
-@onready var _tracks: ItemList = %Tracks
+@onready var _tracks: ItemList = %TracksA
+## Deck B's copy of the library list: the same rows, its own widget -- own scroll, own
+## selection, and a double-click that loads deck B. Filled by _refill alongside %TracksA.
+@onready var _tracks_b: ItemList = %TracksB
 @onready var _folder_tree: Tree = %FolderTree
 @onready var _count: Label = %Count
 @onready var _dialog: FileDialog = %Dialog
@@ -99,7 +101,7 @@ var _eq: Equalizer               # the ACTIVE deck's rack; see _bind_deck
 var _folders: Array[String] = []
 ## Every audio file found on disk, before the folder checkboxes get a say. `_paths` is the
 ## ACTIVE library carved out of this, and it is _paths that feeds the rows, the queue and
-## every index in _row_path -- so nothing downstream had to learn about the filter.
+## every index in _row_paths -- so nothing downstream had to learn about the filter.
 var _all_paths: Array[String] = []
 var _paths: Array[String] = []
 ## Checked directories, as a set rather than the Array the config stores: this is asked
@@ -156,20 +158,27 @@ var _awaiting_rebind := ""   # action currently capturing a key, or ""
 const REBIND_TIMEOUT_SEC := 10.0
 var _note := ""
 var _hover: Callable    # live value readout for the fader under the pointer, or unset
-var _sort := 0
+## TRK A and TRK B are two CRATES over the one library: each keeps its own search, sort and
+## playlist, its own row order and its own row maps. Crate 0 is TRK A (deck A), crate 1 is
+## TRK B (deck B). Everything below indexed by crate is one entry per list.
+var _sorts := [0, 0]            # crate -> index into SORTS
 var _mtime := {}
-var _sortkey := {}   # path -> meta_sort_key, rebuilt per _reindex for the metadata sorts
-## Current SEARCH text, matched against each row's pre-folded lowercase haystack.
-var _filter := ""
-## Sorted view of the library: one entry per _paths index, holding the row string and a
-## pre-folded lowercase haystack so a search keystroke never re-derives either.
+var _sortkey := {}   # path -> meta_sort_key, rebuilt per sort pass for the metadata sorts
+## Current SEARCH text per crate, matched against each row's pre-folded lowercase haystack.
+var _filters := ["", ""]
+## The library's rows: one entry per _paths index, holding the row string and a pre-folded
+## lowercase haystack so a search keystroke never re-derives either. Sort-independent now --
+## each crate keeps its own order in _orders.
 var _index: Array[Dictionary] = []
 var _path_pos := {}   # path -> its position in _index/_paths, rebuilt alongside _index
+var _orders := [[], []]         # crate -> _paths in that crate's sort order
 ## FOLDER view inserts unselectable header rows, so list rows and _paths indices stop
-## lining up. These two keep the mapping in both directions; in every other view they
-## are simply the identity, so nothing downstream needs to branch.
-var _row_path := PackedInt32Array()
-var _path_row := PackedInt32Array()
+## lining up. These two keep the mapping in both directions, per crate; in every other view
+## they are simply the identity, so nothing downstream needs to branch.
+var _row_paths := [PackedInt32Array(), PackedInt32Array()]
+var _path_rows := [PackedInt32Array(), PackedInt32Array()]
+var _shown := [[], []]          # crate -> the paths its list shows, in row order: its queue
+var _unknown := [[], []]        # crate -> shown tracks never probed, for the duration sweep
 var _busy := false
 var _flash := 0.0
 var _viz_cfg := {}
@@ -199,6 +208,16 @@ var _mono := false        # true: Master folds to mono, post-limiter, pre-analys
 var _mono_btn: Button
 var _crt_on := true        # CRT scanline/glow pass over the visualizer feed
 var _crt_btn: Button
+var _video_test := false      # TBS "Video TEST": .mp4 joins the library and plays with a low-fi picture
+var _video_test_btn: Button
+var _video_color: VideoTest.ColorMode = VideoTest.ColorMode.PALETTE   # TBS VIDEO COLOR
+var _video_color_btn: Button
+var _listening_mode := 0      # TBS LISTENING MODE: AudioEngine.ListeningMode, AUDIOPHILE by default
+var _listening_btn: Button
+var _autopsy: Label           # TBS DSP AUTOPSY / SIGNAL FLOW readout
+var _autopsy_at := 0.0        # session time it is next due, like _stats_at
+var _picture: VideoTest       # the MP4 picture over the visualizer (video_test.gd)
+var _skin_ramp: Gradient      # the skin's picture palette, rebuilt on every skin switch
 var _crt_mat: ShaderMaterial   # %VizBox's material, captured once so OFF can null it out
 var _playbar_on := true    # bottom transport (scrub + deck) visible outside FULLSCREEN
 var _playbar_btn: Button
@@ -212,6 +231,13 @@ var _visual_windowed := false   # %LeftColumn (the visual EQ feed) torn into its
 var _visual_win_btn: Button
 var _visual_win: Window
 var _visual_home_index := -1
+var _dual_deck := false        # TBS DUAL DECK MODE: [DECK A TRACKS | FEED | DECK B SIDEBAR]
+var _dual_deck_btn: Button
+var _split_btn: Button         # the same switch on the transport, beside the deck button
+var _dual_visual := false      # VIS DUAL VISUAL: the feed stacks deck A over deck B
+var _dual_visual_btn: Button
+var _viz_edit_btn: Button      # which half the VIS tab edits; only shown while split
+var _viz_cfg_b := {}
 var _reboot_armed := 0.0
 var _user_name := ""
 ## Retained, though nothing writes to it any more: the staging UI is gone but the
@@ -223,7 +249,8 @@ var _playlists := {}    # NAME -> Array of absolute paths
 var _pl_cues := {}      # NAME -> { path -> Array of cue Dictionaries }
 var _cues := {}         # path -> Array of cue Dictionaries, global scope
 var _labels := {}       # path -> display name, from RENAME TAG
-var _playlist := ""     # active playlist, "" = the whole library
+var _crate_pl := ["", ""]   # crate -> its selected playlist, "" = the whole library
+var _menu_crate := 0        # which crate the open track or playlist menu was raised from
 var _mark_mode := false # deliberately NOT persisted; see _setup_menus
 var _menu_ctx := {}     # what the one PopupMenu is currently about
 var _ask_cb: Callable   # what to do with the text the prompt dialog collects
@@ -274,7 +301,9 @@ var _boost := 0        # 0..100 on the dial; 0 is unity, no boost
 
 func _ready() -> void:
 	assert(_fmt(61.0) == "01:01" and _ratio_at(-9.0, 100.0) == 0.0 and _ratio_at(999.0, 100.0) == 1.0)
-	assert(_is_audio("A.MP3") and _is_audio("b.flac") and not _is_audio("cover.jpg"))
+	assert(_is_track("A.MP3") and _is_track("b.flac") and _is_track("c.DSF") and not _is_track("cover.jpg"))
+	assert(not _is_track("clip.MP4") and _is_track("clip.MP4", true) and not _is_track("clip.mp4.jpg", true))
+	assert(rev_landing("STOPPED", 3.0, 10.0, 10.0) == [false, false, 7.0] and rev_landing("PAUSED", 3.0, 10.0, 10.0) == [true, true, 7.0] and rev_landing("PLAYING", 12.0, 10.0, 10.0) == [true, false, 0.0])
 	assert(_cmp_by("NAME", "z/a.mp3", "a/b.mp3") and _cmp_by("PATH", "a/b.mp3", "z/a.mp3"))
 	assert(_cmp_by("TYPE", "b.flac", "a.mp3") and not _cmp_by("TYPE", "a.mp3", "b.flac"))
 	# shuffle must not hand back the track already playing, except in a one-track queue
@@ -288,7 +317,7 @@ func _ready() -> void:
 	assert(asset_test())               # cursor thumbnail cap keeps aspect at both extremes
 	assert(Visualizer.gradient_test()) # hex list round trip and gradient sampling
 	assert(code_test())                # cheat buffer tail-matches and stays capped
-	assert(setlist_test())             # deck B reorder, including both end stops
+	assert(setlist_test())             # playlist reorder, including both end stops
 	assert(license_test())             # the token signature binds to payload AND user
 	assert(Visualizer.snake_test())    # snake wall and self-collision rules
 	assert(AudioDirector.tempo_test())  # the sweep, now that it runs on a worker
@@ -308,6 +337,8 @@ func _ready() -> void:
 	assert(write_in_test())             # which rows the write-in is allowed to touch
 	assert(sort_key_test())             # ARTIST/ALBUM/KEY order, unknowns last
 	assert(AudioDirector.sync_test())   # beat-sync offset wraps to the nearest beat
+	# same source as the BIOS POST line and STATS VERSION, so one bump in project.godot moves all three
+	$Margin/Main/TopHeaderBar/HB/Title.text += " %s" % ProjectSettings.get_setting("application/config/version", "")
 	# seeded unconditionally, not inside the config branch below: a first run with no
 	# library.cfg yet must still ship with working shortcuts, not a silently empty map
 	for action in KEYBIND_SPEC:
@@ -335,8 +366,10 @@ func _ready() -> void:
 		for dir in _cfg_arr(cfg, "library", "known_folders",
 				_cfg_arr(cfg, "library", "enabled_folders")):
 			_known_folders[dir] = true
-		_sort = clampi(int(_cfg_num(cfg, "library", "sort", 0.0)), 0, SORTS.size() - 1)
+		_sorts[0] = clampi(int(_cfg_num(cfg, "library", "sort", 0.0)), 0, SORTS.size() - 1)
+		_sorts[1] = clampi(int(_cfg_num(cfg, "library", "sort_b", float(_sorts[0]))), 0, SORTS.size() - 1)
 		_viz_cfg = _cfg_dict(cfg, "visual", "viz")
+		_viz_cfg_b = _cfg_dict(cfg, "visual", "viz_b")
 		_skin = _cfg_str(cfg, "visual", "skin", "WIN98")
 		# "state" stays deck A's key, so a config written before decks existed loads
 		# straight into the deck the user was already listening on
@@ -356,9 +389,9 @@ func _ready() -> void:
 		_labels = _cfg_dict(cfg, "library", "track_labels")
 		# a playlist deleted by hand out of the config must not leave the list showing
 		# an empty scope with no way back to ALL TRACKS
-		_playlist = _cfg_str(cfg, "library", "playlist")
-		if not _playlists.has(_playlist):
-			_playlist = ""
+		for c in 2:
+			var pl := _cfg_str(cfg, "library", ["playlist", "playlist_b"][c])
+			_crate_pl[c] = pl if _playlists.has(pl) else ""
 		# @onready, so _engine is already bound by the time the _ready body runs
 		_engine.shuffle = _cfg_bool(cfg, "library", "shuffle", false)
 		_engine.repeat = clampi(int(_cfg_num(cfg, "library", "repeat", float(AudioEngine.Repeat.ALL))),
@@ -405,6 +438,9 @@ func _ready() -> void:
 		_viz.color_anim = clampi(int(_cfg_num(cfg, "visual", "color_anim", 1.0)), 0, 3) \
 			as Visualizer.ColorAnim
 		_viz.rotate_gradients = _cfg_bool(cfg, "visual", "rotate_gradients", false)
+		%VizB.color_anim = clampi(int(_cfg_num(cfg, "visual", "color_anim_b", 1.0)), 0, 3) \
+			as Visualizer.ColorAnim
+		%VizB.rotate_gradients = _cfg_bool(cfg, "visual", "rotate_gradients_b", false)
 		_cursor_name = _cfg_str(cfg, "visual", "cursor")
 		_cursor_scale = clampf(_cfg_num(cfg, "visual", "cursor_scale", 1.0),
 			CURSOR_SCALE_MIN, CURSOR_SCALE_MAX)
@@ -417,8 +453,14 @@ func _ready() -> void:
 		_max_fps = FPS_UNCAPPED if fps_cfg == FPS_UNCAPPED else clampi(fps_cfg, FPS_MIN, FPS_MAX)
 		_mono = _cfg_bool(cfg, "audio", "mono", false)
 		_crt_on = _cfg_bool(cfg, "visual", "crt", true)
+		_video_test = _cfg_bool(cfg, "visual", "video_test", false)
+		_video_color = clampi(int(_cfg_num(cfg, "visual", "video_color", 1.0)), 0, 1) as VideoTest.ColorMode
+		_listening_mode = clampi(int(_cfg_num(cfg, "visual", "listening_mode", 0.0)), 0,
+			AudioEngine.LISTENING_MODE_NAMES.size() - 1)
 		_playbar_on = _cfg_bool(cfg, "visual", "playbar", true)
 		_visual_windowed = _cfg_bool(cfg, "visual", "visual_windowed", false)
+		_dual_deck = _cfg_bool(cfg, "visual", "dual_deck_mode", false)
+		_dual_visual = _cfg_bool(cfg, "visual", "dual_visual", false)
 		_skip_secs = clampf(_cfg_num(cfg, "input", "skip_secs", 5.0), 1.0, 30.0)
 		_fade_speed = clampf(_cfg_num(cfg, "visual", "fade_speed", 1.0), 0.25, 4.0)
 		if cfg.has_section("keybinds"):
@@ -466,24 +508,29 @@ func _ready() -> void:
 	if video_path:
 		_video.stream = load(video_path)
 	%Play.pressed.connect(_toggle)
-	%Stop.pressed.connect(_stop)
+	%Stop.pressed.connect(func() -> void: _stop(_bar_deck()))
 	%AddFolder.pressed.connect(_dialog.popup_centered)
-	# The library's own way in, on the tab people actually land on. ADD FOLDER lived only on
-	# DIRS, so a first launch opened onto an empty TRACKS list with no visible way forward.
-	var add_music := Button.new()
-	add_music.name = "AddMusic"
-	add_music.text = "[ ADD MUSIC FOLDER ]"
-	add_music.pressed.connect(_dialog.popup_centered)
-	%Search.add_sibling(add_music)
-	_hover_note(add_music, func() -> String:
-		return "PICK A MUSIC FOLDER  //  OR DRAG FOLDERS STRAIGHT ONTO THE WINDOW")
+	# TRK A and TRK B carry the same header, but each drives only its own crate: searching,
+	# sorting or picking a playlist in one list never touches the other.
+	for crate in 2:
+		var search: LineEdit = [%Search, %SearchB][crate]
+		# The library's own way in, on the tab people actually land on. ADD FOLDER lived only on
+		# DIRS, so a first launch opened onto an empty TRACKS list with no visible way forward.
+		var add_music := Button.new()
+		add_music.name = "AddMusic"
+		add_music.text = "[ ADD MUSIC FOLDER ]"
+		add_music.pressed.connect(_dialog.popup_centered)
+		search.add_sibling(add_music)
+		_hover_note(add_music, func() -> String:
+			return "PICK A MUSIC FOLDER  //  OR DRAG FOLDERS STRAIGHT ONTO THE WINDOW")
+		search.text_changed.connect(func(t: String) -> void:
+			_filters[crate] = t.strip_edges()
+			_refill(crate))
 	get_window().files_dropped.connect(_on_files_dropped)
 	%RemoveFolder.pressed.connect(_remove_folder)
 	%Rescan.pressed.connect(_rescan)
-	%Sort.pressed.connect(_cycle_sort)
-	%Search.text_changed.connect(func(s: String) -> void:
-		_filter = s.strip_edges()
-		_refill())
+	%Sort.pressed.connect(_cycle_sort.bind(0))
+	%SortB.pressed.connect(_cycle_sort.bind(1))
 	%Reboot.pressed.connect(_on_reboot)
 	_setup_decks()
 	_setup_fade()
@@ -502,39 +549,45 @@ func _ready() -> void:
 	_crt_mat = %VizBox.material as ShaderMaterial
 	_apply_crt()
 	_apply_mono()
+	_engine.set_listening_mode(_listening_mode)
 	if _visual_windowed:
 		_toggle_visual_window(true)
-	%Sort.text = "SORT: %s" % SORTS[_sort]
+	%Sort.text = "SORT: %s" % SORTS[_sorts[0]]
+	%SortB.text = "SORT: %s" % SORTS[_sorts[1]]
 	_dialog.dir_selected.connect(_add_folder)
 	_folder_tree.item_edited.connect(_on_folder_tree_item_edited)
 	_folder_tree.gui_input.connect(_on_folder_tree_input)
-	_tracks.item_activated.connect(_on_row_activated)
-	_tracks.gui_input.connect(_on_list_scroll)
+	for deck in 2:
+		var list: ItemList = [_tracks, _tracks_b][deck]
+		list.item_activated.connect(_on_row_activated.bind(deck))
+		list.gui_input.connect(_on_list_scroll.bind(list))
 	_engine.track_ready.connect(_on_track_ready)
 	_engine.reversed_ready.connect(func(path: String, stream: AudioStream) -> void:
 		if path != _current:
 			return   # the track changed while ffmpeg was working; drop the stale take
-		# _pos()/_len() answer for whichever backend is live, so they are read BEFORE
-		# the swap -- afterwards they would describe the reversed audio stream while a
-		# video was still the thing actually playing.
+		# The transport as it stands NOW, not as it stood when REV was pressed: a STOP or PAUSE
+		# pressed while ffmpeg worked is the user's latest word, and the take used to override
+		# it by starting playback regardless (audit C1). Untouched since the press, this IS the
+		# press-time state. _pos()/_len() answer for whichever backend is live, so all of it is
+		# read BEFORE the swap.
+		var land := rev_landing(_state(), _pos(), _len(), stream.get_length())
 		# A crossfade owns _audio's volume and ends by stopping the outgoing player and
 		# nulling its stream -- so a REV that swapped the stream mid-fade would either be
 		# ramped by a fade that no longer means anything or stopped outright a moment
 		# later. Cancel it first and settle the level.
 		_kill_fade(_engine.deck)
 		_audio.volume_db = ACTIVE_DB
-		var at := _pos()
-		var full := _len()
 		if _vid():
 			# a video's audio cannot be swapped out from under its picture: pushing the
 			# reversed track onto _audio would play both at once, out of sync
 			_video.stop()
 			_video.stream = null
 		_audio.stream = stream
-		_audio.play()
-		# resume at the MIRRORED position, so REV picks up where you were rather than
-		# dropping you at the top of the reversed file
-		_audio.seek(clampf(full - at, 0.0, maxf(_len(), 0.0)))
+		if land[0]:
+			# at the MIRRORED position, so REV picks up where you were rather than dropping
+			# you at the top of the reversed file
+			_audio.play(land[2])
+			_audio.stream_paused = land[1]
 		_sync_attach(_engine.deck)
 		_reversed = true
 		_refresh_rev_btn()
@@ -565,16 +618,26 @@ func _ready() -> void:
 		_apply_font(_font_name)
 	_apply_font_size(_font_size)   # independent of WHICH font: the built-in scales too
 	_setup_eq()
-	_setup_rack_tab()     # the FX tab: boots blank, modules added at runtime
-	_setup_record_tab()   # the RECORD SET tab
-	_setup_setlist_b()     # deck B's tab, added before the capture below
+	_setup_rack_tab(0)    # FX A and FX B: boot blank, modules added at runtime
+	_setup_rack_tab(1)
+	_setup_record_tab()   # the RECORD SET tab, added before the capture below
 	_capture_tab_order()
 	_shorten_tab_titles()   # 9 tabs do not fit the bar at its natural widths   # every tab now exists, including the runtime-built ones
-	_tabs.tab_changed.connect(func(_i: int) -> void:
-		_stats_at = 0.0   # a switch onto STATS paints this frame, not up to 250 ms late
-		_write_in())
+	_set_dual_deck(_dual_deck)   # after the capture, so every tab has a home slot to return to
+	for dock: TabContainer in [_tabs, %DeckADock]:
+		sleep_hidden_pages(dock)   # every page lives in one of the two docks until a drag moves it
+		dock.tab_changed.connect(func(_i: int) -> void:
+			_stats_at = 0.0   # a switch onto STATS paints this frame, not up to 250 ms late
+			# only a switch ONTO the track list reveals it. With two docks the list can already be
+			# on screen in the other one, and re-typing it on every click over there is noise.
+			if dock.get_current_tab_control() == _tracks.get_parent():
+				_write_in())
 	_setup_cursor()
 	_setup_visual()
+	_picture = VideoTest.new()
+	_picture.color_mode = _video_color
+	%VizStack.add_sibling(_picture)   # the same screen cell: sized with the visualizer, docked or windowed
+	_engine.video_ready.connect(_picture.open)
 	_director.attach(_audio)
 	_director.beat.connect(func(_i: int) -> void: _flash = 0.10)
 	_scrub.gui_input.connect(_on_scrub_input)
@@ -604,8 +667,12 @@ func _ready() -> void:
 		_ticker.text = _ticker.text.substr(1) + _ticker.text[0])
 	_vol.value = _volume
 	_apply_volume()   # the bus was never actually set here, so the slider lied
+	_engine.video_test = _video_test   # before the first scan and the first decode
 	_engine.load_index()   # before the first scan: known tracks cost a stat, not an ffprobe
-	var reclaimed := AudioEngine.purge_transcode_cache()
+	var reclaimed := AudioEngine.purge_cache("pcm_")
+	AudioEngine.purge_cache("rev_")   # reverse renders last one session: REV re-renders on demand
+	if not _video_test:
+		AudioEngine.purge_video_cache()
 	_rescan()
 	%Boot.finished.connect(func(who: String) -> void:
 		_user_name = who
@@ -623,11 +690,15 @@ func _ready() -> void:
 		_note = "  //  RECLAIMED %s OF OLD FLAC TRANSCODES  //  FLAC NOW DECODES NATIVELY" % _bytes(reclaimed)
 
 # --- library --------------------------------------------------------------
-func _cycle_sort() -> void:
-	_sort = (_sort + 1) % SORTS.size()
-	%Sort.text = "SORT: %s" % SORTS[_sort]
+func _cycle_sort(crate: int) -> void:
+	_sorts[crate] = (_sorts[crate] + 1) % SORTS.size()
+	([%Sort, %SortB][crate] as Button).text = "SORT: %s" % SORTS[_sorts[crate]]
 	_save()
-	_reindex()  # re-sort only; no reason to re-walk the disk
+	# re-sort this crate only; no reason to re-walk the disk or touch the other list
+	_orders[crate] = _sorted(SORTS[_sorts[crate]])
+	_refill(crate)
+	if crate == 0:
+		_write_in()
 
 func _cmp_by(mode: String, a: String, b: String) -> bool:
 	match mode:
@@ -703,23 +774,8 @@ func _rescan() -> void:
 ## counts, the queue hand-off, and the row strings themselves. Typing used to re-run all of
 ## it per character -- an O(n log n) sort plus an O(folders x tracks) prefix scan -- so it
 ## is split out here and called only when the library or the sort order actually changes.
-## `_index` stays index-aligned with `_paths`, which is what `_row_path` and the queue mean.
+## `_index` stays index-aligned with `_paths`, which is what `_row_paths` and the queues mean.
 func _reindex() -> void:
-	_mtime.clear()
-	if SORTS[_sort] == "DATE":  # stat once here, not once per comparison
-		for p in _paths:
-			_mtime[p] = FileAccess.get_modified_time(p)
-	_sortkey.clear()
-	if SORTS[_sort] in META_SORTS:   # one cached lookup per track, not one per comparison
-		for p in _paths:
-			var m := _engine.cached_meta(p)
-			if SORTS[_sort] == "KEY" and int((m.get("key", {}) as Dictionary).get("pc", -1)) < 0:
-				var est := _engine.spectral_key_for(p)   # an untagged track sorts by its estimate
-				if not est.is_empty():
-					m = m.duplicate()
-					m["key"] = {"pc": est["pc"], "minor": est["minor"]}
-			_sortkey[p] = meta_sort_key(SORTS[_sort], m, p)
-	_paths.sort_custom(func(a: String, b: String) -> bool: return _cmp_by(SORTS[_sort], a, b))
 	_index.clear()
 	_path_pos.clear()
 	for path in _paths:
@@ -734,39 +790,86 @@ func _reindex() -> void:
 		# path -> its _index/_paths position, so a playlist's OWN order can look each of
 		# its tracks up in O(1) instead of _paths.find() per entry, per keystroke
 		_path_pos[path] = _index.size() - 1
+	# each crate sorts its own copy; the same mode twice is one sort shared, not two
+	for crate in 2:
+		_orders[crate] = _orders[0] if crate == 1 and _sorts[1] == _sorts[0] else _sorted(SORTS[_sorts[crate]])
 	# the queue hand-off moved into _refill(): the queue is the VISIBLE list now, and
 	# the visible list is what a search keystroke changes
 	_refill()
 	_write_in()
 
-## Rebuilds only the visible list, matching the filter against the cached lowercase
-## haystack. Cheap enough to run on every keystroke.
-func _refill() -> void:
+## _paths in `mode`'s order, as a new array. Stats and metadata keys are gathered once per
+## pass here, not once per comparison.
+func _sorted(mode: String) -> Array[String]:
+	_mtime.clear()
+	if mode == "DATE":
+		for p in _paths:
+			_mtime[p] = FileAccess.get_modified_time(p)
+	_sortkey.clear()
+	if mode in META_SORTS:
+		for p in _paths:
+			var m := _engine.cached_meta(p)
+			if mode == "KEY" and int((m.get("key", {}) as Dictionary).get("pc", -1)) < 0:
+				var est := _engine.spectral_key_for(p)   # an untagged track sorts by its estimate
+				if not est.is_empty():
+					m = m.duplicate()
+					m["key"] = {"pc": est["pc"], "minor": est["minor"]}
+			_sortkey[p] = meta_sort_key(mode, m, p)
+	var out: Array[String] = _paths.duplicate()
+	out.sort_custom(func(a: String, b: String) -> bool: return _cmp_by(mode, a, b))
+	return out
+
+## Rebuilds the visible list of one crate, or of both with no argument, matching that crate's
+## filter against the cached lowercase haystack. Cheap enough to run on every keystroke.
+func _refill(crate := -1) -> void:
 	# Before the list stops existing. A write-in tween holds ROW INDICES into the list it
 	# was armed on; rebuilding underneath it made _write_step index past the end of a
 	# shorter list (seven engine errors on one search keystroke) and _write_restore paint
 	# the OLD track names onto the NEW rows. Cancel rather than restore -- restoring into
-	# rows that are about to be cleared is the bug, not the fix.
-	_write_cancel()
-	_tracks.clear()
-	_row_path.clear()
-	_path_row.resize(_index.size())
-	_path_row.fill(-1)          # a filtered-out track has no row at all
-	var needle := _filter.to_lower()
-	# Viewing a playlist shows ITS OWN stored order, not the global SORT -- that is what
+	# rows that are about to be cleared is the bug, not the fix. The write-in is TRK A's.
+	if crate != 1:
+		_write_cancel()
+	for c in 2:
+		if crate < 0 or crate == c:
+			_fill(c)
+	# SEARCH scopes PLAYBACK, not just the view. The queue is the DRIVEN deck's visible list,
+	# so NEXT, PREV, shuffle and auto-advance all stay inside that crate's result until it is
+	# cleared -- AudioEngine re-anchors its index on _current, so a track that is still
+	# visible keeps playing from where it was, and one that is filtered out simply hands
+	# the next advance to the top of the new queue.
+	if crate < 0 or crate == _engine.deck:
+		_engine.set_queue(_shown[_engine.deck], _current)
+	# both crates' unprobed tracks in one sweep: a sweep supersedes the last, so sweeping only
+	# the crate that changed would cancel the other one's
+	var todo: Array[String] = []
+	for c in 2:
+		for path: String in _unknown[c]:
+			if not path in todo:
+				todo.append(path)
+	if todo.size() <= SWEEP_MAX:
+		_sweep_durations(todo)
+	_mark_decks()
+
+func _fill(crate: int) -> void:
+	var list: ItemList = [_tracks, _tracks_b][crate]
+	var playlist: String = _crate_pl[crate]
+	list.clear()
+	var row_path := PackedInt32Array()
+	var path_row := PackedInt32Array()
+	path_row.resize(_index.size())
+	path_row.fill(-1)          # a filtered-out track has no row at all
+	var needle: String = (_filters[crate] as String).to_lower()
+	# Viewing a playlist shows ITS OWN stored order, not the crate's SORT -- that is what
 	# MOVE UP/DOWN in the track menu rearranges, and there would be nothing to see it
-	# rearrange if this still iterated _paths regardless. Folder grouping is a global-
+	# rearrange if this still iterated the sorted library regardless. Folder grouping is a
 	# library concept and does not apply to a playlist's deliberate order.
-	var grouped: bool = SORTS[_sort] == "FOLDER" and _playlist.is_empty()
+	var grouped: bool = SORTS[_sorts[crate]] == "FOLDER" and playlist.is_empty()
 	# .assign(), NOT a direct assignment: ConfigFile hands back an UNTYPED Array, and
 	# GDScript refuses untyped -> Array[String] outright ("Trying to assign an array of
 	# type Array"). A playlist built this session is already typed and worked; one
 	# reloaded from library.cfg threw here and took the whole track list down with it.
 	var order: Array[String] = []
-	if _playlist.is_empty():
-		order = _paths
-	else:
-		order.assign(_playlists.get(_playlist, []))
+	order.assign(_orders[crate] if playlist.is_empty() else _playlists.get(playlist, []))
 	var header := theme.get_color("font_color", "Green")
 	var last_dir := ""
 	var shown: Array[String] = []
@@ -784,26 +887,26 @@ func _refill() -> void:
 		if grouped:
 			if e["dir"] != last_dir:
 				last_dir = e["dir"]
-				_tracks.add_item((e["dir"] as String).get_file().to_upper() + "/")
+				list.add_item((e["dir"] as String).get_file().to_upper() + "/")
 				# headers are labels, not tracks: unselectable so a double-click or an
 				# arrow key can never land on one
-				_tracks.set_item_selectable(_tracks.item_count - 1, false)
-				_tracks.set_item_custom_fg_color(_tracks.item_count - 1, header)
-				_row_path.append(-1)
-			_tracks.add_item("  " + e["file"])
-		elif not _playlist.is_empty():
+				list.set_item_selectable(list.item_count - 1, false)
+				list.set_item_custom_fg_color(list.item_count - 1, header)
+				row_path.append(-1)
+			list.add_item("  " + e["file"])
+		elif not playlist.is_empty():
 			pl_num += 1
-			_tracks.add_item("%2d. %s" % [pl_num, e["row"]])
+			list.add_item("%2d. %s" % [pl_num, e["row"]])
 		else:
-			_tracks.add_item(e["row"])
+			list.add_item(e["row"])
 		# FIRST row wins. A playlist may legitimately list the same track twice, and the
 		# later row used to overwrite this mapping -- after which selecting the playing
 		# track jumped to the wrong copy and the highlight followed a row the transport
-		# was not on. _row_path still points every row at its own path, so opening
+		# was not on. row_path still points every row at its own path, so opening
 		# either copy works; only this reverse lookup has to pick one.
-		if _path_row[i] < 0:
-			_path_row[i] = _tracks.item_count - 1
-		_row_path.append(i)
+		if path_row[i] < 0:
+			path_row[i] = list.item_count - 1
+		row_path.append(i)
 		shown.append(_paths[i])
 		# cached only -- an unprobed track is counted as unknown here and swept below,
 		# never probed inline: one ffprobe per row would stall the keystroke that asked
@@ -812,23 +915,26 @@ func _refill() -> void:
 			unknown.append(_paths[i])
 		else:
 			secs += float(m.get("duration", 0.0))
-	# the playlist name wins the readout when both are on: it is the scope you chose and
-	# stays chosen, where a search is transient
-	var scope := _playlist if not _playlist.is_empty() else ("FILTERED" if not needle.is_empty() else "")
-	_count.text = count_text(_paths.size(), shown.size(), _folders.size(), secs,
-		scope, not unknown.is_empty())
-	# SEARCH scopes PLAYBACK, not just the view. The queue is the visible list, so NEXT,
-	# PREV, shuffle and auto-advance all stay inside the search result until it is
-	# cleared -- AudioEngine re-anchors its index on _current, so a track that is still
-	# visible keeps playing from where it was, and one that is filtered out simply hands
-	# the next advance to the top of the new queue.
-	_engine.set_queue(shown, _current)
-	if unknown.size() <= SWEEP_MAX:
-		_sweep_durations(unknown)
-	var playing := _paths.find(_current)
-	# the current track can be filtered out, and then it simply has no row to select
-	if playing >= 0 and playing < _path_row.size() and _path_row[playing] >= 0:
-		_tracks.select(_path_row[playing])
+	# assigned back whole: a packed array read out of an Array is a copy
+	_row_paths[crate] = row_path
+	_path_rows[crate] = path_row
+	_shown[crate] = shown
+	_unknown[crate] = unknown
+	if crate == 0:   # the count line lives under TRK A
+		# the playlist name wins the readout when both are on: it is the scope you chose and
+		# stays chosen, where a search is transient
+		var scope := playlist if not playlist.is_empty() else ("FILTERED" if not needle.is_empty() else "")
+		_count.text = count_text(_paths.size(), shown.size(), _folders.size(), secs,
+			scope, not unknown.is_empty())
+
+## Each list highlights ITS deck's track, not whichever deck happens to be driven. A track
+## filtered out of that crate's view simply has no row to select.
+func _mark_decks() -> void:
+	for deck in 2:
+		var i: int = _path_pos.get(_current if deck == _engine.deck else _deck_cur[deck], -1)
+		var path_row: PackedInt32Array = _path_rows[deck]
+		if i >= 0 and i < path_row.size() and path_row[i] >= 0:
+			([_tracks, _tracks_b][deck] as ItemList).select(path_row[i])
 
 ## The line under the track list. Pure, so count_test() covers both branches and the
 ## partial marker without a library on disk.
@@ -894,14 +1000,14 @@ func _sweep_durations(todo: Array[String]) -> void:
 				# what the sweep learned is kept for the next launch, and a metadata sort
 				# re-sorts now that the missing artists, albums and keys are known
 				_engine.save_index(_all_paths)
-				if SORTS[_sort] in META_SORTS:
+				if SORTS[_sorts[0]] in META_SORTS or SORTS[_sorts[1]] in META_SORTS:
 					_reindex()
 				else:
 					_refill()).call_deferred())
 
 func _walk(dir: String, out: Array[String]) -> void:
 	for f in DirAccess.get_files_at(dir):
-		if _is_audio(f):
+		if _is_track(f, _video_test):
 			out.append(dir.path_join(f))
 	for d in DirAccess.get_directories_at(dir):
 		_walk(dir.path_join(d), out)
@@ -1173,10 +1279,12 @@ func _save() -> void:
 	cfg.set_value("library", "folders", _folders)
 	cfg.set_value("library", "enabled_folders", _enabled_folders.keys())
 	cfg.set_value("library", "known_folders", _known_folders.keys())
-	cfg.set_value("library", "sort", _sort)
+	cfg.set_value("library", "sort", _sorts[0])
+	cfg.set_value("library", "sort_b", _sorts[1])
 	cfg.set_value("library", "tbs", _tbs)
 	cfg.set_value("library", "track_labels", _labels)
-	cfg.set_value("library", "playlist", _playlist)
+	cfg.set_value("library", "playlist", _crate_pl[0])
+	cfg.set_value("library", "playlist_b", _crate_pl[1])
 	cfg.set_value("playlists", "list", _playlists)
 	cfg.set_value("playlists", "cues", _pl_cues)
 	cfg.set_value("cues", "tracks", _cues)
@@ -1214,10 +1322,18 @@ func _save() -> void:
 	cfg.set_value("visual", "skin", _skin)
 	cfg.set_value("audio", "mono", _mono)
 	cfg.set_value("visual", "crt", _crt_on)
+	cfg.set_value("visual", "video_test", _video_test)
+	cfg.set_value("visual", "listening_mode", _listening_mode)
+	cfg.set_value("visual", "video_color", int(_video_color))
 	cfg.set_value("visual", "playbar", _playbar_on)
 	cfg.set_value("visual", "visual_windowed", _visual_windowed)
-	cfg.set_value("visual", "color_anim", int(_viz.color_anim))
-	cfg.set_value("visual", "rotate_gradients", _viz.rotate_gradients)
+	cfg.set_value("visual", "dual_deck_mode", _dual_deck)
+	cfg.set_value("visual", "dual_visual", _dual_visual)
+	# %Viz / %VizB, never _viz: that is whichever half the VIS tab happens to be editing
+	cfg.set_value("visual", "color_anim", int(%Viz.color_anim))
+	cfg.set_value("visual", "rotate_gradients", %Viz.rotate_gradients)
+	cfg.set_value("visual", "color_anim_b", int(%VizB.color_anim))
+	cfg.set_value("visual", "rotate_gradients_b", %VizB.rotate_gradients)
 	cfg.set_value("input", "skip_secs", _skip_secs)
 	cfg.set_value("visual", "fade_speed", _fade_speed)
 	for action in KEYBIND_SPEC:
@@ -1242,9 +1358,11 @@ func _save() -> void:
 	cfg.set_value("eq", "presets", _presets)
 	cfg.set_value("stats", "total_seconds", _total_secs)
 	cfg.set_value("stats", "user_name", _user_name)
-	cfg.set_value("visual", "viz", {
-		"mode": int(_viz.mode), "color": _viz.color_index, "sens": _viz.sensitivity,
-		"tilt": _viz.tilt_db, "height": _viz.height_scale, "speed": _viz.speed})
+	for pair in [["viz", %Viz], ["viz_b", %VizB]]:
+		var v: Visualizer = pair[1]
+		cfg.set_value("visual", pair[0], {
+			"mode": int(v.mode), "color": v.color_index, "sens": v.sensitivity,
+			"tilt": v.tilt_db, "height": v.height_scale, "speed": v.speed})
 	var err := save_cfg_atomic(cfg, _cfg)
 	if err != OK:
 		push_warning("could not save %s: %s" % [_cfg, error_string(err)])
@@ -1292,33 +1410,57 @@ static func load_cfg_safe(cfg: ConfigFile, path: String) -> String:
 ## exit write: _exit_tree() used to duplicate it, and both fired on a normal close.
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_CLOSE_REQUEST and is_node_ready():
-		# ORDER MATTERS, and all three steps are about not losing work on the way out.
-		# A take still running has a placeholder RIFF header claiming zero bytes of
-		# audio, so closing mid-record left a file no player would open; stop() patches
-		# the real sizes in and runs the conversion. Then the workers are joined, so
-		# nothing is holding _spectral_lock when the engine node is freed underneath it.
-		# _save() goes last, because stopping the recorder is what settles the state it
-		# is about to write.
+		# ORDER MATTERS, and every step is about not losing work on the way out.
+		# A take still running has a placeholder RIFF header claiming zero bytes of audio;
+		# stop() patches the real sizes in and hands the conversion to a worker. The config is
+		# saved NEXT, before any worker is joined, so a close that stalls or is force-killed
+		# after this point has already written everything. shutdown() then kills every
+		# ffmpeg/ffprobe still running -- that conversion included, whose float take stays
+		# intact -- and joins the workers, which now takes milliseconds rather than the rest of
+		# a render. The index goes last, once no worker can still be writing _meta.
 		if _recorder and _recorder.recording:
 			_recorder.stop(_rec_type, _rec_rate, _rec_quality)
+		_save()
 		if _engine:
 			_engine.shutdown()
 			_engine.save_index(_all_paths)   # after the join, so no worker is still writing _meta
-		_save()
 	# A drag begins somewhere and ends somewhere; Godot tells every Control about both
 	# but never says where. So the tab under the cursor is noted at the start, and at the
 	# end the cursor is asked again -- if the drag was not consumed by anything (the tab
-	# bar did not reorder it, no other Control took it) and the cursor is outside the tab
-	# dock, that is a tear-off.
+	# bar did not reorder it, no other Control took it) and the cursor is outside both tab
+	# docks, that is a tear-off. Over the OTHER dock it is a move into that dock.
+	#
+	# The move is done here with reparent() rather than by giving the two TabContainers one
+	# tabs_rearrange_group. Godot's own cross-container drop is remove_child + add_child, which
+	# clears the owner of every scene-built node in the tab -- %TracksA, %Search, %EqMode and the
+	# rest would stop resolving. reparent() keeps owners (see _move_row).
 	elif what == NOTIFICATION_DRAG_BEGIN:
-		_drag_tab = _tab_under_cursor()
+		# The drag data names the dragged tab and its bar exactly. Hit-testing the pointer here
+		# instead read whatever tab it had travelled onto by the time the drag threshold tripped
+		# -- the neighbour, for a press near a tab's edge.
+		_drag_dock = null
+		_drag_tab = -1
+		var data: Variant = get_viewport().gui_get_drag_data()
+		if data is Dictionary and data.get("type") == "tab" and data.has("from_path"):
+			for dock: TabContainer in [_tabs, %DeckADock]:
+				if get_node_or_null(data["from_path"]) == dock.get_tab_bar():
+					_drag_dock = dock
+					_drag_tab = int(data.get("tab_index", -1))
 	elif what == NOTIFICATION_DRAG_END:
 		var idx := _drag_tab
+		var from := _drag_dock
 		_drag_tab = -1
-		if idx < 0 or get_viewport().gui_is_drag_successful():
+		_drag_dock = null
+		if idx < 0 or not is_instance_valid(from) or get_viewport().gui_is_drag_successful():
 			return
-		if not _tabs.get_global_rect().has_point(_tabs.get_global_mouse_position()):
-			_tear_off_tab(idx)
+		var over: TabContainer = null
+		for dock: TabContainer in [_tabs, %DeckADock]:
+			if dock.is_visible_in_tree() and dock.get_global_rect().has_point(dock.get_global_mouse_position()):
+				over = dock
+		if over == null:
+			_tear_off_tab(from, idx)
+		elif over != from:
+			_move_tab(from.get_tab_control(idx), over)
 	# Application focus, not the main window's: clicking into a torn-off FX or settings
 	# window is still using the program, and throttling there would make its faders stutter.
 	elif what == NOTIFICATION_APPLICATION_FOCUS_OUT:
@@ -1368,13 +1510,30 @@ func _on_track_ready(path: String, stream: AudioStream, _meta: Dictionary, deck:
 	# lock for us -- it is per-track, and carrying it over would fight the new song
 	_director.attach(_audio)
 	_sync_attach(deck)   # a new track on this deck: its tracker starts a fresh lock
+	_arm_picture(path, stream)
 	_ticker.text = _engine.ticker_line(path)
 	_cue_overlay.queue_redraw()   # the new track's cue markers, not the old one's
 	# already cached by the worker that decoded the track: a dictionary read, no I/O
 	_key = _resolved_key(path)
-	var i := _paths.find(path)
-	if i >= 0 and i < _path_row.size() and _path_row[i] >= 0:
-		_tracks.select(_path_row[i])
+	_mark_decks()
+
+## Video TEST: an MP4's picture renders after its sound is already playing, and only for the
+## deck being looked at. Any other track clears whatever picture was up.
+## ponytail: an MP4 loaded onto the PARKED deck plays sound only; a picture per deck is the
+## upgrade if mixing two videos ever matters.
+func _arm_picture(path: String, stream: AudioStream) -> void:
+	var mp4 := _video_test and path.get_extension().to_lower() == "mp4"
+	_picture.expect(path if mp4 else "", stream if mp4 else null)
+	if mp4:
+		_engine.request_video(path)
+
+## The picture's palette: the user gradient picked on the VISUAL tab when one is, else the
+## skin's own screen colours. Read every frame, so gradient rotation and a new pick land at once.
+## levels[0] drives the kick: at the 96 kHz mix the analyser's lowest FFT bin spans about
+## 0-94 Hz, so that band carries the kick fundamental as well as the sub-bass.
+func _video_palette() -> Gradient:
+	var gi: int = _viz.gradient_index()
+	return _gradients[gi] if gi >= 0 and gi < _gradients.size() else _skin_ramp
 
 func _on_track_failed(path: String, reason: String) -> void:
 	_busy = false
@@ -1399,6 +1558,7 @@ func _load_parked(deck: int, path: String, stream: AudioStream) -> void:
 		_deck_live[deck] = pl
 	_deck_cur[deck] = path
 	_sync_attach(deck)
+	_mark_decks()
 	_note = "  //  LOADED ON %s: %s" % [AudioEngine.DECK_NAMES[deck], path.get_file()]
 	_clear_note_later()
 
@@ -1409,19 +1569,33 @@ func _prev() -> void:
 	_open(_engine.prev_index())
 
 # --- backend switch: the only place audio vs video APIs differ -------------
+## The deck the transport bar shows AND drives -- times, scrub, PLAY/PAUSE, STOP, arrow seeks
+## and the cue markers. Normally the focused deck. But a focused deck holding NOTHING hands
+## the bar to the other deck while that one is playing or paused: moving focus onto an empty
+## deck to load it must not blank the bar, the markers and the analyser under the music you
+## can hear. The first track loaded on the focused deck takes the bar back.
+func _bar_deck() -> int:
+	if _audio.stream or _vid():
+		return _engine.deck
+	var other := _live_player(1 - _engine.deck)
+	return 1 - _engine.deck if other.stream and (other.playing or other.stream_paused) else _engine.deck
+
+func _bar() -> AudioStreamPlayer: return _live_player(_bar_deck())
+func _bar_path() -> String: return _current if _bar_deck() == _engine.deck else _deck_cur[1 - _engine.deck]
+
 func _vid() -> bool: return _video.stream != null
-func _len() -> float: return _video.get_stream_length() if _vid() else (_audio.stream.get_length() if _audio.stream else 0.0)
-func _pos() -> float: return _video.stream_position if _vid() else _audio.get_playback_position()
-func _playing() -> bool: return _video.is_playing() if _vid() else _audio.playing
-func _paused() -> bool: return _video.paused if _vid() else _audio.stream_paused
+func _len() -> float: return _video.get_stream_length() if _vid() else (_bar().stream.get_length() if _bar().stream else 0.0)
+func _pos() -> float: return _video.stream_position if _vid() else _bar().get_playback_position()
+func _playing() -> bool: return _video.is_playing() if _vid() else _bar().playing
+func _paused() -> bool: return _video.paused if _vid() else _bar().stream_paused
 func _seek(t: float) -> void:
 	# ponytail: VideoStreamPlayer seeks to the nearest keyframe; exact only for audio.
 	if _vid(): _video.stream_position = t
-	else: _audio.seek(t)
+	else: _bar().seek(t)
 
 func _set_paused(v: bool) -> void:
 	if _vid(): _video.paused = v
-	else: _audio.stream_paused = v
+	else: _bar().stream_paused = v
 
 # --- transport ------------------------------------------------------------
 ## Single play/pause control -- the button's label is derived from _state(), so it can
@@ -1437,12 +1611,15 @@ func _play() -> void:
 	if _playing():
 		return
 	if _vid(): _video.play()
-	elif _audio.stream: _audio.play()
+	elif _bar().stream: _bar().play()
 
-func _stop() -> void:
-	_kill_fade(_engine.deck)   # this deck's fade only; a parked deck keeps its own
+## Stops one deck: the focused one by default, which is what every internal caller means --
+## a track landing on the focused deck must never stop the other. The STOP button and the
+## media key pass _bar_deck(), so they stop what the bar is showing.
+func _stop(deck := _engine.deck) -> void:
+	_kill_fade(deck)   # this deck's fade only; the other deck keeps its own
 	_video.stop()
-	for pl in [_a, _b]:
+	for pl: AudioStreamPlayer in _deck_pair[deck]:
 		pl.stop()
 		pl.stream_paused = false
 		pl.volume_db = ACTIVE_DB
@@ -1499,6 +1676,8 @@ func _on_vol_input(e: InputEvent) -> void:
 		_save_soon()
 
 # --- readout --------------------------------------------------------------
+var _bar_seen: AudioStreamPlayer   # the player _process last saw the bar on
+
 func _process(delta: float) -> void:
 	var l := _len()
 	var p := _pos()
@@ -1509,13 +1688,24 @@ func _process(delta: float) -> void:
 		_dragging = false
 		if l > 0.0:
 			_seek(_scrub.value / 100.0 * l)
-	if not _dragging and l > 0.0:
-		_scrub.value = p / l * 100.0
+	if not _dragging:
+		# zero with nothing to show, rather than holding the last deck's position beside a
+		# 00:00 readout
+		_scrub.value = p / l * 100.0 if l > 0.0 else 0.0
+	# The bar's player can change with no switch and no load -- the other deck stopping, a
+	# fade swapping its player -- so it is watched: the analyser and the markers follow it.
+	var bar := _bar()
+	if bar != _bar_seen:
+		_bar_seen = bar
+		_director.attach(bar)
+		_cue_overlay.queue_redraw()
 	_elapsed.text = _time_text(p)
 	_total.text = _time_text(l)
 	_clock.text = _clock_text()
 	_nosignal.visible = _state() == "STOPPED"
 	_nosignal.text = "[ LOADING ]" if _busy else "[ NO SIGNAL ]"
+	_picture.follow(_audio, _video_palette(), VideoTest.kick(_director.levels[0], _viz.db_floor()))
+	%VizStack.visible = not _picture.visible   # an MP4 picture takes the visualizer's place
 	_session_secs += delta
 	_total_secs += delta
 	_reboot_armed = maxf(_reboot_armed - delta, 0.0)
@@ -1565,6 +1755,9 @@ func _process(delta: float) -> void:
 		_stats_at = _session_secs + STATS_PERIOD
 		_sample_perf()
 		_refresh_stats()
+	if is_instance_valid(_autopsy) and _session_secs >= _autopsy_at and _autopsy.is_visible_in_tree():
+		_autopsy_at = _session_secs + STATS_PERIOD
+		_refresh_autopsy()
 
 const STATS_PERIOD := 0.25
 var _stats_at := 0.0   # session time the STATS block is next due; zeroed on a tab switch
@@ -1575,7 +1768,7 @@ func _refresh_stats() -> void:
 	# whichever deck happened to be live, so with A+B running there was no way to read
 	# what the other deck was doing -- or even to tell which one you were looking at.
 	var lines: Array[String] = [
-		"VERSION.%s" % VERSION,
+		"VERSION.%s" % ProjectSettings.get_setting("application/config/version", ""),
 		"USER....%s" % (_user_name if _user_name else "-"),
 		"SOURCE..%s" % _src(),
 		"LIBRARY.%d" % _paths.size(),
@@ -1600,6 +1793,122 @@ func _refresh_stats() -> void:
 		"ADDONS..%d" % 0,   # placeholder: nothing plugs into this yet
 	])
 	_stats.text = "\n".join(lines)
+
+# --- DSP AUTOPSY / SIGNAL FLOW ----------------------------------------------------
+## The focused deck's signal path, stage by stage, from what the objects in it report about
+## themselves -- never from what the settings say they should be.
+func _refresh_autopsy() -> void:
+	var which := _engine.deck
+	var player: AudioStreamPlayer = _deck_live[which] if _deck_live[which] else _engine.deck_player(which)
+	var stream: AudioStream = player.stream if is_instance_valid(player) else null
+	var meta := _engine.cached_meta(_current) if _current else {}
+	var mix := int(AudioServer.get_mix_rate())
+	var lines: Array[String] = ["DECK.......%s" % AudioEngine.DECK_NAMES[which]]
+	lines.append_array(_autopsy_block("SOURCE", [autopsy_source(stream, meta, _current)]))
+	lines.append_array(_autopsy_block("RESAMPLER", autopsy_resampler(stream, meta, mix)))
+	lines.append_array(_autopsy_block("FX ENGINE", autopsy_fx(_rack_decks[which] if which < _rack_decks.size() else null)))
+	lines.append_array(_autopsy_block("MASTER OUT", autopsy_master(mix, _engine.listening_mode,
+		_engine.curve_latency_ms(), _rec_type, _rec_quality)))
+	_autopsy.text = "\n".join(lines)
+
+static func _autopsy_block(caption: String, parts: Array[String]) -> Array[String]:
+	var out: Array[String] = []
+	for i in parts.size():
+		out.append((caption.rpad(11, ".") if i == 0 else " ".repeat(11)) + parts[i])
+	return out
+
+## THD+N of the C++ sinc on the worst case test_flac_native.gd measures: an 18 kHz tone, 44.1 kHz to
+## 96 kHz, 24-bit (its image, 2 kHz into the stopband). A 1 kHz tone measures -139 dB.
+const AUTOPSY_SINC_THDN_DB := -124
+## Godot's own 4-point cubic, measured in the 2026-09-14 audit: a 10 kHz tone, 44.1 kHz to 96 kHz.
+const AUTOPSY_CUBIC_THDN_DB := -26
+const NATIVE_STREAMS := ["SsFlacStream", "SsWavStream", "SsDsdStream"]
+
+## Codec | native rate / depth | channels of what the deck is ACTUALLY playing. The native streams
+## report their own format; Godot's decoders fall back on the file's probed metadata. A render (REV,
+## an MP4's sound) names what it was rendered from, since the stream is not the file.
+static func autopsy_source(stream: AudioStream, meta: Dictionary, path := "") -> String:
+	if stream == null:
+		return "-- (NOTHING LOADED)"
+	var cls := stream.get_class()
+	var codec := ""
+	var rate := 0
+	var depth := ""
+	var chans := 2
+	if cls in NATIVE_STREAMS:
+		rate = int(stream.call("get_sample_rate"))
+		chans = int(stream.call("get_channels"))
+		depth = "%d-BIT" % int(stream.call("get_bits_per_sample"))
+		codec = {"SsFlacStream": "FLAC", "SsWavStream": "WAV"}.get(cls, "")
+		if cls == "SsDsdStream":
+			codec = "DSD%d %s" % [rate / (44100 if rate % 44100 == 0 else 48000), stream.call("get_container")]
+	elif stream is AudioStreamWAV:
+		var wav := stream as AudioStreamWAV
+		codec = "WAV (GODOT)"
+		rate = wav.mix_rate
+		chans = 2 if wav.stereo else 1
+		depth = ["8-BIT", "16-BIT", "IMA-ADPCM", "QOA"][clampi(wav.format, 0, 3)]
+	else:
+		codec = {"AudioStreamMP3": "MP3", "AudioStreamOggVorbis": "OGG VORBIS"}.get(cls, cls.to_upper())
+		rate = int(meta.get("sample_rate", 0))
+		chans = int(meta.get("channels", 2))
+		depth = "LOSSY"
+	var from := path.get_extension().to_upper()
+	if from and not codec.begins_with(from) and not (from in ["DSF", "DFF"] and codec.begins_with("DSD")):
+		codec += " (RENDER OF %s)" % from
+	# two decimals with one trailing zero dropped: 22.05, 44.1, 96.0 -- a readout of rates must not round 22050 to 22.1
+	return "%s | %s / %s | %s" % [codec, ("%.2f" % (rate / 1000.0)).trim_suffix("0") + " KHZ" if rate > 0 else "? KHZ", depth,
+		{1: "MONO", 2: "STEREO"}.get(chans, "%d CH" % chans)]
+
+## How the stream reaches the mix rate: the native C++ sinc (its exact rational phase step L:M), a
+## straight copy at the mix rate, or Godot's cubic for the formats it still decodes itself.
+static func autopsy_resampler(stream: AudioStream, meta: Dictionary, mix_rate: int) -> Array[String]:
+	if stream == null:
+		return ["--"]
+	var cls := stream.get_class()
+	if cls in NATIVE_STREAMS:
+		var dsd := cls == "SsDsdStream"
+		var rate := int(stream.call("get_pcm_rate" if dsd else "get_sample_rate"))
+		var pre := "1-BIT FIR TO %.1f KHZ, THEN " % (rate / 1000.0) if dsd else ""
+		if rate == mix_rate:
+			return [pre + "NONE: PASSTHROUGH", "PHASE 1:1 | BIT-EXACT COPY"]
+		var g := _gcd(rate, mix_rate)
+		return [pre + "C++ WINDOWED-SINC (SincResampler)",
+			"PHASE %d:%d | THD+N %d DB (TESTED)" % [mix_rate / g, rate / g, AUTOPSY_SINC_THDN_DB]]
+	var src := (stream as AudioStreamWAV).mix_rate if stream is AudioStreamWAV else int(meta.get("sample_rate", 0))
+	if src <= 0:
+		return ["GODOT 4-POINT CUBIC", "RATE UNKNOWN"]
+	var g := _gcd(src, mix_rate)
+	return ["GODOT 4-POINT CUBIC (16-BIT STEP)",
+		"RATIO %d:%d | THD+N %d DB @ 10 KHZ (TESTED)" % [mix_rate / g, src / g, AUTOPSY_CUBIC_THDN_DB]]
+
+static func _gcd(a: int, b: int) -> int:
+	while b != 0:
+		var t := a % b
+		a = b
+		b = t
+	return maxi(a, 1)
+
+## The deck rack: whether MIX has a real dry path, and how many modules are actually in circuit.
+static func autopsy_fx(rack: FxRack) -> Array[String]:
+	if rack == null:
+		return ["--"]
+	var pairs := rack.pair_count()
+	var counts := rack.circuit_counts()
+	return ["PARALLEL WET/DRY: %d TAP/BLEND PAIRS" % pairs if pairs > 0 else "SERIAL: NO SsParallel, MIX INERT",
+		"ACTIVE MODULES: %d%s" % [counts[0], "  (+%d AT MIX 0, SWITCHED OUT)" % counts[1] if counts[1] > 0 else ""]]
+
+## The mix format, LISTENING MODE, and whether a recording would be TPDF-dithered: every take is
+## captured as 32-bit float and dithered only on its way down to 16 or 24-bit integers.
+static func autopsy_master(mix_rate: int, mode: int, latency_ms: float, rec_type: int, rec_quality: int) -> Array[String]:
+	var curve: String = AudioEngine.LISTENING_MODE_NAMES[clampi(mode, 0, AudioEngine.LISTENING_MODE_NAMES.size() - 1)]
+	if latency_ms > 0.0:
+		curve += " +%.1f MS" % latency_ms
+	var type: String = Recorder.FILE_TYPES[clampi(rec_type, 0, Recorder.FILE_TYPES.size() - 1)]
+	var bits: int = Recorder.FLAC_BITS if type == "FLAC" \
+		else Recorder.WAV_DEPTHS[clampi(rec_quality, 0, Recorder.WAV_DEPTHS.size() - 1)]
+	return ["%d HZ / 32-BIT FLOAT | %s" % [mix_rate, curve],
+		"TPDF DITHER: ON (REC %s %d-BIT)" % [type, bits] if bits < 32 else "TPDF DITHER: OFF (REC WAV 32-BIT: NONE NEEDED)"]
 
 ## A+B means both decks are live at once, which is exactly the case the old single-deck
 ## readout could not describe.
@@ -1626,7 +1935,7 @@ func _deck_stat_lines(which: int) -> Array[String]:
 	var dl := 0.0
 	var dp := 0.0
 	var st := "EMPTY"
-	if live:
+	if live and _bar_deck() == which:   # else the bar is showing the other deck
 		dl = _len()
 		dp = _pos()
 		st = _state()
@@ -1814,8 +2123,10 @@ func _time_text(t: float) -> String:
 		return ts_text(t)
 	return _hms(t) if t >= 3600.0 else _fmt(t)
 
-static func _is_audio(f: String) -> bool:
-	return f.get_extension().to_lower() in EXTS
+## A file the library takes: audio always, an .mp4 only while Video TEST is on.
+static func _is_track(f: String, video := false) -> bool:
+	var ext := f.get_extension().to_lower()
+	return ext in EXTS or (video and ext == "mp4")
 
 static func _ratio_at(x: float, w: float) -> float:
 	return clampf(x / maxf(w, 1.0), 0.0, 1.0)
@@ -1950,13 +2261,13 @@ var _anim_btn: Button
 var _rotate_btn: Button
 
 func _setup_visual() -> void:
-	_viz.director = _director
 	# user skins are read before the saved name is resolved, so a custom palette survives a
 	# restart -- and a saved name whose file has since been deleted falls back to WIN98
 	Skins.load_user_skins()
 	if not _skin in Skins.names():
 		_skin = "WIN98"
 	Skins.apply(theme, self, _skin)
+	_skin_ramp = Skins.video_ramp(_skin)
 	%Skin.text = "SKIN: %s" % _skin
 	%Skin.pressed.connect(func() -> void:
 		# rescanned per click, like FONT: a .cfg dropped into user://skins is one click away
@@ -1964,6 +2275,7 @@ func _setup_visual() -> void:
 		var all := Skins.names()
 		_skin = all[(all.find(_skin) + 1) % all.size()]
 		Skins.apply(theme, self, _skin)
+		_skin_ramp = Skins.video_ramp(_skin)
 		%Skin.text = "SKIN: %s" % _skin
 		_refill()  # folder headers carry the accent colour, so they need repainting
 		_save())
@@ -1971,16 +2283,20 @@ func _setup_visual() -> void:
 		return "CUSTOM SKINS: DROP .CFG PALETTES INTO %s" % ProjectSettings.globalize_path(Skins.USER_SKIN_DIR))
 	# clamped against the UNLOCKED count: losing the unlock must not boot into SNAKE
 	_apply_unlocks()
-	_viz.mode = clampi(_viz_cfg.get("mode", 0), 0, _viz_mode_count() - 1) as Visualizer.Mode
-	# PRESETS.size() is the rainbow slot, one past the last fixed colour
-	_viz.gradients = _gradients
-	# one slot per gradient past the rainbow, so a saved gradient selection survives
-	_viz.color_index = clampi(_viz_cfg.get("color", 0), 0,
-		_viz.PRESETS.size() + _gradients.size())
-	_viz.sensitivity = _viz_cfg.get("sens", 0.5)
-	_viz.tilt_db = _viz_cfg.get("tilt", 20.0)
-	_viz.height_scale = _viz_cfg.get("height", 0.62)
-	_viz.speed = _viz_cfg.get("speed", 0.5)
+	# deck B's half is a second Visualizer with its own saved block; the gradients are the one
+	# shared list, so a gradient built for either half is pickable on both
+	for pair in [[%Viz, _viz_cfg], [%VizB, _viz_cfg_b]]:
+		var v: Visualizer = pair[0]
+		var c: Dictionary = pair[1]
+		v.mode = clampi(c.get("mode", 0), 0, _viz_mode_count() - 1) as Visualizer.Mode
+		# PRESETS.size() is the rainbow slot, one past the last fixed colour
+		v.gradients = _gradients
+		# one slot per gradient past the rainbow, so a saved gradient selection survives
+		v.color_index = clampi(c.get("color", 0), 0, v.PRESETS.size() + _gradients.size())
+		v.sensitivity = c.get("sens", 0.5)
+		v.tilt_db = c.get("tilt", 20.0)
+		v.height_scale = c.get("height", 0.62)
+		v.speed = c.get("speed", 0.5)
 	# the swatch row is rebuilt rather than inlined here: a gradient added or deleted
 	# renumbers every slot after it, and color_index IS a position in this row
 	_rebuild_color_row()
@@ -2010,6 +2326,19 @@ func _setup_visual() -> void:
 		_save())
 	_refresh_rotate_btn()
 
+	_dual_visual_btn = _add_setting_row("DUAL VISUAL", "DualVisualRow", _rotate_btn.get_parent(), visual_home)
+	_dual_visual_btn.pressed.connect(func() -> void:
+		_dual_visual = not _dual_visual
+		_apply_dual_visual()
+		_save())
+	_hover_note(_dual_visual_btn, func() -> String:
+		return "SPLITS THE FEED: DECK A ON TOP, DECK B BELOW  //  EACH HALF KEEPS ITS OWN MODE, COLOUR AND BARS")
+	_viz_edit_btn = _add_setting_row("EDITING", "VizEditRow", _dual_visual_btn.get_parent(), visual_home)
+	_viz_edit_btn.pressed.connect(func() -> void:
+		_viz = %VizB if _viz == %Viz else %Viz
+		_apply_dual_visual())
+	_apply_dual_visual()
+
 	%VizMode.pressed.connect(func() -> void:
 		_viz.mode = ((_viz.mode + 1) % _viz_mode_count()) as Visualizer.Mode
 		_refresh_visual()
@@ -2034,7 +2363,29 @@ func _refresh_anim_btn() -> void:
 
 func _refresh_rotate_btn() -> void:
 	if is_instance_valid(_rotate_btn):
+		# the toggle state too: switching which half is edited must not leave the button
+		# holding the other half's value, or the next press would set what was already set
+		_rotate_btn.set_pressed_no_signal(_viz.rotate_gradients)
 		_rotate_btn.text = "[*] ON" if _viz.rotate_gradients else "[ ] OFF"
+
+## DUAL VISUAL: %VizBoxB appears under %VizBox and each half draws its own deck from that
+## deck's BEAT SYNC tracker -- the Master director hears the sum, so it cannot feed either.
+## The trackers' analysers stay on for this even with SYNC off; their tempo fit does not.
+## Off, the top half goes back to Master and the VIS tab back to editing it.
+func _apply_dual_visual() -> void:
+	%VizBoxB.visible = _dual_visual
+	%Viz.director = _deck_directors[0] if _dual_visual else _director
+	%VizB.director = _deck_directors[1]
+	for i in _deck_directors.size():
+		_deck_directors[i].set_tracking(_beat_sync, _beat_sync or _dual_visual)
+	if not _dual_visual:
+		_viz = %Viz
+	_viz_edit_btn.get_parent().visible = _dual_visual
+	_dual_visual_btn.text = "[*] ON" if _dual_visual else "[ ] OFF"
+	_viz_edit_btn.text = "[DECK A]  DECK B" if _viz == %Viz else "DECK A  [DECK B]"
+	_refresh_visual()
+	_refresh_anim_btn()
+	_refresh_rotate_btn()
 
 func _on_viz_bar(e: InputEvent, bar: ProgressBar) -> void:
 	var r := _bar_wheel(e, bar.value / 100.0)
@@ -2054,27 +2405,44 @@ func _on_viz_bar(e: InputEvent, bar: ProgressBar) -> void:
 ## ItemList in Godot 4.7 has NO fixed_item_height (only fixed_column_width and
 ## fixed_icon_size), so the row height has to be measured off a real item.
 ## A double-click gives a LIST row, which is neither a library index nor a queue index.
-func _on_row_activated(row: int) -> void:
-	if row >= 0 and row < _row_path.size() and _row_path[row] >= 0:
-		# row -> _paths index -> queue index. The last hop is not a no-op under a search:
-		# the queue holds only the matches, so a row's queue position is not its library one.
-		_open(_engine.queue.find(_paths[_row_path[row]]))
+func _on_row_activated(row: int, deck: int) -> void:
+	var row_path: PackedInt32Array = _row_paths[deck]
+	if row >= 0 and row < row_path.size() and row_path[row] >= 0:
+		_open_deck(deck, _paths[row_path[row]])
 
-func _on_list_scroll(e: InputEvent) -> void:
+## Plays `path` on `deck` whichever deck is driven, and never changes which one that is:
+## %TracksA always loads deck A, %TracksB deck B. The driven deck goes through _open as ever;
+## the other decodes by path and lands in _load_parked, leaving the queue -- and the driven
+## deck's place in it -- alone.
+func _open_deck(deck: int, path: String) -> void:
+	if deck != _engine.deck:
+		_note = "  //  LOADING ON %s: %s" % [AudioEngine.DECK_NAMES[deck], path.get_file()]
+		_engine.load_on(deck, path)
+		return
+	# row -> queue index. Not a no-op under a search: the queue holds only the matches, so a
+	# row's queue position is not its library one. A path outside this deck's view (PLAY ON
+	# DECK A from TRK B's menu, under a different search) still plays, by path.
+	var qi := _engine.queue.find(path)
+	if qi >= 0:
+		_open(qi)
+	else:
+		_engine.load_on(deck, path)
+
+func _on_list_scroll(e: InputEvent, list: ItemList) -> void:
 	if not (e is InputEventMouseButton and e.pressed):
 		return
 	var dir := 0
 	if e.button_index == MOUSE_BUTTON_WHEEL_UP: dir = -1
 	elif e.button_index == MOUSE_BUTTON_WHEEL_DOWN: dir = 1
 	else: return
-	if _tracks.item_count == 0:
+	if list.item_count == 0:
 		return
-	var step := _tracks.get_item_rect(0).size.y
+	var step := list.get_item_rect(0).size.y
 	if step <= 0.0:
 		return
-	var bar := _tracks.get_v_scroll_bar()
+	var bar := list.get_v_scroll_bar()
 	bar.value = snappedf(bar.value + dir * step * 3.0, step)
-	_tracks.accept_event()
+	list.accept_event()
 
 
 ## Px437 is a codepage-437 bitmap font: no CJK glyphs at all, so the Japanese track
@@ -2184,15 +2552,9 @@ func _setup_eq() -> void:
 	for i in _eq_decks.size():
 		_eq_decks[i].setup(_engine.deck_bus(i))
 		_eq_decks[i].from_dict(_eq_cfg_decks[i])
-		# T-BASS and BBE have had no control anywhere since the fixed rack went, so a value
-		# carried in an older [eq] state would be bass drive or a treble lift nobody can
-		# reach. Forced to zero, which Equalizer._push treats as true bypass.
-		_eq_decks[i].set_dsp("tbass", 0.0)
-		_eq_decks[i].set_dsp("bbe", 0.0)
-		# AFTER the Equalizer on the same bus, never before: Equalizer.setup inserts at
-		# explicit slots 0-11, so a rack already sitting there would be interleaved into
-		# the middle of its chain. Appending puts the rack past that deck's own limiter,
-		# where AudioEngine's MASTER limiter is what catches it.
+		# AFTER the Equalizer on the same bus, never before: Equalizer.setup builds from slot 0
+		# and ends the bus with its limiter, and the rack inserts its modules just ahead of that
+		# limiter -- so the deck limiter catches whatever the rack adds.
 		var rack := FxRack.new()
 		rack.name = "Rack%s" % ["A", "B"][i]
 		add_child(rack)
@@ -2208,7 +2570,6 @@ func _setup_eq() -> void:
 		add_child(tracker)
 		_deck_directors.append(tracker)
 	_eq = _eq_decks[_engine.deck]
-	_rack = _rack_decks[_engine.deck]
 	# the racks are inserted ahead of the analyser, which invalidates the handle the
 	# director cached in its own _ready (children are ready before their parent)
 	_director.rebind()
@@ -2238,14 +2599,12 @@ func _setup_eq() -> void:
 	%EqAdapt.toggled.connect(func(on: bool) -> void:
 		_eq.adapt = on
 		_save())
-	# T-BASS and BBE are FX-rack controls only. Their rows used to be duplicated on this
-	# tab, which meant two widgets owning one value plus a refresh path to keep them
-	# honest; the rack's own faders drive Equalizer.set_dsp directly, so there is one
-	# source of truth. The rows are gone from player.tscn, not hidden or freed at load.
+	# T-BASS and BBE are FX rack modules (fx_rack.gd), each in its own wet/dry pair; this tab
+	# has no rows for them, and an older [eq] state's tbass/bbe keys are simply ignored.
 	_setup_presets()
 	for e in _eq_decks:
 		e.changed.connect(_save_soon)
-	# With both fader panels hidden in OFF mode, and the T-BASS/BBE rows now gone, the
+	# With both fader panels hidden in OFF mode, and no T-BASS/BBE rows here, the
 	# tab collapsed to a lone button in a 29 px strip -- which reads as the equalizer
 	# having broken rather than being switched off. This says which it is.
 	_eq_off_note = Label.new()
@@ -2508,6 +2867,32 @@ func _add_settings_rows() -> void:
 	_refresh_mono_btn()
 	after = _mono_btn.get_parent()
 
+	_listening_btn = _add_setting_row("LISTENING MODE", "ListeningModeRow", after)
+	_listening_btn.pressed.connect(func() -> void:
+		_listening_mode = (_listening_mode + 1) % AudioEngine.LISTENING_MODE_NAMES.size()
+		_engine.set_listening_mode(_listening_mode)
+		_refresh_listening_btn()
+		_autopsy_at = 0.0
+		_save())
+	_refresh_listening_btn()
+	_hover_note(_listening_btn, func() -> String:
+		return "AUDIOPHILE: BIT-EXACT, NOTHING ADDED  //  CASUAL: +2.2 DB UNDER 120 HZ, -0.8 DB AT 3 KHZ, -1.5 DB OVER 16 KHZ, PHASE-LINEAR, 6 MS LATE")
+	after = _listening_btn.get_parent()
+
+	# DSP AUTOPSY: a column of its own rather than a caption + control row, refreshed at 4 Hz
+	# from _process while it can be seen
+	var autopsy := VBoxContainer.new()
+	autopsy.name = "AutopsyPanel"
+	var head := Label.new()
+	head.text = "--- DSP AUTOPSY / SIGNAL FLOW"
+	autopsy.add_child(head)
+	_autopsy = Label.new()
+	_autopsy.name = "Autopsy"
+	autopsy.add_child(_autopsy)
+	_tbs_home.add_child(autopsy)
+	_tbs_home.move_child(autopsy, after.get_index() + 1)
+	after = autopsy
+
 	_crt_btn = _add_setting_row("CRT FILTER", "CrtRow", after)
 	_crt_btn.toggle_mode = true
 	_crt_btn.button_pressed = _crt_on
@@ -2540,6 +2925,33 @@ func _add_settings_rows() -> void:
 		_save())
 	_refresh_visual_win_btn()
 	after = _visual_win_btn.get_parent()
+
+	_dual_deck_btn = _add_setting_row("DUAL DECK MODE", "DualDeckRow", after)
+	_dual_deck_btn.pressed.connect(func() -> void: _set_dual_deck(not _dual_deck))
+	_hover_note(_dual_deck_btn, func() -> String:
+		return "DECK A'S TRACKS IN THEIR OWN COLUMN LEFT OF THE FEED  //  DECK B'S TRACKS, FX, EQ, DIRS ON THE RIGHT")
+	after = _dual_deck_btn.get_parent()
+
+	_video_test_btn = _add_setting_row("Video TEST", "VideoTestRow", after)
+	_video_test_btn.toggle_mode = true
+	_video_test_btn.button_pressed = _video_test
+	_video_test_btn.pressed.connect(func() -> void: _set_video_test(_video_test_btn.button_pressed))
+	_refresh_video_test_btn()
+	_hover_note(_video_test_btn, func() -> String:
+		return "OFF: MP4 FILES ARE INVISIBLE  //  ON: THEY JOIN THE LIBRARY, FULL AUDIO + LOW-FI PICTURE")
+	after = _video_test_btn.get_parent()
+
+	_video_color_btn = _add_setting_row("VIDEO COLOR", "VideoColorRow", after)
+	_video_color_btn.pressed.connect(func() -> void:
+		_video_color = VideoTest.ColorMode.ORIGINAL if _video_color == VideoTest.ColorMode.PALETTE \
+			else VideoTest.ColorMode.PALETTE
+		_picture.color_mode = _video_color
+		_refresh_video_color_btn()
+		_save())
+	_refresh_video_color_btn()
+	_hover_note(_video_color_btn, func() -> String:
+		return "ORIGINAL: THE VIDEO'S OWN COLOURS  //  PALETTE: 4-STOP DITHER IN THE SKIN OR PICKED GRADIENT, PULSING ON THE KICK")
+	after = _video_color_btn.get_parent()
 
 	_skip_field = _add_setting_field_row("SKIP SECONDS (1-30)", "SkipSecsRow", after,
 		str(int(_skip_secs)))
@@ -2582,6 +2994,36 @@ func _refresh_mono_btn() -> void:
 func _refresh_crt_btn() -> void:
 	if is_instance_valid(_crt_btn):
 		_crt_btn.text = "[*] ON" if _crt_on else "[ ] OFF"
+
+func _refresh_video_test_btn() -> void:
+	if is_instance_valid(_video_test_btn):
+		_video_test_btn.text = "[*] ON" if _video_test else "[ ] OFF"
+
+func _refresh_listening_btn() -> void:
+	if is_instance_valid(_listening_btn):
+		_listening_btn.text = "[ %s ]" % AudioEngine.LISTENING_MODE_NAMES[_listening_mode]
+
+func _refresh_video_color_btn() -> void:
+	if is_instance_valid(_video_color_btn):
+		_video_color_btn.text = "[ ORIGINAL COLOR ]" if _video_color == VideoTest.ColorMode.ORIGINAL \
+			else "[ PALETTE / DITHER ]"
+
+## Video TEST gates .mp4 at every door at once: the scan (so the TRACKS list, the index and the
+## queue), the engine's decode (so nothing already queued can still play one), and the
+## picture. Off also stops an MP4 that is playing and drops the renders --
+## they are test output, not library data.
+func _set_video_test(on: bool) -> void:
+	_video_test = on
+	_engine.video_test = on
+	_refresh_video_test_btn()
+	if not on:
+		_picture.expect("", null)
+		if _current.get_extension().to_lower() == "mp4":
+			_stop()
+		AudioEngine.purge_video_cache()
+	_rescan()
+	_engine.save_index(_all_paths)   # the index forgets them now, not at the next close
+	_save()
 
 func _refresh_playbar_btn() -> void:
 	if is_instance_valid(_playbar_btn):
@@ -2897,7 +3339,8 @@ const TEAR_PAD_TIGHT := 1
 const TEAR_TIGHT_BELOW := 520
 
 var _drag_tab := -1     # tab index the current drag started on, -1 when not dragging
-var _torn := {}         # panel Control -> {title, index, window}
+var _drag_dock: TabContainer   # which dock that tab was in: _tabs or %DeckADock
+var _torn := {}         # panel Control -> {title, index, window, pad, home}
 ## Canonical tab order: Control -> position. A stored absolute index goes stale the
 ## moment a SECOND tab is torn off, because the first one leaving shifted everything
 ## after it -- restoring both then put EQ and FX back the wrong way round. Sorting the
@@ -2912,6 +3355,7 @@ func _setup_tear_off() -> void:
 	# Godot's own reorder drag is what produces the drag event at all; without it a tab
 	# is not draggable and nothing below ever fires. Reordering inside the bar comes free.
 	_tabs.drag_to_rearrange_enabled = true
+	%DeckADock.drag_to_rearrange_enabled = true
 	# a deliberate reorder becomes the new canonical order, so restoring a torn-off tab
 	# never undoes an arrangement the user chose
 	_tabs.active_tab_rearranged.connect(func(_to: int) -> void: _capture_tab_order())
@@ -2920,40 +3364,49 @@ func _setup_tear_off() -> void:
 	# the bar every time it was torn off and put back. _ready captures after the FX tab.
 
 func _capture_tab_order() -> void:
-	# A torn-off panel is NOT in the container, so clearing the map wholesale drops it --
-	# and _restore_tab_order() sorts anything missing to 999, which is the far end of the
-	# bar. Reordering tabs while one was out therefore sent THAT one to the back when it
-	# docked, instead of home. The absent ones are kept, nudged half a slot ahead of
-	# whichever tab inherited their index, which is exactly the gap they left.
-	var absent := {}
-	for panel in _torn:
-		absent[panel] = float(_tab_home_indices.get(panel, _tabs.get_tab_count())) - 0.5
-	_tab_home_indices.clear()
+	# A tab that is out -- torn off, or over in %DeckADock -- is NOT in the container, and
+	# clearing the map wholesale would drop it and sort it to the far end when it came back.
+	# So the absent keep their slots untouched, and the tabs still in the bar are dealt the
+	# SAME set of slots they already held, in their new order. The old version nudged one
+	# absent tab half a slot ahead of its successor; with DUAL DECK MODE holding two tabs out
+	# for a whole session, that half slot drifted further forward on every reorder.
+	var top := -1.0
+	for panel in _tab_home_indices:
+		top = maxf(top, float(_tab_home_indices[panel]))
+	var slots: Array[float] = []
 	for i in _tabs.get_tab_count():
-		_tab_home_indices[_tabs.get_tab_control(i)] = float(i)
-	_tab_home_indices.merge(absent)
+		var panel := _tabs.get_tab_control(i)
+		if _tab_home_indices.has(panel):
+			slots.append(float(_tab_home_indices[panel]))
+		else:
+			top += 1.0   # a tab the map has never seen joins after everything it knows
+			slots.append(top)
+	slots.sort()
+	for i in _tabs.get_tab_count():
+		_tab_home_indices[_tabs.get_tab_control(i)] = slots[i]
 
 ## Puts every attached tab back into canonical order. Torn-off panels are simply absent
 ## from the container, so they need no special case -- they slot back in when they return.
-func _restore_tab_order() -> void:
-	var kids := _tabs.get_children()
-	# float, not int: a torn-off tab is parked on a half slot so it sorts back between the
-	# same two neighbours it left from, and int() would round that collision away again
+func _restore_tab_order(dock: TabContainer = null) -> void:
+	if not dock:
+		dock = _tabs
+	var kids := dock.get_children()
 	kids.sort_custom(func(a: Node, b: Node) -> bool:
 		return float(_tab_home_indices.get(a, 999)) < float(_tab_home_indices.get(b, 999)))
 	for i in kids.size():
-		_tabs.move_child(kids[i], i)
+		dock.move_child(kids[i], i)
 
-## Which tab the cursor is over, or -1. Asks the TabBar rather than doing the arithmetic,
-## so hidden tabs and variable-width titles are its problem and not ours.
-func _tab_under_cursor() -> int:
-	var bar := _tabs.get_tab_bar()
-	if not bar:
-		return -1
-	var local := bar.get_local_mouse_position()
-	if not Rect2(Vector2.ZERO, bar.size).has_point(local):
-		return -1
-	return bar.get_tab_idx_at_point(local)
+## Moves one tab into the other dock. The title is carried by hand (a TabContainer names a new
+## tab after its node), and the tab lands in canonical order there, the order both docks share.
+func _move_tab(panel: Control, to: TabContainer) -> void:
+	var from := panel.get_parent() as TabContainer
+	var title := from.get_tab_title(from.get_tab_idx_from_control(panel))
+	panel.reparent(to, false)
+	_restore_unique_names(panel)
+	_restore_tab_order(to)
+	var at := to.get_tab_idx_from_control(panel)
+	to.set_tab_title(at, title)
+	to.current_tab = at
 
 ## F11 fullscreens THIS window specifically, not the main one -- a torn-off tab is a
 ## real OS window of its own, and pressing F11 while it has focus should do what F11
@@ -2981,14 +3434,14 @@ func _enable_window_fullscreen_toggle(win: Window) -> void:
 ## owner, and every tab in player.tscn does. The FX tab is built at runtime and has no
 ## owner, which is why _restore_unique_names runs afterwards regardless -- it costs a
 ## walk of one panel and removes the whole class of "this tab works, that one crashes".
-func _tear_off_tab(idx: int) -> void:
-	if idx < 0 or idx >= _tabs.get_tab_count():
+func _tear_off_tab(from: TabContainer, idx: int) -> void:
+	if idx < 0 or idx >= from.get_tab_count():
 		return
-	var panel := _tabs.get_tab_control(idx)
+	var panel := from.get_tab_control(idx)
 	if not panel or _torn.has(panel):
 		return
 
-	var title := _tabs.get_tab_title(idx)
+	var title := from.get_tab_title(idx)
 	var win := Window.new()
 	win.name = "Tear%s" % panel.name
 	win.title = "SOUNDSCAPE // %s" % title
@@ -3033,8 +3486,13 @@ func _tear_off_tab(idx: int) -> void:
 	var chrome: Vector2 = chassis.get_combined_minimum_size()
 
 	# reparenting out of a TabContainer removes the tab and its title outright
-	_torn[panel] = {"title": title, "index": idx, "window": win, "pad": pad}
+	_torn[panel] = {"title": title, "index": idx, "window": win, "pad": pad, "home": from}
 	panel.reparent(col, false)
+	# A TabContainer stretches its tab over the whole page whatever the size flags say; a VBox
+	# hands a child that does not expand only its MINIMUM height. Without this every tab came
+	# out squeezed to its minimum -- TRACKS 136 of 955 px, TBS 0 -- with its list, tree or
+	# scroller collapsed to nothing. TabContainer reads FILL, not EXPAND, so docking needs no undo.
+	panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_restore_unique_names(panel)
 	win.close_requested.connect(_reattach_tab.bind(panel))
 
@@ -3110,18 +3568,22 @@ func _reattach_tab(panel: Control) -> void:
 	if rec.is_empty():
 		return
 	_torn.erase(panel)
-	panel.reparent(_tabs, false)
+	# back to the dock it came out of -- unless that is deck A's, folded away since
+	var dock: TabContainer = rec.get("home", _tabs)
+	if dock != _tabs and not _dual_deck:
+		dock = _tabs
+	panel.reparent(dock, false)
 	# straight to its canonical slot first, then the full re-sort so the tabs that never
 	# left keep their order too -- move_child alone puts this one right and nothing else
-	var home := int(_tab_home_indices.get(panel, rec.get("index", _tabs.get_child_count() - 1)))
-	_tabs.move_child(panel, clampi(home, 0, _tabs.get_child_count() - 1))
-	_restore_tab_order()
+	var home := int(_tab_home_indices.get(panel, rec.get("index", dock.get_child_count() - 1)))
+	dock.move_child(panel, clampi(home, 0, dock.get_child_count() - 1))
+	_restore_tab_order(dock)
 	_restore_unique_names(panel)
 	# the tab title defaults to the node name; restore whatever it actually was
-	var back := _tabs.get_tab_idx_from_control(panel)
+	var back := dock.get_tab_idx_from_control(panel)
 	if back >= 0:
-		_tabs.set_tab_title(back, rec["title"])
-		_tabs.current_tab = back
+		dock.set_tab_title(back, rec["title"])
+		dock.current_tab = back
 	var win: Window = rec["window"]
 	if is_instance_valid(win):
 		win.queue_free()
@@ -3359,7 +3821,11 @@ func _apply_feed(mode: int) -> void:
 	# stepping the visualizer, rather than paying for frames that are never shown
 	(%VizBox.get_child(0) as SubViewport).render_target_update_mode = \
 		SubViewport.UPDATE_ALWAYS if not gone else SubViewport.UPDATE_DISABLED
-	_viz.set_process(not gone)
+	# %VizBoxB is left to its container: it is hidden unless DUAL VISUAL is on, and forcing
+	# UPDATE_ALWAYS here would render it behind that. _viz may be either half, so name both.
+	%Viz.set_process(not gone)
+	%VizB.set_process(not gone)
+	%DeckAPanel.visible = _dual_deck and not full
 
 ## Puts the divider where a stretch ratio used to put it.
 ##
@@ -3469,6 +3935,36 @@ func _refresh_visual_win_btn() -> void:
 	if is_instance_valid(_visual_win_btn):
 		_visual_win_btn.text = "[*] WINDOWED" if _visual_windowed else "[ ] DOCKED"
 
+# --- DUAL DECK MODE -------------------------------------------------------------
+## [DECK A WING | FEED | DECK B WING]. %DeckADock is a second TabContainer left of %Workspace,
+## behind its own divider (%Body); TRACKS A and FX A move into it and the sidebar opens
+## on TRACKS B. Both docks share one canonical tab order, tear off the same way, and take tabs
+## dragged over from the other. Off, whatever is in deck A's dock goes back to the sidebar.
+## EQ stays single and follows the deck being driven, as it always has.
+func _set_dual_deck(on: bool) -> void:
+	_dual_deck = on
+	var dock: TabContainer = %DeckADock
+	var tracks: Control = _tracks.get_parent()
+	if on:
+		for panel: Control in [tracks, _rack_boxes[0].get_parent().get_parent()]:   # box -> scroll -> FX A
+			if _torn.has(panel):
+				_reattach_tab(panel)   # out in its own window: home first, then into the wing
+			if panel.get_parent() == _tabs:
+				_move_tab(panel, dock)
+		_tabs.current_tab = _tabs.get_tab_idx_from_control(_tracks_b.get_parent())   # mirrors TRACKS A on the left
+		dock.current_tab = maxi(dock.get_tab_idx_from_control(tracks), 0)
+	else:
+		for panel: Control in dock.get_children():
+			_move_tab(panel, _tabs)
+		if tracks.get_parent() == _tabs:
+			_tabs.current_tab = _tabs.get_tab_idx_from_control(tracks)
+	_apply_feed(_feed)   # %DeckAPanel's visibility lives with the rest of the chrome
+	if is_instance_valid(_dual_deck_btn):
+		_dual_deck_btn.text = "[*] ON" if on else "[ ] OFF"
+	if is_instance_valid(_split_btn):
+		_split_btn.text = "[SPLIT]" if on else "SPLIT"
+	_save()
+
 
 # --- tab transition: top-to-bottom line scan ----------------------------------
 ## Seconds per revealed row at TAB FADE SPEED == 1.0. The field is a multiplier, not
@@ -3486,9 +3982,27 @@ var _scan_rows: Array[CanvasItem] = []   # what the running scan is hiding, for 
 ## on, with no alpha ramp at all: the panel prints itself down the screen the way a
 ## terminal does. Rows rather than glyphs because a row is the unit a container already
 ## lays out -- a per-character reveal would mean re-typing every Label's text.
+## A tab page that is off screen sleeps: PROCESS_MODE_DISABLED while it is not visible in the
+## tree, INHERIT the moment it is. A TabContainer already hides the pages it is not showing, so
+## they were never drawn; this stops them processing too. It keys on the page's own visibility
+## rather than on tab_changed, so every way a page moves -- a tab click, a drag into the other
+## dock, a torn-off window and back, DUAL DECK or the FULL feed folding deck A's dock away --
+## lands in the same place. Nothing is rebuilt: a sleeping page keeps its text, scroll and
+## selection, and waking it is one property.
+static func sleep_hidden_pages(dock: TabContainer) -> void:
+	for page in dock.get_children():
+		if page is Control:
+			var wake := func() -> void:
+				page.process_mode = Node.PROCESS_MODE_INHERIT if page.is_visible_in_tree() \
+					else Node.PROCESS_MODE_DISABLED
+			page.visibility_changed.connect(wake)
+			page.tree_entered.connect(wake)   # a reparent can change visibility while out of the tree
+			wake.call()
+
 func _setup_tab_fade() -> void:
-	_tabs.tab_changed.connect(func(idx: int) -> void:
-		_scan_in(_tabs.get_tab_control(idx)))
+	for dock: TabContainer in [_tabs, %DeckADock]:
+		dock.tab_changed.connect(func(idx: int) -> void:
+			_scan_in(dock.get_tab_control(idx)))
 
 func _scan_in(panel: Control) -> void:
 	# An interrupted scan must put its rows back FIRST: switching tabs mid-scan would
@@ -3558,41 +4072,39 @@ static func _chunky_arrow_texture(flip: bool) -> ImageTexture:
 ## Godot only draws these when the tab row overflows its width, which is exactly when
 ## a modern vector arrow would have looked out of place next to everything else here.
 ## Nine tabs do not fit a sidebar sitting on its 575 px floor, and the overflow answer
-## Godot gives is two ~15 px scroll arrows -- which is how RECORD SET and TRACKS B
-## ended up effectively unreachable. Two things fix it together: shorter titles for the
+## Godot gives is two ~15 px scroll arrows -- which is how RECORD SET ended up
+## effectively unreachable. Two things fix it together: shorter titles for the
 ## two worst offenders, and a width cap so no single tab can hog the bar.
 ##
 ## Titles are set here rather than by renaming the nodes, because the node name is what
 ## _tab_home_indices and the tear-off registry key on, and a rename would reshuffle the
 ## saved tab order. _reattach_tab restores the title from its own record, so a torn-off
 ## tab comes back with the short name intact.
-## "SET B" said nothing about which deck it belonged to, sitting next to a DECK A / DECK B
-## keybind pair and an A+B button that both spell it out. The node is still named
-## TRACKS B -- see the note above about why titles are not node renames.
 const TAB_SHORT_TITLES := {
-	"RECORD SET": "REC", "TRACKS B": "DECK B", "FOLDERS": "DIRS", "VISUAL": "VIS",
+	"RECORD SET": "REC", "FOLDERS": "DIRS", "VISUAL": "VIS", "TRACKS A": "TRK A", "TRACKS B": "TRK B",
 }
 const TAB_MAX_WIDTH := 108
 
 func _shorten_tab_titles() -> void:
-	var bar := _tabs.get_tab_bar()
-	if bar:
-		bar.max_tab_width = TAB_MAX_WIDTH
+	for dock: TabContainer in [_tabs, %DeckADock]:
+		if dock.get_tab_bar():
+			dock.get_tab_bar().max_tab_width = TAB_MAX_WIDTH
 	for i in _tabs.get_tab_count():
 		var t := _tabs.get_tab_title(i)
 		if TAB_SHORT_TITLES.has(t):
 			_tabs.set_tab_title(i, TAB_SHORT_TITLES[t])
 
 func _setup_tab_arrows() -> void:
-	var bar := _tabs.get_tab_bar()
-	if not bar:
-		return
 	var right := _chunky_arrow_texture(false)
 	var left := _chunky_arrow_texture(true)
-	bar.add_theme_icon_override("increment", right)
-	bar.add_theme_icon_override("increment_highlight", right)
-	bar.add_theme_icon_override("decrement", left)
-	bar.add_theme_icon_override("decrement_highlight", left)
+	for dock: TabContainer in [_tabs, %DeckADock]:
+		var bar := dock.get_tab_bar()
+		if not bar:
+			continue
+		bar.add_theme_icon_override("increment", right)
+		bar.add_theme_icon_override("increment_highlight", right)
+		bar.add_theme_icon_override("decrement", left)
+		bar.add_theme_icon_override("decrement_highlight", left)
 
 
 ## ESC only means anything in FULLSCREEN, so the event is left alone otherwise -- the
@@ -3682,7 +4194,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			get_viewport().set_input_as_handled()
 			return
 		"media_stop":
-			_stop()
+			_stop(_bar_deck())
 			get_viewport().set_input_as_handled()
 			return
 		"simple_mode":
@@ -3692,7 +4204,7 @@ func _unhandled_input(event: InputEvent) -> void:
 	# Cue jump keys come AFTER the transport keys, so a marker can never shadow one, and
 	# they are only live while a track is loaded. A focused LineEdit eats the keypress
 	# before _unhandled_input ever sees it, so typing a search term cannot jump anything.
-	if not _current.is_empty() and _jump_to_key(OS.get_keycode_string(k.keycode)):
+	if not _bar_path().is_empty() and _jump_to_key(OS.get_keycode_string(k.keycode)):
 		get_viewport().set_input_as_handled()
 		return
 	if k.keycode == KEY_ESCAPE:
@@ -4145,11 +4657,12 @@ func _refresh_beat() -> void:
 ## pre-allocates all of them, disabled), so ADD EFFECT only flips a slot -- see
 ## fx_rack.gd for why nothing is ever inserted at runtime.
 var _rack_decks: Array[FxRack] = []
-var _rack: FxRack
 var _rack_cfg_decks := [{}, {}]   # deck -> saved [rack]/[rack_b] block
 var _rack_presets := {}           # preset name -> FxRack.to_dict()
-var _rack_box: VBoxContainer      # where the module boxes are rendered
-var _rack_bars := {}              # "type/key" -> [ProgressBar, Label]
+## One FX tab per deck, each pinned to its own rack (FX A, FX B), rather than one tab that
+## re-binds to whichever deck is live: DUAL DECK MODE shows both at once, one in each dock.
+var _rack_boxes: Array[VBoxContainer] = [null, null]   # deck -> where its module boxes render
+var _rack_bars := [{}, {}]        # deck -> "type/key" -> [ProgressBar, Label]
 
 var _key := {}          # _current's key: {"text": String, "pc": int, "minor": bool},
 						 # optionally "estimated": true when it came from SpectralKey
@@ -4370,12 +4883,12 @@ func _refresh_rec() -> void:
 const RACK_LABEL_W := 132
 # --- FX tab: the dynamic rack ------------------------------------------------
 ## Boots blank: four buttons, the Master Volume panel, and an empty module list.
-func _setup_rack_tab() -> void:
+func _setup_rack_tab(deck: int) -> void:
 	var tab := VBoxContainer.new()
-	tab.name = "FX"
+	tab.name = "FX %s" % ["A", "B"][deck]
 	tab.add_theme_constant_override("separation", 4)
 	_tabs.add_child(tab)
-	_tabs.move_child(tab, 4)  # sit beside EQ rather than after STATS
+	_tabs.move_child(tab, _tabs.get_node("EQ").get_index() + 1 + deck)  # right after EQ, not after STATS
 
 	# HFlow, not HBox: five buttons on one line is 1084 px of minimum width, and clipping
 	# them instead leaves "ADD.../CLE.../CRE..." which is no use to anyone. Wrapping to a
@@ -4390,7 +4903,7 @@ func _setup_rack_tab() -> void:
 		b.text = spec[0]
 		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		var what: String = spec[1]
-		b.pressed.connect(func() -> void: _rack_action(what))
+		b.pressed.connect(func() -> void: _rack_action(deck, what))
 		row.add_child(b)
 
 	# Master Volume deliberately STAYS on the transport bar. Moving it here put the one
@@ -4402,44 +4915,48 @@ func _setup_rack_tab() -> void:
 	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	tab.add_child(scroll)
-	_rack_box = VBoxContainer.new()
-	_rack_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_rack_box.add_theme_constant_override("separation", 4)
-	scroll.add_child(_rack_box)
-	_refresh_rack()
+	var box := VBoxContainer.new()
+	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	box.add_theme_constant_override("separation", 4)
+	scroll.add_child(box)
+	_rack_boxes[deck] = box
+	_refresh_rack(deck)
 
 ## Rebuilt wholesale rather than patched: a module added or removed renumbers the boxes,
 ## and the rack is a handful of entries, not a track list.
-func _refresh_rack() -> void:
-	# _rack as well as the box: the tab is built after _setup_eq creates the racks, but
+func _refresh_rack(deck: int) -> void:
+	# the rack as well as the box: the tab is built after _setup_eq creates the racks, but
 	# one reorder of those two calls would turn this into a null deref at boot
-	if not is_instance_valid(_rack_box) or _rack == null:
+	var box := _rack_boxes[deck]
+	if not is_instance_valid(box) or deck >= _rack_decks.size():
 		return
-	for c in _rack_box.get_children():
-		_rack_box.remove_child(c)
+	var rack := _rack_decks[deck]
+	for c in box.get_children():
+		box.remove_child(c)
 		c.queue_free()
-	_rack_bars.clear()
+	(_rack_bars[deck] as Dictionary).clear()
 	var any := false
 	for type in FxRack.MODULES:
-		if _rack.active.get(type, false):
+		if rack.active.get(type, false):
 			any = true
-			_rack_module_box(type)
+			_rack_module_box(deck, type)
 	if not any:
 		var empty := Label.new()
 		empty.text = "RACK EMPTY  //  PRESS ADD EFFECT"
-		_rack_box.add_child(empty)
+		box.add_child(empty)
 
 ## One module: the same 1 px outlined box the fixed rack uses, its parameters as drag
 ## bars, its switches as [*]/[ ] buttons and its choices as dropdowns -- all generated
 ## from FxRack.MODULES, so a new module is an entry in that table and nothing here.
-func _rack_module_box(type: String) -> void:
-	var body := _fx_module(_rack_box, "[ %s ]" % FxRack.module_name(type))
+func _rack_module_box(deck: int, type: String) -> void:
+	var rack := _rack_decks[deck]
+	var body := _fx_module(_rack_boxes[deck], "[ %s ]" % FxRack.module_name(type))
 	var head: Control = body.get_child(0)
 	var kill := Button.new()
 	kill.text = "REMOVE"
 	kill.pressed.connect(func() -> void:
-		_rack.remove_module(type)
-		_refresh_rack()
+		rack.remove_module(type)
+		_refresh_rack(deck)
 		_save())
 	head.add_child(kill)
 	for key in FxRack._choices(type):
@@ -4460,22 +4977,22 @@ func _rack_module_box(type: String) -> void:
 		opt.custom_minimum_size.x = 90
 		for i in (spec[1] as Array).size():
 			opt.add_item(str((spec[1] as Array)[i]), i)
-		opt.selected = _rack.ch[type][key]
+		opt.selected = rack.ch[type][key]
 		opt.item_selected.connect(func(i: int) -> void:
-			_rack.set_choice(type, key, i)
+			rack.set_choice(type, key, i)
 			_save())
 		r.add_child(opt)
 	for key in FxRack._switches(type):
 		var spec: Array = FxRack._switches(type)[key]
 		var btn := _rack_switch(body, spec[0])
-		btn.button_pressed = _rack.sw[type][key]
+		btn.button_pressed = rack.sw[type][key]
 		_refresh_rack_switch(btn, spec[0], btn.button_pressed)
 		btn.pressed.connect(func() -> void:
-			_rack.set_switch(type, key, btn.button_pressed)
+			rack.set_switch(type, key, btn.button_pressed)
 			_refresh_rack_switch(btn, spec[0], btn.button_pressed)
 			_save())
 	for key in FxRack._params(type):
-		_rack_row(body, type, key)
+		_rack_row(deck, body, type, key)
 
 ## No caption Label: the button already says the word, and having both rendered as
 ## "MODULAT      [ ] MODULATE OFF" -- the label clipped, the word duplicated, and the
@@ -4498,7 +5015,8 @@ func _refresh_rack_switch(btn: Button, caption: String, on: bool) -> void:
 
 ## Same ProgressBar + _bar_drag control every other fader in the program uses, rather
 ## than an HSlider the theme has no styles for.
-func _rack_row(parent: Control, type: String, key: String) -> void:
+func _rack_row(deck: int, parent: Control, type: String, key: String) -> void:
+	var rack := _rack_decks[deck]
 	var spec: Array = FxRack._params(type)[key]
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 6)
@@ -4520,33 +5038,33 @@ func _rack_row(parent: Control, type: String, key: String) -> void:
 	val.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	val.theme_type_variation = &"Green"
 	row.add_child(val)
-	_rack_bars["%s/%s" % [type, key]] = [bar, val]
+	_rack_bars[deck]["%s/%s" % [type, key]] = [bar, val]
 	bar.gui_input.connect(func(e: InputEvent) -> void:
 		if e is InputEventMouseButton and e.double_click:
-			_rack.set_param(type, key, spec[3])   # double-click restores the spec default
-			_refresh_rack_value(type, key)
+			rack.set_param(type, key, spec[3])   # double-click restores the spec default
+			_refresh_rack_value(deck, type, key)
 			_save_soon()
 			return
-		var w := _bar_wheel(e, inverse_lerp(spec[1], spec[2], _rack.fx[type][key]))
+		var w := _bar_wheel(e, inverse_lerp(spec[1], spec[2], rack.fx[type][key]))
 		if w >= 0.0:
-			_rack.set_param(type, key, lerpf(spec[1], spec[2], w))
-			_refresh_rack_value(type, key)
+			rack.set_param(type, key, lerpf(spec[1], spec[2], w))
+			_refresh_rack_value(deck, type, key)
 			_save_soon()
 			return
 		if not _bar_drag(e, bar):
 			return
-		_rack.set_param(type, key,
+		rack.set_param(type, key,
 			lerpf(spec[1], spec[2], _ratio_at(e.position.x, bar.size.x)))
-		_refresh_rack_value(type, key)
+		_refresh_rack_value(deck, type, key)
 		_save_soon())
-	_refresh_rack_value(type, key)
+	_refresh_rack_value(deck, type, key)
 
-func _refresh_rack_value(type: String, key: String) -> void:
-	var pair: Array = _rack_bars.get("%s/%s" % [type, key], [])
+func _refresh_rack_value(deck: int, type: String, key: String) -> void:
+	var pair: Array = (_rack_bars[deck] as Dictionary).get("%s/%s" % [type, key], [])
 	if pair.is_empty():
 		return
 	var spec: Array = FxRack._params(type)[key]
-	var v: float = _rack.fx[type][key]
+	var v: float = _rack_decks[deck].fx[type][key]
 	(pair[0] as ProgressBar).value = inverse_lerp(spec[1], spec[2], v) * 100.0
 	(pair[1] as Label).text = _rack_value_text(key, v, spec[2] > 1.0)
 
@@ -4569,12 +5087,13 @@ static func _rack_value_text(key: String, v: float, unit_ms := false) -> String:
 
 ## The four buttons. Presets store the WHOLE rack -- which modules are in it and every
 ## value they hold -- so recalling one is a single from_dict, not a per-module replay.
-func _rack_action(what: String) -> void:
+func _rack_action(deck: int, what: String) -> void:
+	var rack := _rack_decks[deck]
 	match what:
 		"add":
 			var free: Array[String] = []
 			for type in FxRack.MODULES:
-				if not _rack.active.get(type, false):
+				if not rack.active.get(type, false):
 					free.append(type)
 			if free.is_empty():
 				_note = "  //  EVERY MODULE IS ALREADY IN THE RACK"
@@ -4584,15 +5103,15 @@ func _rack_action(what: String) -> void:
 			for type in free:
 				labels.append(FxRack.module_name(type))
 			_rack_popup(labels, func(picked: String) -> void:
-				_rack.add_module(free[labels.find(picked)])
-				_refresh_rack()
+				rack.add_module(free[labels.find(picked)])
+				_refresh_rack(deck)
 				_save())
 		"clear":
 			# FxRack.clear() flips every slot's enable in one pass and leaves the effect
 			# COUNT untouched, which is the whole point of the pre-allocated rack: this
 			# empties the rack without the driver lock a remove_bus_effect would take.
-			_rack.clear()
-			_refresh_rack()
+			rack.clear()
+			_refresh_rack(deck)
 			_note = "  //  RACK CLEARED"
 			_clear_note_later()
 			_save()
@@ -4601,7 +5120,7 @@ func _rack_action(what: String) -> void:
 				func(name: String) -> void:
 					if name.is_empty():
 						return
-					_rack_presets[name] = _rack.to_dict()
+					_rack_presets[name] = rack.to_dict()
 					_note = "  //  SAVED RACK PRESET %s" % name
 					_clear_note_later()
 					_save())
@@ -4625,8 +5144,8 @@ func _rack_action(what: String) -> void:
 				_clear_note_later()
 				return
 			_rack_popup(names, func(picked: String) -> void:
-				_rack.from_dict(_rack_presets[picked])
-				_refresh_rack()
+				rack.from_dict(_rack_presets[picked])
+				_refresh_rack(deck)
 				_note = "  //  LOADED RACK PRESET %s" % picked
 				_clear_note_later()
 				_save())
@@ -4704,7 +5223,8 @@ static func _hz(hz: float) -> String:
 ## volume bar already use -- except the two that must not be able to disagree with the
 ## disk (a new playlist, a deleted file), which call _save() outright.
 func _setup_menus() -> void:
-	%Tracks.item_clicked.connect(_on_item_clicked)
+	for crate in 2:
+		([_tracks, _tracks_b][crate] as ItemList).item_clicked.connect(_on_item_clicked.bind(crate))
 	%Menu.id_pressed.connect(_on_menu_id)
 	%PlMenu.id_pressed.connect(_on_menu_id)
 	var shapes := PopupMenu.new()
@@ -4723,15 +5243,19 @@ func _setup_menus() -> void:
 	# RMB on the picker acts on the playlist it is showing. The picker IS the sidebar's
 	# playlist control, and PopupMenu gives no per-item right-click signal to hang this
 	# off inside the drop-down, so the button itself is where it goes.
-	%Playlist.gui_input.connect(func(e: InputEvent) -> void:
-		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_RIGHT:
-			_popup_playlist_menu())
-	%Playlist.item_selected.connect(func(i: int) -> void:
-		_playlist = "" if i == 0 else %Playlist.get_item_text(i)
-		_refill()
-		_write_in()
-		_cue_overlay.queue_redraw()   # playlist-scoped cues come and go with the scope
-		_save_soon())
+	for crate in 2:
+		var picker: OptionButton = [%Playlist, %PlaylistB][crate]
+		picker.gui_input.connect(func(e: InputEvent) -> void:
+			if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_RIGHT:
+				_menu_crate = crate
+				_popup_playlist_menu())
+		picker.item_selected.connect(func(i: int) -> void:
+			_crate_pl[crate] = "" if i == 0 else picker.get_item_text(i)
+			_refill(crate)
+			if crate == 0:
+				_write_in()   # the write-in is TRK A's
+			_cue_overlay.queue_redraw()   # playlist-scoped cues come and go with the scope
+			_save_soon())
 	# MARK MODE is deliberately not persisted. It changes what a click on the scrub bar
 	# does, and booting into a player whose scrub bar silently refuses to seek is a bug
 	# report, not a restored preference.
@@ -4780,13 +5304,15 @@ func _setup_cue_overlay() -> void:
 ## Rebuilt rather than patched: playlists are a handful of entries, and this runs on a
 ## config load or a playlist being created, not per frame.
 func _refresh_playlists() -> void:
-	%Playlist.clear()
-	%Playlist.add_item("ALL TRACKS")
-	for name in _playlists:
-		%Playlist.add_item(name)
-	# index 0 is ALL TRACKS, so a playlist sits one past its position in the dictionary
-	var at := _playlists.keys().find(_playlist)
-	%Playlist.selected = at + 1 if at >= 0 else 0
+	for crate in 2:
+		var picker: OptionButton = [%Playlist, %PlaylistB][crate]
+		picker.clear()
+		picker.add_item("ALL TRACKS")
+		for name in _playlists:
+			picker.add_item(name)
+		# index 0 is ALL TRACKS, so a playlist sits one past its position in the dictionary
+		var at := _playlists.keys().find(_crate_pl[crate])
+		picker.selected = at + 1 if at >= 0 else 0
 
 # --- context menu ----------------------------------------------------------
 ## Two open-ended ranges at the top, everything fixed below them: a playlist is
@@ -4809,7 +5335,6 @@ const MENU_CUE_HEX := 9
 const MENU_CUE_KEY := 10
 const MENU_PL_DELETE := 11
 const MENU_CUE_TS := 12
-const MENU_DECK_B := 13
 const MENU_DECK_A := 14
 const MENU_MAKE_PLAYLIST := 17   # was 14 -- MENU_DECK_A's id, so the folder item ran PLAY ON DECK A
 const MENU_PL_UP := 15
@@ -4818,12 +5343,14 @@ const MENU_PL_DOWN := 16
 ## RMB anywhere on a row. `item_clicked` hands back the row index, so there is no
 ## hit-testing to do and no gui_input handler to write; `allow_rmb_select` in the scene is
 ## what makes the row highlight under the cursor, so the menu visibly belongs to a track.
-func _on_item_clicked(row: int, _at: Vector2, button: int) -> void:
+func _on_item_clicked(row: int, _at: Vector2, button: int, crate: int) -> void:
 	if button != MOUSE_BUTTON_RIGHT:
 		return
-	if row < 0 or row >= _row_path.size() or _row_path[row] < 0:
+	var row_path: PackedInt32Array = _row_paths[crate]
+	if row < 0 or row >= row_path.size() or row_path[row] < 0:
 		return   # a FOLDER-mode header row is not a track
-	_popup_track_menu(_paths[_row_path[row]])
+	_menu_crate = crate   # REMOVE FROM / MOVE UP act on THIS list's playlist
+	_popup_track_menu(_paths[row_path[row]])
 
 func _popup_track_menu(path: String) -> void:
 	_menu_ctx = {"kind": "track", "path": path}
@@ -4837,16 +5364,14 @@ func _popup_track_menu(path: String) -> void:
 	%Menu.add_item("RENAME TAG", MENU_RENAME)
 	# offered only where it can do something, and it is the only way back out of a
 	# mis-click on ADD TO PLAYLIST
-	if not _playlist.is_empty() and path in _playlists.get(_playlist, []):
-		%Menu.add_item("REMOVE FROM %s" % _playlist, MENU_UNFILE)
+	var playlist: String = _crate_pl[_menu_crate]
+	if not playlist.is_empty() and path in _playlists.get(playlist, []):
+		%Menu.add_item("REMOVE FROM %s" % playlist, MENU_UNFILE)
 		# manual rearrangement: only meaningful while VIEWING the playlist the track is
 		# actually filed in, which not is_empty() + the membership check above both cover
 		%Menu.add_item("MOVE UP IN PLAYLIST", MENU_PL_UP)
 		%Menu.add_item("MOVE DOWN IN PLAYLIST", MENU_PL_DOWN)
-	# The two decks get one line each, in deck order, so the menu reads symmetrically
-	# with the DECK B tab's own PLAY button rather than only ever mentioning deck B.
 	%Menu.add_item("PLAY ON DECK A", MENU_DECK_A)
-	%Menu.add_item("ADD TO DECK B SETLIST", MENU_DECK_B)
 	%Menu.add_item("TRACK INFO", MENU_INFO)
 	%Menu.add_separator()
 	%Menu.add_item("DELETE FROM DISK", MENU_DELETE)
@@ -4898,9 +5423,9 @@ func _popup_cue_menu(cue: Dictionary) -> void:
 ## Which store this marker lives in. Read rather than remembered: the scope IS where the
 ## cue is, and a second copy of that fact in the cue record could disagree with it.
 func _cue_is_local(cue: Dictionary) -> bool:
-	if _playlist.is_empty():
+	if _crate_pl[_bar_deck()].is_empty():
 		return false
-	return cue in ((_pl_cues.get(_playlist, {}) as Dictionary).get(_current, []) as Array)
+	return cue in ((_pl_cues.get(_crate_pl[_bar_deck()], {}) as Dictionary).get(_bar_path(), []) as Array)
 
 ## A 12 px colour chip for a menu item. Cached per colour, because a menu rebuild would
 ## otherwise allocate a texture per swatch every time a marker is clicked.
@@ -4915,11 +5440,12 @@ func _swatch(c: Color) -> ImageTexture:
 ## RMB on the playlist picker. ALL TRACKS is not a playlist and has nothing to delete,
 ## so the menu simply does not open there.
 func _popup_playlist_menu() -> void:
-	if _playlist.is_empty():
+	var playlist: String = _crate_pl[_menu_crate]
+	if playlist.is_empty():
 		return
-	_menu_ctx = {"kind": "playlist", "playlist": _playlist}
+	_menu_ctx = {"kind": "playlist", "playlist": playlist}
 	%Menu.clear()
-	%Menu.add_item("DELETE PLAYLIST %s" % _playlist, MENU_PL_DELETE)
+	%Menu.add_item("DELETE PLAYLIST %s" % playlist, MENU_PL_DELETE)
 	_popup_at_mouse()
 
 ## Dropping a playlist also drops every cue that was scoped to it -- those cues exist
@@ -4928,8 +5454,9 @@ func _popup_playlist_menu() -> void:
 func _delete_playlist(name: String) -> void:
 	_playlists.erase(name)
 	_pl_cues.erase(name)
-	if _playlist == name:
-		_playlist = ""      # back to ALL TRACKS rather than a scope that no longer exists
+	for crate in 2:
+		if _crate_pl[crate] == name:
+			_crate_pl[crate] = ""   # back to ALL TRACKS rather than a scope that no longer exists
 	_refresh_playlists()
 	_refill()
 	_cue_overlay.queue_redraw()
@@ -4953,8 +5480,6 @@ func _on_menu_id(id: int) -> void:
 		_set_cue_color(cue, (_viz.PRESETS[id - COLOR_FIRST] as Color).to_html(false))
 	elif id >= PL_FIRST:
 		_file_track(_playlists.keys()[id - PL_FIRST], path)
-	elif id == MENU_DECK_B:
-		_add_to_setlist(path)
 	elif id == MENU_DECK_A:
 		_play_on_deck_a(path)
 	elif id == MENU_NEW_PL:
@@ -4975,14 +5500,14 @@ func _on_menu_id(id: int) -> void:
 			_reindex()   # the row text and the search haystack are both built there
 			_save_soon())
 	elif id == MENU_UNFILE:
-		(_playlists[_playlist] as Array).erase(path)
+		(_playlists[_crate_pl[_menu_crate]] as Array).erase(path)
 		_refill()
 		_save_soon()
 	elif id == MENU_PL_UP or id == MENU_PL_DOWN:
 		var order: Array[String] = []
-		order.assign(_playlists.get(_playlist, []))
+		order.assign(_playlists.get(_crate_pl[_menu_crate], []))
 		setlist_move(order, order.find(path), -1 if id == MENU_PL_UP else 1)
-		_playlists[_playlist] = order
+		_playlists[_crate_pl[_menu_crate]] = order
 		_refill()
 		_save_soon()
 	elif id == MENU_MAKE_PLAYLIST:
@@ -4997,7 +5522,9 @@ func _on_menu_id(id: int) -> void:
 				if p.get_base_dir() == folder:
 					tracks.append(p)
 			_playlists[name] = tracks
-			_playlist = name   # set before _refresh_playlists so it selects the new one
+			# opened in the driven deck's crate (DIRS belongs to neither list), set before
+			# _refresh_playlists so that picker selects the new one
+			_crate_pl[_engine.deck] = name
 			_refresh_playlists()
 			_refill()
 			_write_in()
@@ -5146,8 +5673,8 @@ const CUE_GRAB := 5.0
 ## two, which is what makes the scope menu a move rather than a copy.
 func _cues_for(path: String) -> Array:
 	var out: Array = (_cues.get(path, []) as Array).duplicate()
-	if not _playlist.is_empty():
-		out.append_array((_pl_cues.get(_playlist, {}) as Dictionary).get(path, []))
+	if not _crate_pl[_bar_deck()].is_empty():
+		out.append_array((_pl_cues.get(_crate_pl[_bar_deck()], {}) as Dictionary).get(path, []))
 	return out
 
 static func cue_x(t: float, length: float, w: float) -> float:
@@ -5236,11 +5763,11 @@ const CUE_TAB := Vector2(9.0, 6.0)
 ## where the bar does and runs to the bottom.
 func _draw_cues() -> void:
 	var length := _len()
-	if _current.is_empty() or length <= 0.0:
+	if _bar_path().is_empty() or length <= 0.0:
 		return
 	var w := _cue_overlay.size.x
 	var top := CUE_TAB.y
-	for c in _cues_for(_current):
+	for c in _cues_for(_bar_path()):
 		var col := Color(str(c["color"]))
 		var x := cue_x(float(c["time"]), length, w)
 		_cue_overlay.draw_rect(Rect2(x - 1.0, top, 2.0, _cue_overlay.size.y - top), col)
@@ -5265,11 +5792,11 @@ func _draw_cues() -> void:
 ## actually lives in.
 func _cue_at(x: float) -> Dictionary:
 	var length := _len()
-	if _current.is_empty() or length <= 0.0:
+	if _bar_path().is_empty() or length <= 0.0:
 		return {}
 	var best := {}
 	var best_dx := CUE_GRAB
-	for c in _cues_for(_current):
+	for c in _cues_for(_bar_path()):
 		var dx: float = absf(cue_x(float(c["time"]), length, _cue_overlay.size.x) - x)
 		if dx <= best_dx:
 			best_dx = dx
@@ -5333,7 +5860,7 @@ func _drag_cue_step() -> void:
 			# this one within it of another simply refuses the move; the marker holds at
 			# its last valid position rather than stacking on top of its neighbour
 			var dragged_id := int(_drag_cue.get("id", -1))
-			var others := _cues_for(_current).filter(
+			var others := _cues_for(_bar_path()).filter(
 				func(c: Dictionary) -> bool: return int(c.get("id", -2)) != dragged_id)
 			if not cue_too_close(others, t, MIN_CUE_GAP_SEC):
 				_drag_cue["time"] = t
@@ -5376,7 +5903,7 @@ static func cue_too_close(cues: Array, t: float, min_gap: float) -> bool:
 	return false
 
 func _add_cue(at: float) -> void:
-	if _current.is_empty() or _len() <= 0.0:
+	if _bar_path().is_empty() or _len() <= 0.0:
 		_note = "  //  NOTHING PLAYING TO MARK"
 		_clear_note_later()
 		return
@@ -5389,23 +5916,23 @@ func _add_cue(at: float) -> void:
 		_clear_note_later()
 		return
 	var t := clampf(at, 0.0, _len())
-	if cue_too_close(_cues_for(_current), t, MIN_CUE_GAP_SEC):
+	if cue_too_close(_cues_for(_bar_path()), t, MIN_CUE_GAP_SEC):
 		_note = "  //  TOO CLOSE TO AN EXISTING MARKER"
 		_clear_note_later()
 		return
-	var store := _cue_store(not _playlist.is_empty())
-	var list: Array = store.get(_current, [])
+	var store := _cue_store(not _crate_pl[_bar_deck()].is_empty())
+	var list: Array = store.get(_bar_path(), [])
 	var cue := {
-		"id": next_cue_id(_cues_for(_current)),
+		"id": next_cue_id(_cues_for(_bar_path())),
 		"time": clampf(at, 0.0, _len()),
 		"shape": "square",
-		"label": "CUE %d" % (_cues_for(_current).size() + 1),
+		"label": "CUE %d" % (_cues_for(_bar_path()).size() + 1),
 		# the skin accent, captured at creation: markers read against every scheme, and a
 		# cue keeps the colour it was born with even after the skin changes
 		"color": theme.get_color("font_color", "Green").to_html(false),
 	}
 	list.append(cue)
-	store[_current] = list
+	store[_bar_path()] = list
 	_note = "  //  %s @ %s" % [cue["label"], _time_text(float(cue["time"]))]
 	_clear_note_later()
 	_cue_overlay.queue_redraw()
@@ -5417,21 +5944,21 @@ func _add_cue(at: float) -> void:
 func _cue_store(playlist_scope: bool) -> Dictionary:
 	if not playlist_scope:
 		return _cues
-	if not _pl_cues.has(_playlist):
-		_pl_cues[_playlist] = {}
-	return _pl_cues[_playlist]
+	if not _pl_cues.has(_crate_pl[_bar_deck()]):
+		_pl_cues[_crate_pl[_bar_deck()]] = {}
+	return _pl_cues[_crate_pl[_bar_deck()]]
 
 func _move_cue(cue: Dictionary, to_playlist: bool) -> void:
-	if to_playlist and _playlist.is_empty():
+	if to_playlist and _crate_pl[_bar_deck()].is_empty():
 		_note = "  //  NO PLAYLIST SELECTED"
 		_clear_note_later()
 		return
 	_pull_cue(cue)
 	var store := _cue_store(to_playlist)
-	var list: Array = store.get(_current, [])
+	var list: Array = store.get(_bar_path(), [])
 	list.append(cue)
-	store[_current] = list
-	_note = "  //  %s -> %s" % [cue["label"], _playlist if to_playlist else "ALL TRACKS"]
+	store[_bar_path()] = list
+	_note = "  //  %s -> %s" % [cue["label"], _crate_pl[_bar_deck()] if to_playlist else "ALL TRACKS"]
 	_clear_note_later()
 	_cue_overlay.queue_redraw()
 	_save_soon()
@@ -5497,7 +6024,7 @@ func _set_cue_key(cue: Dictionary, raw: String) -> void:
 		_note = "  //  KEYBIND RESERVED BY SYSTEM"
 		_clear_note_later()
 		return
-	var clash := key_conflict(_cues_for(_current), cue, k) if not k.is_empty() else {}
+	var clash := key_conflict(_cues_for(_bar_path()), cue, k) if not k.is_empty() else {}
 	if not clash.is_empty():
 		# full precision here whatever SHOW MS says: this names a specific marker, and
 		# two markers a fifth of a second apart must not read as the same one
@@ -5516,7 +6043,7 @@ func _set_cue_key(cue: Dictionary, raw: String) -> void:
 ## The jump itself. Seeks only -- it is meant to be used while a track is playing, and a
 ## key that also started playback would turn a mis-hit into a surprise.
 func _jump_to_key(k: String) -> bool:
-	for c in _cues_for(_current):
+	for c in _cues_for(_bar_path()):
 		if str(c.get("key", "")) == k:
 			_seek(float(c["time"]))
 			_note = "  //  JUMP %s @ %s" % [c["label"], _time_text(float(c["time"]))]
@@ -5538,21 +6065,21 @@ func _delete_cue(cue: Dictionary) -> void:
 ## ever held a cue keeps a `path: []` entry in library.cfg forever, and the file grows
 ## with tracks that have nothing to say.
 func _pull_cue(cue: Dictionary) -> void:
-	(_cues.get(_current, []) as Array).erase(cue)
-	if (_cues.get(_current, []) as Array).is_empty():
-		_cues.erase(_current)
+	(_cues.get(_bar_path(), []) as Array).erase(cue)
+	if (_cues.get(_bar_path(), []) as Array).is_empty():
+		_cues.erase(_bar_path())
 	for name in _pl_cues:
 		var d := _pl_cues[name] as Dictionary
-		(d.get(_current, []) as Array).erase(cue)
-		if (d.get(_current, []) as Array).is_empty():
-			d.erase(_current)
+		(d.get(_bar_path(), []) as Array).erase(cue)
+		if (d.get(_bar_path(), []) as Array).is_empty():
+			d.erase(_bar_path())
 
 ## A 500 ms taste of a cue: seek, play, pause. The generation counter is what keeps a
 ## second audition from being cut short by the first one's timer -- shift-clicking along
 ## a row of markers is the normal way to use this, and without it every preview after the
 ## first would be truncated by whatever was already counting down.
 func _audition(cue: Dictionary) -> void:
-	if not _audio.stream and not _vid():
+	if not _bar().stream and not _vid():
 		return
 	_audition_gen += 1
 	var gen := _audition_gen
@@ -5598,7 +6125,9 @@ func _setup_decks() -> void:
 ## crossfader belong.
 func _setup_deck_ui() -> void:
 	_deck_btn = Button.new()
-	_deck_btn.pressed.connect(_toggle_both)
+	# A <-> B only. A+B is its own keybind (TAB), never a stop on this button's cycle:
+	# _select_deck leaves A+B first, so a click from A+B lands on a single deck too
+	_deck_btn.pressed.connect(func() -> void: _select_deck(1 - _engine.deck))
 	%ControlDeck.add_child(_deck_btn)
 	_rev_btn = Button.new()
 	_rev_btn.pressed.connect(_toggle_reverse)
@@ -5651,6 +6180,14 @@ func _setup_deck_ui() -> void:
 	%ControlDeck.move_child(_sync_btn, 2)
 	_hover_note(_sync_btn, _sync_readout)
 	_refresh_sync_btn()
+	# DUAL DECK MODE from the transport: bracketed while on, the same way the deck button
+	# brackets whatever is live. A layout switch only -- which decks are heard stays A+B's job.
+	_split_btn = Button.new()
+	_split_btn.pressed.connect(func() -> void: _set_dual_deck(not _dual_deck))
+	%ControlDeck.add_child(_split_btn)
+	%ControlDeck.move_child(_split_btn, 1)
+	_hover_note(_split_btn, func() -> String:
+		return "DUAL DECK MODE %s  //  DECK A TRACKS | FEED | DECK B" % ("ON" if _dual_deck else "OFF"))
 	_hover_note(_xfade, func() -> String:
 		return "CROSSFADER: %s  //  %s %+.1f DB  //  %s %+.1f DB" % [
 			("A" if _crossfader < 0.02 else ("B" if _crossfader > 0.98 else "%d%%" % int(_crossfader * 100.0))),
@@ -5667,7 +6204,8 @@ func _set_crossfader(x: float) -> void:
 ## TWO states, not three. The old A -> B -> A+B -> A cycle meant the same button did
 ## "change deck" and "stop muting the other one" depending on where in the rotation you
 ## happened to be, so you could not tell what a press would do without remembering the
-## last one. Now [1] and [2] pick a deck outright and this only ever toggles combined.
+## last one. Now [1] and [2] pick a deck outright and this only ever toggles combined. It is
+## reached from the DECK A+B keybind alone; the transport's deck button only flips A <-> B.
 func _toggle_both() -> void:
 	if _engine.both:
 		_engine.set_both(false)
@@ -5722,6 +6260,12 @@ func _toggle_reverse() -> void:
 	_note = "  //  REVERSING %s ..." % _current.get_file()
 	_engine.request_reversed(_current)
 
+## Where a finished reverse render leaves the deck, as [play, paused, from]. Read when the take
+## LANDS, so the transport the user left is the one it gets: stopped stays stopped with the
+## reversed take loaded, paused stays paused at the mirrored position, playing carries on there.
+static func rev_landing(state: String, at: float, full: float, rev_len: float) -> Array:
+	return [state != "STOPPED", state == "PAUSED", clampf(full - at, 0.0, maxf(rev_len, 0.0))]
+
 func _refresh_rev_btn() -> void:
 	if is_instance_valid(_rev_btn):
 		_rev_btn.text = "[*] REV" if _reversed else "REV"
@@ -5751,7 +6295,7 @@ var _sync_btn: Button
 func _set_beat_sync(on: bool) -> void:
 	_beat_sync = on
 	for i in _deck_directors.size():
-		_deck_directors[i].set_tracking(on)
+		_deck_directors[i].set_tracking(on, on or _dual_visual)   # DUAL VISUAL reads their bands
 		_sync_attach(i)
 	_refresh_sync_btn()
 
@@ -5819,15 +6363,11 @@ func _bind_deck(which: int) -> void:
 	_audio = _deck_live[which] if _deck_live[which] else _a
 	_current = _deck_cur[which]
 	_eq = _eq_decks[which] if _eq_decks.size() > which else _eq
-	if _rack_decks.size() > which:
-		_rack = _rack_decks[which]
-		if is_instance_valid(_rack_box):
-			_refresh_rack()   # the FX tab belongs to whichever deck is live
 	if _eq:
 		# DRIVE is a global colour control rather than a channel strip, so it follows you
 		# onto whichever deck you are driving
 		_eq.set_boost(_boost_gain())
-	_director.attach(_audio)
+	_director.attach(_bar())   # the bar's player, not _audio: an empty deck would blank it
 	_refresh_deck_ui()
 	if not _current.is_empty():
 		_key = _resolved_key(_current)
@@ -5835,7 +6375,9 @@ func _bind_deck(which: int) -> void:
 	if is_instance_valid(_cue_overlay):
 		_cue_overlay.queue_redraw()
 	if not _index.is_empty():
-		_refill()        # selection and queue anchor follow the deck's own track
+		# the queue becomes this deck's crate view; neither list needs rebuilding for that
+		_engine.set_queue(_shown[which], _current)
+		_mark_decks()
 
 # --- runtime assets: fonts, cursors, and the write-in ------------------------
 ## Fonts and cursors are read from beside library.cfg rather than compiled in, so a
@@ -6769,7 +7311,8 @@ func _unlock(what: String) -> void:
 	_save()
 
 func _apply_unlocks() -> void:
-	_viz.snake_unlocked = "snake" in _unlocked
+	%Viz.snake_unlocked = "snake" in _unlocked
+	%VizB.snake_unlocked = %Viz.snake_unlocked
 
 ## SNAKE sits one past the end of the normal cycle until it is unlocked, so the VIZ MODE
 ## button cannot land on it by accident.
@@ -6875,83 +7418,14 @@ static func license_test() -> bool:
 		and sig != license_sig("someone|snake")
 
 
-# --- TRACKS B: deck B's setlist -------------------------------------------------
-## Deck B gets a SETLIST, not a second library browser. The TRACKS tab already owns
-## scanning, sorting, searching and playlists; forking all of that would be two of
-## everything to keep in step forever. This is a curated running order you push tracks
-## into from the TRACKS right-click menu, which is what a second deck is actually for.
-##
-## Stored as PATHS, so it survives a rescan and a re-sort -- the same reason
-## AudioEngine.set_queue re-anchors on a path rather than on an integer index.
-##
-## It is a plain child of %Tabs, which is all a tab is here, so tear-off and re-dock work
-## through _tab_home_indices with nothing added: the slot registry is keyed by the panel
-## Control and does not care that this one was built in code.
+# --- playlist reordering, and deck A from the track menu ------------------------------
+## DECK B's setlist tab is gone: TRK B is deck B's list now. `setlist_b` is still loaded and
+## saved untouched -- the same courtesy the old TBS list gets -- so a running order someone
+## built survives in library.cfg rather than being erased by the next save.
 var _setlist_b: Array[String] = []
-var _setlist_ui: ItemList
-var _setlist_count: Label
-
-func _setup_setlist_b() -> void:
-	var col := VBoxContainer.new()
-	col.name = "TRACKS B"          # TabContainer takes the tab title from the node name
-	col.add_theme_constant_override("separation", 4)
-	_tabs.add_child(col)
-
-	var row := HFlowContainer.new()   # same wrapping reason as the FX header row
-	row.add_theme_constant_override("h_separation", 4)
-	row.add_theme_constant_override("v_separation", 4)
-	col.add_child(row)
-	for spec in [["PLAY", "play"], ["UP", "up"], ["DOWN", "down"],
-			["REMOVE", "remove"], ["CLEAR", "clear"]]:
-		var b := Button.new()
-		b.text = spec[0]
-		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		var what: String = spec[1]
-		b.pressed.connect(func() -> void: _setlist_action(what))
-		row.add_child(b)
-
-	_setlist_ui = ItemList.new()
-	_setlist_ui.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_setlist_ui.allow_reselect = true
-	_setlist_ui.item_activated.connect(_play_setlist)
-	col.add_child(_setlist_ui)
-
-	_setlist_count = Label.new()
-	col.add_child(_setlist_count)
-	_hover_note(_setlist_ui, func() -> String:
-		return "DECK B SETLIST  //  DOUBLE-CLICK PLAYS ON DECK B  //  ADD FROM TRACKS RMB")
-	var legend := Label.new()
-	legend.text = "DECK A PLAYS THE TRACKS TAB  //  DECK B PLAYS THIS LIST"
-	col.add_child(legend)
-	_refresh_setlist()
-
-func _refresh_setlist() -> void:
-	if not is_instance_valid(_setlist_ui):
-		return
-	var keep := _setlist_ui.get_selected_items()
-	_setlist_ui.clear()
-	for i in _setlist_b.size():
-		var p: String = _setlist_b[i]
-		var m := _engine.cached_meta(p)
-		# cached_meta NEVER probes -- an ffprobe spawn per row would turn building this
-		# list into a multi-second stall, exactly as it would in the TRACKS tab
-		var who: String = str(m.get("artist", ""))
-		var title: String = str(m.get("title", "")) if m.has("title") else p.get_file().get_basename()
-		_setlist_ui.add_item("%02d  %s" % [i + 1,
-			"%s - %s" % [who, title] if not who.is_empty() else title])
-	for k in keep:
-		if k < _setlist_ui.item_count:
-			_setlist_ui.select(k)
-	_setlist_count.text = "%d TRACK%s" % [_setlist_b.size(), "" if _setlist_b.size() == 1 else "S"]
-
-func _setlist_sel() -> int:
-	if not is_instance_valid(_setlist_ui):
-		return -1
-	var sel := _setlist_ui.get_selected_items()
-	return sel[0] if sel.size() > 0 else -1
 
 ## Pure, so the reorder rules are checkable without a list widget. Returns the new index
-## of the moved row, or the original when the move is not legal.
+## of the moved row, or the original when the move is not legal. MOVE UP/DOWN IN PLAYLIST.
 static func setlist_move(list: Array[String], from: int, delta: int) -> int:
 	if from < 0 or from >= list.size():
 		return from
@@ -6975,64 +7449,11 @@ static func setlist_test() -> bool:
 		return false
 	return setlist_move(l, 2, -1) == 1 and l == ["b", "c", "a"]
 
-func _setlist_action(what: String) -> void:
-	var i := _setlist_sel()
-	match what:
-		"play":
-			_play_setlist(i)
-			return
-		"up", "down":
-			var to := setlist_move(_setlist_b, i, -1 if what == "up" else 1)
-			_refresh_setlist()
-			if to >= 0 and to < _setlist_ui.item_count:
-				_setlist_ui.select(to)
-		"remove":
-			if i < 0 or i >= _setlist_b.size():
-				return
-			_setlist_b.remove_at(i)
-			_refresh_setlist()
-		"clear":
-			_setlist_b.clear()
-			_refresh_setlist()
-	_save()
-
-func _add_to_setlist(path: String) -> void:
-	if path.is_empty() or path in _setlist_b:
-		_note = "  //  ALREADY IN DECK B SETLIST"
-		_clear_note_later()
-		return
-	_setlist_b.append(path)
-	_refresh_setlist()
-	_note = "  //  ADDED TO DECK B: %s" % path.get_file()
-	_clear_note_later()
-	_save()
-
-## Loads into deck B whatever deck is currently selected -- this list belongs to B, and
-## having it hijack deck A because that happened to be live would be the surprise.
-##
-## The switch comes FIRST: _bind_deck re-runs _refill(), which hands the visible library
-## list to the engine as the queue, so setting the setlist before switching would have it
-## overwritten a moment later.
-## The TRACKS tab's deck-A counterpart to the setlist's PLAY. Explicit rather than
-## implied: double-clicking a row plays it on whatever deck happens to be current, and
-## after a spell on deck B that is not the deck you meant.
+## PLAY ON DECK A from the track menu: switches to deck A and plays there.
 func _play_on_deck_a(path: String) -> void:
-	var qi := _engine.queue.find(path)
-	if qi < 0:
-		_note = "  //  NOT IN THE CURRENT VIEW"
-		_clear_note_later()
-		return
 	if _engine.both:
 		_engine.set_both(false)
 	if _engine.deck != 0:
 		_switch_deck(0)
 	_refresh_deck_ui()
-	_open(qi)
-
-func _play_setlist(i: int) -> void:
-	if i < 0 or i >= _setlist_b.size():
-		return
-	if _engine.deck != 1:
-		_switch_deck(1)
-	_engine.set_queue(_setlist_b, "")
-	_open(i)
+	_open_deck(0, path)   # after the switch: the queue is crate A's view by then

@@ -8,6 +8,11 @@ extends SceneTree
 ##   3. through AudioEngine.decode: an SsFlacStream comes back and no pcm_* transcode appears
 ##   4. on a real AudioStreamPlayer (muted bus): it sounds, the position advances, a seek
 ##      lands, and finished fires at the end of the file
+##   5. the native resampler, through the real _mix path (SsFlacStream.render): a 24-bit 44.1 kHz
+##      FLAC of 1 kHz left / 18 kHz right comes out at 96 kHz with EXACTLY 96000 frames per second
+##      of source (no drift), both tones within 0.001 dB of their level (flat to 18 kHz), THD+N below
+##      -110 dB on each, and a seek to 1.0 s landing on exactly the samples a continuous render gives
+##   6. at the mix rate already, render is a straight copy: bit-identical to decode_frames
 ## Files live in user://flac_test and are removed.
 ##   godot --headless --path . --script res://test_flac_native.gd
 
@@ -120,6 +125,42 @@ func _initialize() -> void:
 	await process_frame
 	AudioServer.remove_bus(bus)
 
+	# 5. the resampler: 44.1 kHz to 96 kHz
+	var cd := base.path_join("tones_44k.flac")
+	OS.execute("ffmpeg", ["-v", "error", "-y", "-f", "lavfi", "-i",
+		"aevalsrc=0.5*sin(2*PI*1000*t)|0.5*sin(2*PI*18000*t):s=44100:d=3",
+		"-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24", cd], [], true)
+	var up: AudioStream = _load(cd)
+	var rs_ok := false
+	if up:
+		var full: PackedFloat32Array = up.call("render", 96000, 0.0, 96000 * 4)
+		var l := _fit(full, 0, 1000.0, 96000, 48000, 192000)
+		var r := _fit(full, 1, 18000.0, 96000, 48000, 192000)
+		var part: PackedFloat32Array = up.call("render", 96000, 1.0, 48000)
+		var seek_exact := part.size() == 96000
+		for i in part.size():
+			if part[i] != full[192000 + i]:
+				seek_exact = false
+				break
+		var db_l := 20.0 * log(l[0] / 0.5) / log(10.0)
+		var db_r := 20.0 * log(r[0] / 0.5) / log(10.0)
+		rs_ok = full.size() == 3 * 96000 * 2 and absf(db_l) < 0.001 and absf(db_r) < 0.001 \
+			and l[1] < -110.0 and r[1] < -110.0 and seek_exact
+		print("5. 44.1 kHz -> 96 kHz: %d frames (want %d); 1 kHz %+.5f dB THD+N %.1f dB | 18 kHz %+.5f dB THD+N %.1f dB; seek to 1.0 s sample-exact %s: %s" % [
+			full.size() / 2, 3 * 96000, db_l, l[1], db_r, r[1], seek_exact, rs_ok])
+	ok = ok and rs_ok
+
+	# 6. equal rates: a copy, bit for bit
+	var copy: PackedFloat32Array = stream.call("render", RATE, 0.0, frames)
+	var same := copy.size() == mine.size()
+	for i in mini(copy.size(), mine.size()):
+		if copy[i] != mine[i]:
+			same = false
+			break
+	ok = ok and same
+	print("6. 96 kHz at a 96 kHz mix renders bit-identical to decode_frames (%d samples): %s" % [copy.size(), same])
+
+	DirAccess.remove_absolute(cd)
 	DirAccess.remove_absolute(flac)
 	DirAccess.remove_absolute(raw)
 	DirAccess.remove_absolute(base)
@@ -129,6 +170,29 @@ func _initialize() -> void:
 func _load(path: String) -> AudioStream:
 	var s: AudioStream = ClassDB.instantiate("SsFlacStream")
 	return s if int(s.call("load", path)) == OK else null
+
+## Least-squares amplitude of `hz` on channel `ch` of interleaved stereo at `rate`, over a window of
+## whole cycles, and the THD+N (dB) of what is left once that tone and DC are removed.
+static func _fit(x: PackedFloat32Array, ch: int, hz: float, rate: int, from: int, n: int) -> Array:
+	var ss := 0.0
+	var sc := 0.0
+	var sd := 0.0
+	for i in n:
+		var v: float = x[(from + i) * 2 + ch]
+		var ph := TAU * hz * float(from + i) / rate
+		ss += v * sin(ph)
+		sc += v * cos(ph)
+		sd += v
+	var a := 2.0 * ss / n
+	var b := 2.0 * sc / n
+	var c := sd / n
+	var res := 0.0
+	for i in n:
+		var ph := TAU * hz * float(from + i) / rate
+		var e: float = x[(from + i) * 2 + ch] - a * sin(ph) - b * cos(ph) - c
+		res += e * e
+	var amp := sqrt(a * a + b * b)
+	return [amp, 10.0 * log(res / n / maxf(amp * amp * 0.5, 1e-30)) / log(10.0)]
 
 func _pcm_files() -> int:
 	var n := 0

@@ -12,6 +12,17 @@ extends SceneTree
 ##   4. the RT contract's preconditions hold: the rings are lock-free, the callback
 ##      ran on real audio, and it never saw a null buffer
 ##
+## And LISTENING MODE's native curve, SsCasualCurve (ss_casual.h):
+##   7. AudioEngine puts it on Master directly ahead of the safety limiter, switched out; CASUAL
+##      switches it in and reports its latency, AUDIOPHILE switches it back out, and MONO still
+##      toggles the fold it always did though every slot after the curve moved one along
+##   8. switched out (AUDIOPHILE), the output is the input BIT-IDENTICAL
+##   9. switched in (CASUAL), an impulse comes out PHASE-LINEAR: its response peaks exactly the
+##      reported latency after it starts and is symmetric about that peak, the other channel stays
+##      silent, and the response is the warm curve asked for, to 0.01 dB of its design -- +2.2 dB of body
+##      (+2.12 at 30 Hz, half of it at 120 Hz), a -0.8 dB bell at 3 kHz (half depth at 2 kHz), flat again
+##      by 8.5 kHz, -0.72 at 12.25 kHz and -1.50 from 16 kHz up
+##
 ##   godot --headless --path . --script res://test_ss_effect.gd
 ##
 ## Exit codes are three-way on purpose, so CI can tell "not built yet" from "broken":
@@ -117,8 +128,7 @@ func _initialize() -> void:
 	var guard := 0
 	while pushed < TEST_FRAMES and guard < 600:
 		var room: int = mini(pb.get_frames_available(), TEST_FRAMES - pushed)
-		for i in room:
-			pb.push_frame(sent[pushed + i])
+		pb.push_buffer(sent.slice(pushed, pushed + room))   # one call: see _through
 		pushed += room
 		await process_frame
 		guard += 1
@@ -221,6 +231,8 @@ func _initialize() -> void:
 	player.free()
 	AudioServer.remove_bus(bus_idx)
 
+	ok = await _casual_curve() and ok
+
 	print("RESULT ", "PASS" if ok else "FAIL")
 	quit(0 if ok else 1)
 
@@ -231,3 +243,165 @@ func _band_energy(spectrum: AudioEffectSpectrumAnalyzerInstance) -> float:
 		var hi: float = 30.0 * pow(16000.0 / 30.0, float(i + 1) / AudioDirector.BAND_COUNT)
 		total += spectrum.get_magnitude_for_frequency_range(lo, hi).length()
 	return total
+
+const CASUAL_BUS := "CasualVerify"
+const IR_FRAMES := 4096
+
+## [hz, expected dB, tolerance dB] at a 96 kHz mix, from the design in ss_casual.cpp computed in
+## double: four boxcars of 255 frames, then one 193-tap FIR (a 145-tap bell convolved with a 49-tap
+## Kaiser rolloff).
+const CASUAL_RESPONSE := [[30.0, 2.117, 0.01], [120.0, 1.167, 0.01], [1000.0, -0.047, 0.01],
+	[2000.0, -0.389, 0.01], [3000.0, -0.800, 0.01], [8500.0, 0.001, 0.01], [12250.0, -0.717, 0.01],
+	[16000.0, -1.500, 0.01], [40000.0, -1.500, 0.01]]
+
+func _casual_curve() -> bool:
+	if not ClassDB.class_exists("SsCasualCurve"):
+		print("7-9. SsCasualCurve is not registered: LISTENING MODE CASUAL has no curve")
+		return false
+	var ok := true
+
+	# ---- 7. placement on Master ----------------------------------------------------
+	var engine := AudioEngine.new()
+	root.add_child(engine)
+	await process_frame
+	var m := AudioServer.get_bus_index("Master")
+	var at := engine.curve_slot()
+	var placed: bool = at >= 0 and AudioServer.get_bus_effect(m, at).is_class("SsCasualCurve") \
+		and AudioServer.get_bus_effect(m, at + 1) is AudioEffectHardLimiter and not AudioServer.is_bus_effect_enabled(m, at)
+	engine.set_listening_mode(AudioEngine.ListeningMode.CASUAL)
+	var latency_ms := engine.curve_latency_ms()
+	var casual: bool = AudioServer.is_bus_effect_enabled(m, at) and latency_ms > 6.0 and latency_ms < 6.6
+	engine.set_listening_mode(AudioEngine.ListeningMode.AUDIOPHILE)
+	var direct: bool = not AudioServer.is_bus_effect_enabled(m, at) and engine.curve_latency_ms() == 0.0
+	var fold := int(engine.get("_mono_effect_idx"))
+	engine.set_mono(true)
+	var mono: bool = AudioServer.get_bus_effect(m, fold) is AudioEffectStereoEnhance and AudioServer.is_bus_effect_enabled(m, fold) \
+		and not AudioServer.is_bus_effect_enabled(m, at)
+	engine.set_mono(false)
+	var placement := placed and casual and direct and mono
+	ok = ok and placement
+	print("7. Master slot %d ahead of the limiter, out %s; CASUAL in, %.2f ms late %s; AUDIOPHILE out %s; MONO still the fold %s: %s" % [
+		at, placed, latency_ms, casual, direct, mono, placement])
+
+	# ---- a bus of its own: the curve, then a capture ----------------------------------
+	var bus := AudioServer.bus_count
+	AudioServer.add_bus(bus)
+	AudioServer.set_bus_name(bus, CASUAL_BUS)
+	AudioServer.set_bus_send(bus, "Master")
+	AudioServer.set_bus_mute(bus, true)
+	var curve: AudioEffect = ClassDB.instantiate("SsCasualCurve")
+	AudioServer.add_bus_effect(bus, curve, 0)
+	var capture := AudioEffectCapture.new()
+	capture.buffer_length = 2.0
+	AudioServer.add_bus_effect(bus, capture, 1)
+	var gen := AudioStreamGenerator.new()
+	gen.mix_rate = AudioServer.get_mix_rate()
+	gen.buffer_length = 0.5
+	var src := AudioStreamPlayer.new()
+	src.stream = gen
+	src.bus = CASUAL_BUS
+	root.add_child(src)
+	await process_frame
+	src.play()
+	await process_frame
+	var pb: AudioStreamGeneratorPlayback = src.get_stream_playback()
+
+	# ---- 8. AUDIOPHILE: switched out, bit-identical -----------------------------------
+	AudioServer.set_bus_effect_enabled(bus, 0, false)
+	var sent := PackedVector2Array()
+	sent.resize(TEST_FRAMES)
+	for i in TEST_FRAMES:
+		sent[i] = Vector2(sin(float(i) * 0.0213) * 0.6137 + 0.011, cos(float(i) * 0.1731) * 0.4391 - 0.017)
+	var got := await _through(pb, capture, sent)
+	var off := -1
+	for start in maxi(got.size() - 64, 0):
+		var hit := true
+		for i in 64:
+			if got[start + i] != sent[i]:
+				hit = false
+				break
+		if hit:
+			off = start
+			break
+	var exact := off >= 0 and got.size() - off >= TEST_FRAMES
+	var mismatches := 0
+	for i in TEST_FRAMES if exact else 0:
+		mismatches += 0 if got[off + i] == sent[i] else 1
+	exact = exact and mismatches == 0
+	ok = ok and exact
+	print("8. AUDIOPHILE: curve switched out, %d frames bit-identical to the input: %s (captured %d, aligned at %d, %d mismatches)" % [
+		TEST_FRAMES, exact, got.size(), off, mismatches])
+
+	# ---- 9. CASUAL: an impulse through the curve --------------------------------------
+	curve.call("reset")
+	AudioServer.set_bus_effect_enabled(bus, 0, true)
+	for _f in 10:
+		await process_frame
+	var impulse := PackedVector2Array()
+	impulse.resize(IR_FRAMES)
+	impulse[0] = Vector2(0.5, 0.0)   # left only
+	got = await _through(pb, capture, impulse)
+	var lat := int(curve.call("get_latency_frames"))
+	var first := -1
+	for i in got.size():
+		if got[i].x != 0.0:
+			first = i
+			break
+	var peak := first
+	for i in range(maxi(first, 0), mini(first + 2 * lat + 1, got.size())):
+		if absf(got[i].x) > absf(got[peak].x):
+			peak = i
+	var whole: bool = first >= 0 and first + 2 * lat < got.size()
+	var worst_sym := INF
+	var right_silent := whole
+	var gains := []
+	var shaped := whole
+	if whole:
+		worst_sym = 0.0
+		for j in lat + 1:
+			worst_sym = maxf(worst_sym, absf(got[first + lat - j].x - got[first + lat + j].x))
+		for i in range(first, first + 2 * lat + 1):
+			right_silent = right_silent and got[i].y == 0.0
+		for probe in CASUAL_RESPONSE:
+			var w: float = TAU * probe[0] / AudioServer.get_mix_rate()
+			var re := 0.0
+			var im := 0.0
+			for n in 2 * lat + 1:
+				re += got[first + n].x * cos(w * n)
+				im += got[first + n].x * sin(w * n)
+			var db := 20.0 * log(sqrt(re * re + im * im) / 0.5) / log(10.0)
+			gains.append("%.0f Hz %+.3f" % [probe[0], db])
+			shaped = shaped and absf(db - probe[1]) <= probe[2]
+	var linear: bool = whole and peak - first == lat and worst_sym < 1e-7 and right_silent
+	var nine := linear and shaped
+	ok = ok and nine
+	print("9. CASUAL: impulse peaks %d frames after it starts (latency %d), worst asymmetry %s, other channel silent %s; response %s: %s" % [
+		peak - first, lat, "%.10f" % worst_sym if whole else "(response not captured)", right_silent, ", ".join(gains), nine])
+
+	src.stop()
+	src.queue_free()
+	await process_frame
+	AudioServer.remove_bus(bus)
+	return ok
+
+## Pushes `frames` through the generator in one run (its 0.5 s buffer holds them), lets the bus
+## drain, and returns everything the capture saw.
+func _through(pb: AudioStreamGeneratorPlayback, capture: AudioEffectCapture, frames: PackedVector2Array) -> PackedVector2Array:
+	capture.clear_buffer()
+	var pushed := 0
+	var guard := 0
+	while pushed < frames.size() and guard < 600:
+		var room: int = mini(pb.get_frames_available(), frames.size() - pushed)
+		# ONE push_buffer, not a GDScript loop of push_frame: the audio thread reads the generator while
+		# frames go in, and a loop it overtakes leaves silence mid-run (caught: a gap at frame 489)
+		pb.push_buffer(frames.slice(pushed, pushed + room))
+		pushed += room
+		await process_frame
+		guard += 1
+	# until the whole run has come through, not a fixed count of frames: a loaded suite run can leave
+	# the audio thread behind the main loop, and a capture read early is a truncated one
+	var margin := int(AudioServer.get_mix_rate() * 0.05)
+	while capture.get_frames_available() < frames.size() + margin and guard < 1200:
+		await process_frame
+		guard += 1
+	return capture.get_buffer(capture.get_frames_available())

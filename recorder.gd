@@ -10,8 +10,10 @@ extends Node
 ## is free space.
 ##
 ## The intermediate is 32-bit FLOAT wav, which is what the bus actually hands us: any
-## conversion (16/24-bit, FLAC, a different sample rate) happens ONCE at stop, through
-## ffmpeg, so the live path never does format work while audio is flowing.
+## conversion (16/24-bit, FLAC, a different sample rate) happens ONCE after stop, through
+## ffmpeg on a worker, so neither the live path nor the STOP press ever waits on format work.
+## 16- and 24-bit takes are TPDF-dithered on the way down (AudioEngine.dither_filter), resampling
+## first in the same float pass; 32-bit WAV is not, and FLAC is 24-bit.
 ##
 ## ponytail: the capture rate is the AudioServer's mix rate, not the requested one --
 ## an effect cannot resample the bus it is on. SAMPLE RATE resamples on the way out.
@@ -30,6 +32,7 @@ const RATES := [44100, 48000, 96000]
 ## WAV: output bit depth. FLAC: ffmpeg compression level, 0 fastest .. 8 smallest.
 const WAV_DEPTHS := [16, 24, 32]
 const FLAC_LEVELS := [0, 5, 8]
+const FLAC_BITS := 24
 const QUALITY_NAMES := ["LOW", "STANDARD", "HIGH"]
 
 var recording := false
@@ -46,7 +49,7 @@ var _bus_idx := -1
 var _slot := -1
 var _file: FileAccess
 var _raw_path := ""
-var _out_path := ""
+var _tasks: Array[int] = []   # conversions still out on a worker; joined in _exit_tree
 var _mix_rate := 44100.0
 
 ## Pre-allocated once, disabled, exactly like every other effect this program puts on a
@@ -90,8 +93,10 @@ func start(dir: String) -> String:
 	recording = true
 	return _raw_path
 
-## Stops, patches the RIFF sizes the header could not know up front, then hands the take
-## to ffmpeg for whatever the user actually asked for.
+## Stops and patches the RIFF sizes the header could not know up front. From there the take is
+## complete and valid on disk, so converting it -- as long as the take is long, about 55 s per
+## hour to FLAC, measured -- runs on a worker, and `finished` arrives when it is done. The path
+## is captured here, so a new take started meanwhile cannot redirect this one.
 func stop(type_i: int, rate_i: int, quality_i: int) -> void:
 	if not recording:
 		return
@@ -101,8 +106,19 @@ func stop(type_i: int, rate_i: int, quality_i: int) -> void:
 	_write_header(frames_written)   # seeks back over the placeholder
 	_file.close()
 	_file = null
-	var ok := _convert(type_i, rate_i, quality_i)
-	finished.emit(_out_path if ok else _raw_path, ok)
+	var raw := _raw_path
+	AudioEngine.reap_tasks(_tasks)
+	_tasks.append(WorkerThreadPool.add_task(func() -> void:
+		var out := _convert(raw, type_i, rate_i, quality_i)
+		_finish.bind(out if not out.is_empty() else raw, not out.is_empty()).call_deferred()))
+
+func _finish(path: String, ok: bool) -> void:
+	finished.emit(path, ok)
+
+## Never waits out a conversion at exit: player.gd's close path runs AudioEngine.shutdown(),
+## which kills every ffmpeg first, so the worker fails fast and the float take stays intact.
+func _exit_tree() -> void:
+	AudioEngine.join_tasks(_tasks)
 
 func _process(delta: float) -> void:
 	if not recording:
@@ -150,25 +166,29 @@ func _write_header(frames: int) -> void:
 		return
 	_file.seek_end()
 
-## One ffmpeg pass for type, rate and quality together -- the same dependency the FLAC
-## transcode and the spectral key pass already rely on. The float intermediate is left
-## in place if the conversion fails, so a take is never lost to a missing ffmpeg.
-func _convert(type_i: int, rate_i: int, quality_i: int) -> bool:
+## One ffmpeg pass for type, rate and quality together. WORKER THREAD: touches nothing but
+## its arguments and the files. Returns the converted file's path, or "" -- in which case the
+## float intermediate is left in place, so a take is never lost to a missing or killed ffmpeg.
+func _convert(raw: String, type_i: int, rate_i: int, quality_i: int) -> String:
 	var type: String = FILE_TYPES[clampi(type_i, 0, FILE_TYPES.size() - 1)]
 	var rate: int = RATES[clampi(rate_i, 0, RATES.size() - 1)]
 	var q := clampi(quality_i, 0, QUALITY_NAMES.size() - 1)
-	_out_path = "%s.%s" % [_raw_path.trim_suffix(".f32.wav"), type.to_lower()]
-	var args := ["-v", "error", "-y", "-i", _raw_path, "-ar", str(rate)]
+	var out := "%s.%s" % [raw.trim_suffix(".f32.wav"), type.to_lower()]
+	var bits: int = FLAC_BITS if type == "FLAC" else WAV_DEPTHS[q]
+	# rate change and word length in ONE swr pass: resampled in float, then dithered once. A separate
+	# -ar would resample the already-dithered integers and quantise them a second time.
+	var args := ["-v", "error", "-y", "-nostdin", "-i", raw, "-af", AudioEngine.dither_filter(bits, rate)]
 	if type == "FLAC":
-		args.append_array(["-c:a", "flac", "-compression_level", str(FLAC_LEVELS[q])])
+		args.append_array(["-c:a", "flac", "-compression_level", str(FLAC_LEVELS[q]),
+			"-sample_fmt", "s32", "-bits_per_raw_sample", str(FLAC_BITS)])
 	else:
-		args.append_array(["-c:a", "pcm_s%dle" % WAV_DEPTHS[q]])
-	args.append(_out_path)
-	if OS.execute("ffmpeg", args, [], true) != 0:
-		push_warning("ffmpeg could not convert the take; the float wav is kept at %s" % _raw_path)
-		return false
-	DirAccess.remove_absolute(_raw_path)
-	return true
+		args.append_array(["-c:a", "pcm_s%dle" % bits])
+	args.append(out)
+	if AudioEngine.run_process("ffmpeg", args) != 0:
+		push_warning("ffmpeg did not convert the take; the float wav is kept at %s" % raw)
+		return ""
+	DirAccess.remove_absolute(raw)
+	return out
 
 ## Self-check for the pure bits: the header maths and the option tables. The live
 ## capture path needs a running bus and lives in test_recorder.gd.

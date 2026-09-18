@@ -135,12 +135,13 @@ func reset() -> void:
 
 ## Analyser slot and tempo fit together, for a director that only matters while a feature is
 ## on -- the per-deck BEAT SYNC trackers. Off, it costs neither an FFT on the audio thread nor
-## a sweep on a worker, and its stale lock is dropped.
-func set_tracking(on: bool) -> void:
+## a sweep on a worker, and its stale lock is dropped. `analyse` keeps the analyser (and so
+## `levels`) running without the tempo fit -- DUAL VISUAL draws each deck from its tracker.
+func set_tracking(on: bool, analyse: bool) -> void:
 	track_tempo = on
 	var b := AudioServer.get_bus_index(bus)
 	if b >= 0 and _slot >= 0:
-		AudioServer.set_bus_effect_enabled(b, _slot, on)
+		AudioServer.set_bus_effect_enabled(b, _slot, analyse)
 	if not on:
 		reset()
 
@@ -347,9 +348,15 @@ func _apply_fit(r: Array, gen: int) -> void:
 	# re-anchor every fit makes the beat clock jitter (sd 89 ms at 90 BPM); this is a
 	# PLL-lite that keeps the clock predictive while still following real tempo drift.
 	if bpm > 0.0 and absf(best_bpm - bpm) < 1.0 and confidence > 0.5:
+		# Compare the two grids at the old clock's latest beat, not at song time 0. When the fit
+		# steps tempo by a 0.25 BPM sweep step, grids that agree NOW sit one step's period
+		# difference apart per elapsed beat back at 0 -- 42 ms after 20 s of 120 BPM -- and
+		# easing across that pulled the clock off the beat by as much, worse the later in the song.
 		var period := 60.0 / best_bpm
-		var d := fposmod(best_phase - _phase + period * 0.5, period) - period * 0.5
-		_phase = fposmod(_phase + d * PHASE_EASE, period)
+		var t := song_time()
+		var last := t - fposmod(t - _phase, 60.0 / bpm)
+		var d := fposmod(best_phase - last + period * 0.5, period) - period * 0.5
+		_phase = fposmod(last + d * PHASE_EASE, period)
 	else:
 		_phase = best_phase
 	bpm = best_bpm

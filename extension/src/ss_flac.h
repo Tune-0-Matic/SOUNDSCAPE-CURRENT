@@ -11,12 +11,12 @@
 //   - the COMPRESSED file is what stays in memory; frames are decoded block by block inside
 //     the mix, so there is no decoded copy and no cache file at all
 //   - samples are handed over as 32-bit float, which holds every 24-bit value exactly
-//   - the file's own sample rate is kept; AudioStreamPlaybackResampled converts it to the
-//     mix rate with Godot's own resampler, exactly as it does for Ogg and MP3
+//   - the file's own rate is converted to the mix rate HERE, by resampler.h's windowed sinc,
+//     not by Godot's cubic -- a playback at the mix rate already is a straight copy
 //
-// The audio-thread half follows rt.h: _mix_resampled reads only memory that was allocated
-// on the main thread before playback started, and the one thing the main thread can change
-// under it -- a seek -- crosses as an atomic, applied at the top of the next block.
+// The audio-thread half follows rt.h: _mix reads only memory that was allocated on the main
+// thread before playback started, and the one thing the main thread can change under it -- a
+// seek -- crosses as an atomic, applied at the top of the next block.
 
 #ifndef SOUNDSCAPE_SS_FLAC_H
 #define SOUNDSCAPE_SS_FLAC_H
@@ -24,12 +24,12 @@
 #include <godot_cpp/classes/audio_frame.hpp>
 #include <godot_cpp/classes/audio_stream.hpp>
 #include <godot_cpp/classes/audio_stream_playback.hpp>
-#include <godot_cpp/classes/audio_stream_playback_resampled.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/packed_float32_array.hpp>
 
-#include <atomic>
+#include "resampler.h"
+
 #include <vector>
 
 namespace godot {
@@ -53,6 +53,10 @@ public:
 	/// for verification and analysis, never used by playback.
 	PackedFloat32Array decode_frames(int64_t p_from_frame, int64_t p_frame_count) const;
 
+	/// Interleaved STEREO frames at `out_rate`, starting `from_seconds` in, produced by a private
+	/// playback through the exact _mix path the mixer calls -- 512-frame blocks included.
+	PackedFloat32Array render(int p_out_rate, double p_from_seconds, int64_t p_frames) const;
+
 	const PackedByteArray &bytes() const { return _data; }
 
 	Ref<AudioStreamPlayback> _instantiate_playback() const override;
@@ -72,16 +76,16 @@ private:
 	int64_t _frames = 0;
 };
 
-class SsFlacPlayback : public AudioStreamPlaybackResampled {
-	GDCLASS(SsFlacPlayback, AudioStreamPlaybackResampled)
+class SsFlacPlayback : public AudioStreamPlayback {
+	GDCLASS(SsFlacPlayback, AudioStreamPlayback)
 
 public:
 	SsFlacPlayback() = default;
 	~SsFlacPlayback() override;
 
-	/// MAIN THREAD. Opens the decoder over the stream's bytes and sizes the scratch buffer --
-	/// the only allocations this playback ever makes.
-	bool open(const Ref<SsFlacStream> &p_stream);
+	/// MAIN THREAD. Opens the decoder over the stream's bytes and sizes every buffer -- the only
+	/// allocations this playback ever makes. `p_out_rate` 0 means the AudioServer's mix rate.
+	bool open(const Ref<SsFlacStream> &p_stream, int p_out_rate = 0);
 
 	void _start(double p_from_pos) override;
 	void _stop() override;
@@ -89,21 +93,23 @@ public:
 	int32_t _get_loop_count() const override;
 	double _get_playback_position() const override;
 	void _seek(double p_position) override;
-	int32_t _mix_resampled(AudioFrame *r_dst_buffer, int32_t p_frame_count) override;
-	float _get_stream_sampling_rate() const override; // float in the 4.7 binding, unlike its neighbours
+	int32_t _mix(AudioFrame *p_buffer, float p_rate_scale, int32_t p_frames) override;
 
 protected:
 	static void _bind_methods();
 
 private:
+	struct Reader : soundscape::Source {
+		void *flac = nullptr; // drflac*, kept opaque so this header need not include dr_flac.h
+		int channels = 0;
+		std::vector<float> scratch;
+		int64_t read(float *l, float *r, int64_t frames) override;
+		void seek(int64_t frame) override;
+	};
+
 	Ref<SsFlacStream> _stream; // keeps the compressed bytes alive under the decoder
-	void *_flac = nullptr; // drflac*, kept opaque so this header need not include dr_flac.h
-	std::vector<float> _scratch;
-	int _channels = 0;
-	double _rate = 44100.0;
-	std::atomic<bool> _active{ false };
-	std::atomic<int64_t> _pending_seek{ -1 };
-	std::atomic<int64_t> _position{ 0 };
+	Reader _reader;
+	soundscape::StreamPlayer _player;
 };
 
 } // namespace godot

@@ -16,10 +16,10 @@ extends Node
 ## ponytail: one instance per module type per deck, so a rack cannot hold two Wahs.
 ## Pre-allocating N copies of each type is the upgrade if stacking ever matters.
 ##
-## The rack appends AFTER Equalizer's chain (which hardcodes slots 0-11) rather than
-## interleaving with it, so it sits past that deck's own limiter. AudioEngine's MASTER
-## limiter is what catches the rack's output -- it is the one thing in the program that
-## sees the sum, which is exactly the job.
+## The rack inserts its modules just AHEAD of the deck limiter Equalizer puts on the end of the
+## bus, so everything the rack adds -- AMPLIFY, CLIP, OVERDRIVE, a reverb tail -- is limited on
+## the deck before it reaches the crossfader. It used to append past that limiter, where only
+## the MASTER limiter saw its output (audit D4).
 
 ## Module table. Every module is [display name, {float params}, {switches}, {choices}]
 ## and the UI is generated from it -- a new module is one entry here and nothing in
@@ -27,15 +27,27 @@ extends Node
 ##   params:   key -> [label, min, max, default]
 ##   switches: key -> [label, default]
 ##   choices:  key -> [label, [options...], default]
-## Every module carries MIX. Where the stock effect has a real dry/wet (reverb,
-## chorus) MIX is that; where it does not (filters, distortion, panner) there is no
-## parallel path on a serial bus, so MIX scales that effect's own depth toward zero.
-## ponytail: true per-module wet/dry needs a send bus per module; the depth mapping is
-## what one serial chain can honestly do.
+## Every module carries MIX, and MIX is a TRUE parallel wet/dry: each module sits between the two
+## halves of an SsParallel pair (libsoundscape_dsp, ss_parallel.h). The TAP keeps an untouched copy
+## of the block, the module's effects run at full strength as the wet path, and the BLEND outputs
+## wet * MIX + dry * (1 - MIX) -- a linear crossfade, constant sum, since most modules are
+## correlated with their input -- before the signal moves on toward the deck limiter. The stock
+## effects' own dry/wet controls are pinned fully wet so the pair is the only mix.
+## ponytail: without libsoundscape_dsp there is no pair and MIX does nothing; the effects stay at
+## full strength rather than faking a mix with depth.
+##
+## MIX 0 is a BYPASS, not a quiet module: the BLEND already outputs the dry block bit for bit there,
+## but the wet path would still run, so the whole module -- TAP, effects and BLEND -- is switched out
+## once the BLEND has ramped down to it (see _in_circuit). Out of circuit, Godot skips the slots, so
+## the bus carries the untouched signal at no cost, exactly as with the module removed.
 const MODULES := {
 	"notch": ["FEEDBACK KILLER",
 		{"freq": ["FREQ", 60.0, 8000.0, 1000.0], "width": ["WIDTH", 0.1, 2.0, 0.7],
 		"mix": ["MIX", 0.0, 1.0, 1.0]}, {}, {}],
+	"tbass": ["T-BASS",
+		{"amount": ["AMOUNT", 0.0, 1.0, 0.5], "mix": ["MIX", 0.0, 1.0, 1.0]}, {}, {}],
+	"bbe": ["BBE",
+		{"amount": ["AMOUNT", 0.0, 1.0, 0.5], "mix": ["MIX", 0.0, 1.0, 1.0]}, {}, {}],
 	"octaver": ["DUAL OCTAVER",
 		{"mix": ["MIX", 0.0, 1.0, 1.0]}, {},
 		{"octave": ["OCTAVE", ["-1 DOWN", "UNISON", "+1 UP"], 0]}],
@@ -85,9 +97,11 @@ var sw := {}            # type -> {switch key -> bool}
 var ch := {}            # type -> {choice key -> int}
 
 var _bus := 0
-var _effects := {}      # type -> Array[AudioEffect], in the order they were inserted
-var _idx := {}          # type -> Array[int], the bus slots those effects live in
+var _effects := {}      # type -> Array[AudioEffect], the module's own effects (the wet path)
+var _pairs := {}        # type -> [tap SsParallel, blend SsParallel], or [] without the extension
+var _idx := {}          # type -> Array[int], every bus slot the module owns, pair included
 var _phase := {}        # type -> LFO phase in turns, free-running while the module is on
+var _parked := {}       # type -> BLEND block count when its MIX reached 0, until it is switched out
 var _dirty := true
 
 func _init() -> void:
@@ -109,24 +123,41 @@ static func _switches(type: String) -> Dictionary: return MODULES[type][2]
 static func _choices(type: String) -> Dictionary: return MODULES[type][3]
 static func module_name(type: String) -> String: return MODULES[type][0]
 
-## Every module, created and inserted once, disabled. Called after Equalizer.setup()
-## on the same bus -- Equalizer inserts at explicit slots 0-11, so the rack has to
-## append rather than interleave or it would land in the middle of that chain.
+## Every module, created and inserted once, disabled. Called after Equalizer.setup() on the same
+## bus: Equalizer builds its chain from slot 0 and ends the bus with its limiter, and each module
+## goes in just ahead of that limiter. The slots recorded here never move afterwards, because
+## every later insert lands after them.
 func setup(bus_name: String) -> void:
 	_bus = maxi(AudioServer.get_bus_index(bus_name), 0)
+	var parallel := ClassDB.class_exists("SsParallel")
+	if not parallel:
+		push_warning("FxRack: libsoundscape_dsp did not load, so MIX has no dry path to blend with")
 	for type in MODULES:
 		var made: Array[AudioEffect] = _build(type)
+		var chain: Array = made.duplicate()
+		var pair: Array = []
+		if parallel:
+			var tap: AudioEffect = ClassDB.instantiate("SsParallel")
+			pair = [tap, tap.call("make_blend")]
+			chain = [pair[0]] + chain + [pair[1]]
 		var slots: Array[int] = []
-		for effect in made:
-			AudioServer.add_bus_effect(_bus, effect)
-			var at := AudioServer.get_bus_effect_count(_bus) - 1
+		for effect: AudioEffect in chain:
+			var at := _before_limiter()
+			AudioServer.add_bus_effect(_bus, effect, at)
 			# add_bus_effect enables by default; the rack boots blank, so every slot is
 			# switched out until a module is actually added
 			AudioServer.set_bus_effect_enabled(_bus, at, false)
 			slots.append(at)
 		_effects[type] = made
+		_pairs[type] = pair
 		_idx[type] = slots
 	_dirty = true
+
+## The slot the next module takes: the deck limiter's, pushing it one along -- or the end of a
+## bus whose last effect is not a limiter.
+func _before_limiter() -> int:
+	var n := AudioServer.get_bus_effect_count(_bus)
+	return n - 1 if n > 0 and AudioServer.get_bus_effect(_bus, n - 1) is AudioEffectHardLimiter else n
 
 ## The stock effects each module is made of. Two of the eleven modules asked for are
 ## NOT here and cannot be: a NOISE GATE is a downward expander and a BIT CRUSHER is a
@@ -139,6 +170,27 @@ func _build(type: String) -> Array[AudioEffect]:
 	match type:
 		"notch":
 			return [AudioEffectNotchFilter.new()]
+		"tbass":
+			# aggressive and punchy: a 160 Hz shelf lifting the bass hard, straight into OVERDRIVE. Only
+			# the band under keep_hf_hz goes through the curve (Godot splits it off with a one-pole
+			# lowpass); at 650 Hz that band reaches the upper-bass growl, so the harmonics bite, while
+			# everything above passes untouched
+			var shelf := AudioEffectLowShelfFilter.new()
+			shelf.cutoff_hz = 160.0
+			var drive := AudioEffectDistortion.new()
+			drive.mode = AudioEffectDistortion.MODE_OVERDRIVE
+			drive.keep_hf_hz = 650.0
+			drive.pre_gain = 6.0   # drives the low band hard into the curve
+			return [shelf, drive]
+		"bbe":
+			var sparkle := AudioEffectHighShelfFilter.new()
+			sparkle.cutoff_hz = 3500.0
+			var width := AudioEffectStereoEnhance.new()
+			# surround and time_pullout build a DELAYED copy into the side channel, a Haas smear on every
+			# transient; pan_pullout alone is a straight side gain, no delay, and folds cleanly to mono
+			width.surround = 0.0
+			width.time_pullout_ms = 0.0
+			return [sparkle, width]
 		"octaver":
 			var shift := AudioEffectPitchShift.new()
 			# ponytail: ONE shifter, so "dual" is a direction switch rather than both
@@ -207,7 +259,7 @@ func set_choice(type: String, key: String, i: int) -> void:
 ## Animated modules are the exception -- they have to be written every frame while they
 ## are on, but only while they are on, so an empty rack costs one dictionary lookup.
 func _process(delta: float) -> void:
-	var moving := false
+	var moving := not _parked.is_empty()   # a module ramping to MIX 0 is waiting to be switched out
 	for type in ANIMATED:
 		if active.get(type, false):
 			_phase[type] = fposmod(_phase[type] + delta * _lfo_rate(type), 1.0)
@@ -238,39 +290,103 @@ func _push() -> void:
 	if _effects.is_empty():
 		return
 	for type in MODULES:
-		var on: bool = active.get(type, false)
-		for slot in _idx[type]:
+		var on := _in_circuit(type)
+		var slots: Array = _idx[type]
+		if not (_pairs[type] as Array).is_empty():
+			# Every enable takes the lock on its own, so a block can mix between two of them. The TAP
+			# and BLEND go in BEFORE the wet effects and come out AFTER them: each state in between
+			# then passes the dry block (effects out, the BLEND sums the tap's copy with itself; BLEND
+			# out, the TAP is a copy). Chain order would leave a BLEND reading a stale dry block.
+			var outer := [slots[0], slots[-1]]
+			var inner := slots.slice(1, slots.size() - 1)
+			slots = outer + inner if on else inner + [slots[-1], slots[0]]
+		for slot in slots:
 			# only a CHANGE is worth the driver lock, the same rule Equalizer._enable uses
 			if AudioServer.is_bus_effect_enabled(_bus, slot) != on:
 				AudioServer.set_bus_effect_enabled(_bus, slot, on)
 		if on:
 			_apply(type)
 
+## Whether a module's slots should be switched in. Active at a MIX above 0, yes. Active at MIX 0 it
+## goes out, but not at once: the BLEND ramps MIX across a block, and switching it out before that
+## block has run would jump from the last wet mix straight to dry, a click. So the BLEND's block
+## counter is noted when MIX reaches 0, and the slots go out once three more blocks have run --
+## the first may have started before the new MIX landed. A module already out stays out.
+func _in_circuit(type: String) -> bool:
+	if not active.get(type, false):
+		_parked.erase(type)
+		return false
+	var pair: Array = _pairs[type]
+	if pair.is_empty() or float(fx[type].get("mix", 1.0)) > 0.0:
+		_parked.erase(type)
+		return true
+	if not AudioServer.is_bus_effect_enabled(_bus, _idx[type][0]):
+		_parked.erase(type)
+		return false
+	var blocks := int(pair[1].call("get_split_blocks"))
+	if not _parked.has(type):
+		_parked[type] = blocks
+	return blocks - int(_parked[type]) < 3
+
+## Modules in circuit, and modules in the rack but switched out at MIX 0. For the DSP AUTOPSY.
+func circuit_counts() -> Array[int]:
+	var live := 0
+	var out := 0
+	for type in MODULES:
+		if active.get(type, false):
+			if not _idx.has(type) or AudioServer.is_bus_effect_enabled(_bus, _idx[type][0]):
+				live += 1
+			else:
+				out += 1
+	return [live, out]
+
+## How many modules carry a TAP/BLEND pair: all of them, or none without libsoundscape_dsp.
+func pair_count() -> int:
+	var n := 0
+	for type in _pairs:
+		n += 1 if not (_pairs[type] as Array).is_empty() else 0
+	return n
+
+## The wet path at full strength, and MIX handed to the module's pair. Nothing here scales an
+## effect by MIX any more: that was the serial-bus stand-in for a dry path, and the pair is one.
 func _apply(type: String) -> void:
 	var p: Dictionary = fx[type]
-	var mix: float = p.get("mix", 1.0)
+	var pair: Array = _pairs[type]
+	if not pair.is_empty():
+		pair[0].call("set_mix", p.get("mix", 1.0))   # both halves share one MIX
 	var fxs: Array = _effects[type]
 	match type:
 		"notch":
 			var f: AudioEffectNotchFilter = fxs[0]
 			f.cutoff_hz = p["freq"]
-			# MIX scales the notch's depth: at 0 the resonance is flat and the filter is
-			# doing nothing audible, which is the closest a serial notch has to "dry"
-			f.resonance = lerpf(0.05, p["width"], mix)
+			f.resonance = p["width"]
+		"tbass":
+			# up to 2.5x (+8 dB). Godot's OVERDRIVE ignores `drive` (4.7 source): its saturation is set
+			# only by how hot the band arrives, so AMOUNT drives it through this shelf -- more AMOUNT,
+			# more bass into the curve, more saturation. ponytail: a shelving biquad's group delay grows
+			# with its gain, so this lift also moves the kick's leading edge further than the old 1.9x
+			(fxs[0] as AudioEffectLowShelfFilter).gain = 1.0 + p["amount"] * 1.5
+			# post_gain scales only the saturated band. The 6 dB pre_gain comes back off after the curve,
+			# so it sets how hard the bass clips rather than how loud it is, plus about half the shelf's
+			# lift -- all of it would hand the deck limiter the whole boost to pump on
+			(fxs[1] as AudioEffectDistortion).post_gain = -6.0 - p["amount"] * 3.0
+		"bbe":
+			(fxs[0] as AudioEffectHighShelfFilter).gain = 1.0 + p["amount"] * 1.5
+			(fxs[1] as AudioEffectStereoEnhance).pan_pullout = 1.0 + p["amount"] * 0.6
 		"octaver":
 			var s: AudioEffectPitchShift = fxs[0]
 			var steps: Array = [0.5, 1.0, 2.0]
-			s.pitch_scale = lerpf(1.0, steps[ch["octaver"]["octave"]], mix)
+			s.pitch_scale = steps[ch["octaver"]["octave"]]
 		"pumper":
 			var a: AudioEffectAmplify = fxs[0]
 			# one-sided duck: the LFO only ever pulls DOWN from unity, so a pumper at any
 			# depth can never add gain the master limiter then has to catch
 			var duck: float = (0.5 - 0.5 * cos(_phase["pumper"] * TAU))
-			a.volume_db = -duck * p["depth"] * mix * 24.0
+			a.volume_db = -duck * p["depth"] * 24.0
 		"pan":
 			var pan: AudioEffectPanner = fxs[0]
 			var want: float = sin(_phase["pan"] * TAU) if sw["pan"]["auto"] else p["pan"]
-			pan.pan = clampf(want * mix, -1.0, 1.0)
+			pan.pan = clampf(want, -1.0, 1.0)
 		"wah":
 			var w: AudioEffectBandPassFilter = fxs[0]
 			var spec: Array = _params("wah")["freq"]
@@ -280,7 +396,7 @@ func _apply(type: String) -> void:
 				# there is nothing, which reads as a filter that barely moves
 				hz = spec[1] * pow(spec[2] / spec[1], 0.5 + 0.5 * sin(_phase["wah"] * TAU))
 			w.cutoff_hz = hz
-			w.resonance = lerpf(0.5, p["q"], mix)
+			w.resonance = p["q"]
 		"chorus":
 			var c: AudioEffectChorus = fxs[0]
 			c.voice_count = 2
@@ -288,30 +404,28 @@ func _apply(type: String) -> void:
 				c.set_voice_rate_hz(v, p["rate"] * (1.0 if v == 0 else 1.31))
 				c.set_voice_depth_ms(v, p["depth"])
 				c.set_voice_pan(v, -0.5 if v == 0 else 0.5)
-			# constant SUM, so wet + dry is exactly 1.0 at every mix setting. The old
-			# 1.0 - mix*0.5 dry left 1.5 total at full mix -- a ~3.5 dB lift the master
-			# limiter then had to absorb, which reads as the chorus being "louder" rather
-			# than wider and eats headroom every other module has to share.
-			c.wet = mix
-			c.dry = 1.0 - mix
+			# fully wet: the pair's BLEND is the dry/wet control, constant sum, so the chorus is
+			# never louder than the signal it widens
+			c.wet = 1.0
+			c.dry = 0.0
 		"fuzz":
 			var d: AudioEffectDistortion = fxs[0]
-			d.drive = p["drive"] * mix
+			d.drive = p["drive"]
 			d.keep_hf_hz = p["tone"]
 			# clipping adds level; back it off as drive climbs so FUZZ is a texture
 			# control rather than a volume control
-			d.post_gain = -p["drive"] * mix * 8.0
+			d.post_gain = -p["drive"] * 8.0
 		"tape":
 			var sat: AudioEffectDistortion = fxs[0]
-			sat.drive = p["drive"] * mix * 0.5
+			sat.drive = p["drive"] * 0.5
 			sat.keep_hf_hz = 5000.0
-			sat.post_gain = -p["drive"] * mix * 4.0
+			sat.post_gain = -p["drive"] * 4.0
 			var wow: AudioEffectPitchShift = fxs[1]
 			# MODULATE off means EXACTLY 1.0, not "nearly 1.0". That is the whole point
 			# of the switch: an idle shifter left at 0.999 is an audible, permanent
 			# detune on every track, which is the unwanted pitch shift being prevented.
 			wow.pitch_scale = 1.0 if not sw["tape"]["modulate"] \
-				else 1.0 + sin(_phase["tape"] * TAU) * p["wow"] * mix * 0.004
+				else 1.0 + sin(_phase["tape"] * TAU) * p["wow"] * 0.004
 		"reverb":
 			var r: AudioEffectReverb = fxs[0]
 			var t: Dictionary = REVERB_TYPES[ch["reverb"]["type"]]
@@ -322,8 +436,8 @@ func _apply(type: String) -> void:
 			r.damping = clampf(t["damp"] * lerpf(0.5, 1.5, p["damp"]), 0.0, 1.0)
 			r.spread = t["spread"]
 			r.predelay_msec = t["pre"]
-			r.wet = mix
-			r.dry = 1.0 - mix
+			r.wet = 1.0   # the pair blends the dry signal back in
+			r.dry = 0.0
 
 # --- presets ----------------------------------------------------------------
 ## A preset is the whole rack: which modules are in it and every value they hold.

@@ -61,18 +61,12 @@ var mode: Mode = Mode.OFF
 var adapt := true
 var lane_db := PackedFloat32Array()
 var ez_db := PackedFloat32Array()      # LOW, MID, HIGH
-var tbass := 0.0                        # 0..1
-var bbe := 0.0                          # 0..1
 var boost_db := 0.0                     # extra output gain, 0..BOOST_MAX
 var fx := {}                            # FX_SPEC key -> float
 var fx_switch := {"rev_on": false, "dly_on": false, "bypass": false}
 
 var _bus := 0
 var _eq: AudioEffectEQ21
-var _tb_shelf: AudioEffectLowShelfFilter
-var _tb_drive: AudioEffectDistortion
-var _bbe_shelf: AudioEffectHighShelfFilter
-var _bbe_phase: AudioEffectStereoEnhance
 var _boost: AudioEffectAmplify
 var _limiter: AudioEffectHardLimiter
 var _lp: AudioEffectLowPassFilter
@@ -80,7 +74,6 @@ var _hp: AudioEffectHighPassFilter
 var _pitch: AudioEffectPitchShift
 var _delay: AudioEffectDelay
 var _reverb: AudioEffectReverb
-var _idx := {}                          # effect -> bus slot, for true bypass
 var _on_state := {}                     # effect -> last enabled flag actually written
 var _dirty := true
 
@@ -95,10 +88,6 @@ func _init() -> void:
 func setup(bus_name := "Master") -> void:
 	_bus = maxi(AudioServer.get_bus_index(bus_name), 0)
 	_eq = AudioEffectEQ21.new()
-	_tb_shelf = AudioEffectLowShelfFilter.new()
-	_tb_drive = AudioEffectDistortion.new()
-	_bbe_shelf = AudioEffectHighShelfFilter.new()
-	_bbe_phase = AudioEffectStereoEnhance.new()
 	_boost = AudioEffectAmplify.new()
 	_limiter = AudioEffectHardLimiter.new()
 	_lp = AudioEffectLowPassFilter.new()
@@ -107,15 +96,6 @@ func setup(bus_name := "Master") -> void:
 	_delay = AudioEffectDelay.new()
 	_reverb = AudioEffectReverb.new()
 
-	_tb_shelf.cutoff_hz = 120.0
-	# OVERDRIVE with a low keep_hf makes the harmonics band-limited, so T-BASS thickens
-	# the bottom end instead of fizzing the whole mix like a full-range distortion would.
-	_tb_drive.mode = AudioEffectDistortion.MODE_OVERDRIVE
-	_tb_drive.keep_hf_hz = 320.0
-	_bbe_shelf.cutoff_hz = 3500.0
-	# pan_pullout is driven per-push now; see the BBE block in _push for why the delay
-	# half of this effect is switched off permanently.
-	_bbe_phase.time_pullout_ms = 0.0
 	# a hair under 0 dBFS: the booster exists to be pushed, and this is what stops it
 	# turning into hard digital clipping on a loud master
 	_limiter.ceiling_db = -0.5
@@ -125,19 +105,25 @@ func setup(bus_name := "Master") -> void:
 	# front, where a performance move belongs -- filtering after the reverb would leave
 	# the tail unfiltered and the sweep would not read as a cut. EQ and the hardware DSP
 	# shape the dry signal next. The time-based effects come after that so they reverberate
-	# what you actually hear. boost + limiter go last: they are effects rather than bus
-	# volume on purpose, since bus volume is applied after the chain on send, so a limiter
-	# placed anywhere else could never catch clipping the rack in front of it caused.
-	for effect in [_lp, _hp, _pitch, _eq, _tb_shelf, _tb_drive, _bbe_shelf, _bbe_phase,
-			_delay, _reverb, _boost, _limiter]:
+	# what you actually hear. The boost follows, and the limiter is appended on its own below.
+	# T-BASS and BBE lived between the EQ and the delay until 2026-09-16; they are FxRack modules now,
+	# each in its own parallel wet/dry pair.
+	for effect in [_lp, _hp, _pitch, _eq, _delay, _reverb, _boost]:
 		AudioServer.add_bus_effect(_bus, effect, slot)
-		_idx[effect] = slot
 		# add_bus_effect enables by default, and _push does not run until the first
 		# frame -- without this the chain would process a frame or two of audio before
 		# anything had decided it should be on.
 		AudioServer.set_bus_effect_enabled(_bus, slot, false)
 		_on_state[effect] = false   # seeds the change-gate in _enable()
 		slot += 1
+	# The limiter goes on the END of the bus, not straight after the boost: FxRack.setup()
+	# inserts its modules just ahead of it, so whatever the rack adds is limited too. It used to
+	# sit at slot 11 with the rack appended past it, and a module's gain reached the master bus
+	# with nothing in between (audit D4). Bus volume is applied after the chain on send, which is
+	# why this is an effect and not the bus volume.
+	AudioServer.add_bus_effect(_bus, _limiter)
+	AudioServer.set_bus_effect_enabled(_bus, AudioServer.get_bus_effect_count(_bus) - 1, false)
+	_on_state[_limiter] = false
 	_dirty = true
 
 # --- lane control ---------------------------------------------------------
@@ -255,13 +241,6 @@ static func cut_test() -> bool:
 	e.free()   # Equalizer is a Node, not RefCounted: dropping the reference would leak it
 	return ok
 
-func set_dsp(which: String, amount: float) -> void:
-	if which == "tbass":
-		tbass = clampf(amount, 0.0, 1.0)
-	else:
-		bbe = clampf(amount, 0.0, 1.0)
-	_dirty = true
-
 ## EZ mode is three macros over the same 16-lane curve, weighted with raised cosines so
 ## the bands overlap smoothly rather than stepping at the crossover.
 func _ez_curve() -> PackedFloat32Array:
@@ -299,7 +278,12 @@ func _enable(effect: AudioEffect, on: bool) -> void:
 	if _on_state.get(effect) == on:
 		return
 	_on_state[effect] = on
-	AudioServer.set_bus_effect_enabled(_bus, _idx[effect], on)
+	# Found by identity, not by a slot remembered at setup: FxRack inserts ahead of the limiter
+	# after this chain is built, which moves it. Only a CHANGE reaches here, so the scan is rare.
+	for i in AudioServer.get_bus_effect_count(_bus):
+		if AudioServer.get_bus_effect(_bus, i) == effect:
+			AudioServer.set_bus_effect_enabled(_bus, i, on)
+			return
 
 ## Below this a lane is inaudible, and running the bank for it buys phase rotation and
 ## nothing else. 0.1 dB is finer than any step a fader can produce.
@@ -318,10 +302,10 @@ static func is_flat(curve: PackedFloat32Array) -> bool:
 ## one: junk that does not throw but arrives as gain.
 static func from_dict_test() -> bool:
 	var e := Equalizer.new()
-	e.from_dict({"mode": "x", "adapt": "y", "lanes": "z", "ez": 9, "tbass": "q", "bbe": []})
-	var ok := e.mode == Mode.OFF and e.adapt == true and e.tbass == 0.0 and e.bbe == 0.0
-	e.from_dict({"lanes": [999.0, -999.0], "ez": [500.0], "tbass": 50.0, "bbe": -3.0})
-	ok = ok and e.lane_db[0] == GAIN_MAX and e.lane_db[1] == GAIN_MIN 		and e.ez_db[0] == GAIN_MAX and e.tbass == 1.0 and e.bbe == 0.0
+	e.from_dict({"mode": "x", "adapt": "y", "lanes": "z", "ez": 9})
+	var ok := e.mode == Mode.OFF and e.adapt == true
+	e.from_dict({"lanes": [999.0, -999.0], "ez": [500.0]})
+	ok = ok and e.lane_db[0] == GAIN_MAX and e.lane_db[1] == GAIN_MIN 		and e.ez_db[0] == GAIN_MAX
 	e.fx_from_dict({"rev_room": [1, 2], "dly_ms": "loud", "tape": {}, "dly_on": 5})
 	ok = ok and e.fx["rev_room"] == FX_SPEC["rev_room"][3] 		and e.fx["dly_ms"] == FX_SPEC["dly_ms"][3] and e.fx["tape"] == FX_SPEC["tape"][3] 		and e.fx_switch["dly_on"] == false
 	e.free()
@@ -361,58 +345,10 @@ func _push() -> void:
 			var g: float = lerpf(curve[i], curve[mini(i + 1, LANES - 1)], f)
 			_eq.set_band_gain_db(b, g)
 
-	# T-BASS: shelf lift plus band-limited saturation, true-bypassed at zero.
-	#
-	# NOT gated on the EQ mode. It used to be, and that made the FX rack's T-BASS fader
-	# silently inert whenever EQ read OFF -- the fader moved, the readout changed, and
-	# nothing happened to the sound, with the explanation two tabs away. The drive stage
-	# is the hardware colour of the signal rather than part of the equalizer curve, which
-	# is exactly how boost_db below has always behaved; these now match it.
-	var tb_on := tbass > 0.001
-	_enable(_tb_shelf, tb_on)
-	_enable(_tb_drive, tb_on)
-	if tb_on:
-		# Shelf lift capped at 1.9x (+5.6 dB) rather than 2.8x (+8.9 dB). A shelving
-		# biquad's group delay scales with its gain, and Godot 4 ships no linear-phase
-		# filter to escape that with -- so how hard this lifts IS the only lever on how
-		# far it moves the kick's leading edge relative to the rest of the mix.
-		_tb_shelf.gain = 1.0 + tbass * 0.9
-		# pre_gain used to drive the already-boosted bass 4 dB harder into the
-		# nonlinearity, which is where the intermodulation was coming from. `drive` alone
-		# sets the amount of saturation; the extra pre-stage bought nothing but IMD.
-		_tb_drive.drive = tbass * 0.18
-		_tb_drive.pre_gain = 0.0
-		# Partial makeup -- roughly half the shelf's lift, not all of it. post_gain is
-		# full-band while the shelf is not, so compensating in full would be a treble cut
-		# wearing a bass boost's label. Half is what keeps normally mastered material out
-		# of sustained gain reduction, which is what had the mids breathing on every kick.
-		_tb_drive.post_gain = -tbass * 3.0
-
 	var boosting := boost_db > 0.05
 	_enable(_boost, boosting)
 	if boosting:
 		_boost.volume_db = boost_db
-
-	# BBE: high shelf for the sparkle, plus a phase-linear stereo widen.
-	#
-	# The inter-channel time offset this used to run is gone. Godot's StereoEnhance builds
-	# `surround` out of a DELAYED MONO SUM added to L and subtracted from R -- decompose
-	# that and mid is untouched while the side channel receives a full, late copy of the
-	# programme. At the old bbe * 12.0 that was a 4.5 ms anti-phase ghost of every
-	# transient, sitting squarely inside the Haas fusion window, which the ear reads as a
-	# smeared image and a blurred attack instant rather than as width. Worst on
-	# headphones, where there is no crossfeed to cover it.
-	#
-	# pan_pullout widens with no delay whatsoever: it is a straight M/S gain -- mid
-	# untouched, side scaled -- so it is phase-linear and still collapses cleanly to mono.
-	var bb_on := bbe > 0.001   # same rule as T-BASS above: independent of the EQ mode
-	_enable(_bbe_shelf, bb_on)
-	_enable(_bbe_phase, bb_on)
-	if bb_on:
-		_bbe_shelf.gain = 1.0 + bbe * 1.5
-		_bbe_phase.pan_pullout = 1.0 + bbe * 0.6
-		_bbe_phase.surround = 0.0       # zero is what keeps the delay line out of circuit
-		_bbe_phase.time_pullout_ms = 0.0
 
 	# --- FX rack. Independent of the EQ mode: these are performance effects, and
 	# switching the equalizer OFF should not silently kill a reverb tail.
@@ -475,13 +411,9 @@ func _push() -> void:
 	# stacked delay tail both add level that boost_db knows nothing about, and the whole
 	# point of putting it last in the chain is that it catches all of it.
 	#
-	# tb_on and bb_on used to arm it too, and THAT was the pumping. T-BASS is a tone
-	# control that happens to add level, so arming a limiter off it meant every kick drove
-	# gain reduction and the mids breathed back up over the release -- a gain artefact
-	# locked to the beat, which is heard as the track being fractionally off rather than
-	# as compression. AudioEngine now puts a real limiter on Master, which is the right
-	# place to catch a tone control: it sees the actual summed output of both decks and
-	# the video node, so this one no longer has to guess on their behalf.
+	# A tone control must never arm it: T-BASS once did, and every kick drove gain reduction
+	# with the mids breathing back up over the release. T-BASS now lives in FxRack, whose
+	# modules sit ahead of this limiter, and AudioEngine's Master limiter sees the summed output.
 	_enable(_limiter, boosting or rv or dl or lp_on or hp_on or shifting)
 
 ## Back to defaults. Kept here rather than in the UI so there is one definition of
@@ -493,8 +425,6 @@ func reset_all() -> void:
 		lane_db[i] = 0.0
 	for i in 3:
 		ez_db[i] = 0.0
-	tbass = 0.0
-	bbe = 0.0
 	boost_db = 0.0
 	for key in FX_SPEC:
 		fx[key] = FX_SPEC[key][3]
@@ -505,7 +435,7 @@ func reset_all() -> void:
 # --- persistence ----------------------------------------------------------
 func to_dict() -> Dictionary:
 	return {"mode": int(mode), "adapt": adapt, "lanes": Array(lane_db),
-		"ez": Array(ez_db), "tbass": tbass, "bbe": bbe}
+		"ez": Array(ez_db)}
 
 ## A number, or the fallback for anything that is not one. The call site already refuses
 ## a non-Dictionary, but `state={"mode":"x"}` IS a valid Dictionary -- the junk arrives
@@ -528,8 +458,6 @@ func from_dict(d: Dictionary) -> void:
 	if e is Array:
 		for i in mini((e as Array).size(), 3):
 			ez_db[i] = clampf(_num((e as Array)[i], 0.0), GAIN_MIN, GAIN_MAX)
-	tbass = clampf(_num(d.get("tbass"), 0.0), 0.0, 1.0)
-	bbe = clampf(_num(d.get("bbe"), 0.0), 0.0, 1.0)
 	_dirty = true
 
 ## The FX section of the config, keyed exactly as it is written. Clamped on the way in

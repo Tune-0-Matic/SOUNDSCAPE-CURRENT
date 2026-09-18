@@ -3,13 +3,16 @@ extends Node
 ## Decoding, caching, metadata and queue management for the media player.
 ##
 ## FIDELITY -- read this before trusting the word "lossless" anywhere below.
-## FLAC decodes natively in libsoundscape_dsp (SsFlacStream, dr_flac): 24-bit and hi-res
-## files reach the mixer as 32-bit float at their own sample rate, with no transcode, no
-## cache file and no ffmpeg spawn. Float holds every 24-bit sample exactly, so nothing is
-## truncated on the way IN. What happens next is Godot's: the mixer resamples to
-## audio/driver/mix_rate when the rates differ, the deck's effects run in float, and the
-## device takes whatever format it negotiated. WAV still loads through AudioStreamWAV, which
-## is 16-bit; MP3 and Ogg decode to float.
+## FLAC, WAV and DSD decode natively in libsoundscape_dsp (SsFlacStream with dr_flac, SsWavStream
+## with dr_wav, SsDsdStream for .dsf/.dff): 24-bit and hi-res files, EXTENSIBLE WAV headers and
+## float WAVs included, reach the mixer as 32-bit float, with no transcode, no cache file and no
+## ffmpeg spawn. Float holds every 24-bit sample exactly, so nothing is truncated on the way IN, and
+## the extension converts each file's rate to audio/driver/mix_rate ITSELF with a 120 dB windowed
+## sinc on the exact rational ratio (resampler.h: under -135 dB THD+N, no drift), where Godot's own
+## 4-point cubic measured -26 dB and -19.9 ppm. DSD is decimated from its 1-bit stream first. The
+## deck's effects then run in float, and the device takes whatever format it negotiated. MP3 and
+## Ogg decode to float and still go through Godot's resampler. Without the extension, WAV falls
+## back to AudioStreamWAV (16-bit, no EXTENSIBLE files), and FLAC and DSD do not play.
 
 signal track_ready(path: String, stream: AudioStream, meta: Dictionary, deck: int)
 signal track_failed(path: String, reason: String)
@@ -73,6 +76,7 @@ var _deck_players: Array[AudioStreamPlayer] = []
 func _ready() -> void:
 	_setup_master_limiter()
 	_setup_master_mono()
+	_setup_master_curve()
 	_setup_decks()
 
 ## Ceiling for the Master safety limiter. A hair under 0 dBFS, same reasoning as the
@@ -105,7 +109,7 @@ var _mono_effect_idx := -1
 ## pan_pullout 0.0 -- not a custom effect. Godot decomposes into a mid/side pair
 ## internally (mid=(L+R)/2, side scaled by pan_pullout); at pan_pullout 0 the side
 ## term drops out entirely and both channels become the mid alone, which is an exact
-## fold, not an approximation. surround stays 0 for the same reason equalizer.gd
+## fold, not an approximation. surround stays 0 for the same reason fx_rack.gd
 ## keeps it 0 on BBE: that tap is a delayed mono sum added back into both channels,
 ## and it would smuggle a comb-filtered image back in on top of the fold.
 ##
@@ -131,6 +135,70 @@ func _setup_master_mono() -> void:
 func set_mono(on: bool) -> void:
 	if _mono_effect_idx >= 0:
 		AudioServer.set_bus_effect_enabled(_mono_bus_idx, _mono_effect_idx, on)
+
+## LISTENING MODE (TBS). AUDIOPHILE (DIRECT), the default, puts nothing between the decks and the
+## Master limiter. CASUAL (SMOOTH) switches in SsCasualCurve (libsoundscape_dsp, ss_casual.h): a
+## warm, phase-linear curve for harsh masterings -- +2.2 dB below 120 Hz, -0.8 dB around 3 kHz, rolling
+## off from 8.5 kHz to -1.5 dB at 16 kHz -- 6.3 ms late.
+## DIRECT switches the effect OUT rather than zeroing it -- a disabled bus effect is skipped
+## outright, so DIRECT is bit-exact and costs nothing.
+enum ListeningMode { AUDIOPHILE, CASUAL }
+const LISTENING_MODE_NAMES := ["AUDIOPHILE (DIRECT)", "CASUAL (SMOOTH)"]
+
+var listening_mode := ListeningMode.AUDIOPHILE
+var _curve: AudioEffect   # SsCasualCurve, or null without libsoundscape_dsp
+
+## Inserted just AHEAD of the Master limiter, so the limiter catches the +1 dB the curve adds, and
+## ahead of AudioDirector's analyser and the recorder's capture, so both see what is heard. Built
+## once and switched, never added at runtime, for the same reason as the fold. Same idempotency rule.
+func _setup_master_curve() -> void:
+	if not ClassDB.class_exists("SsCasualCurve"):
+		push_warning("AudioEngine: libsoundscape_dsp did not load, so LISTENING MODE CASUAL has no curve")
+		return
+	var m := AudioServer.get_bus_index("Master")
+	var at := -1
+	for i in AudioServer.get_bus_effect_count(m):
+		var effect := AudioServer.get_bus_effect(m, i)
+		if effect.is_class("SsCasualCurve"):
+			_curve = effect
+			return
+		if effect is AudioEffectHardLimiter and at < 0:
+			at = i
+	at = maxi(at, 0)
+	_curve = ClassDB.instantiate("SsCasualCurve")
+	AudioServer.add_bus_effect(m, _curve, at)
+	AudioServer.set_bus_effect_enabled(m, at, false)
+	if _mono_effect_idx >= at:
+		_mono_effect_idx += 1   # the fold sits after the limiter, which just moved one along
+
+func set_listening_mode(mode: int) -> void:
+	listening_mode = clampi(mode, 0, LISTENING_MODE_NAMES.size() - 1) as ListeningMode
+	var at := curve_slot()
+	if at < 0:
+		return
+	var m := AudioServer.get_bus_index("Master")
+	var on := listening_mode == ListeningMode.CASUAL
+	if AudioServer.is_bus_effect_enabled(m, at) == on:
+		return
+	if on:
+		_curve.call("reset")   # or its first 8 ms would be whatever played the last time it was on
+	AudioServer.set_bus_effect_enabled(m, at, on)
+
+## The curve's slot on Master, found by identity; -1 without the extension.
+func curve_slot() -> int:
+	if _curve == null:
+		return -1
+	var m := AudioServer.get_bus_index("Master")
+	for i in AudioServer.get_bus_effect_count(m):
+		if AudioServer.get_bus_effect(m, i) == _curve:
+			return i
+	return -1
+
+## What CASUAL delays the output by, in ms; 0 while DIRECT or without the extension.
+func curve_latency_ms() -> float:
+	if _curve == null or listening_mode != ListeningMode.CASUAL:
+		return 0.0
+	return 1000.0 * float(_curve.call("get_latency_frames")) / AudioServer.get_mix_rate()
 
 func _setup_decks() -> void:
 	for i in DECK_BUSES.size():
@@ -236,17 +304,24 @@ func prev_index() -> int:
 ## Asks for a track. Emits track_ready on the main thread when the stream and its
 ## metadata are both available. Any work that can block (ffmpeg, ffprobe, reading a
 ## 90 MB wav) happens on a worker; only the newest request PER DECK is honoured.
-func request(i: int) -> void:
+func request(i: int, for_deck := -1) -> void:
 	if i < 0 or i >= queue.size() or _shutdown:
 		return
-	index = i
 	# The deck is captured HERE, at request time. A cold FLAC transcode takes seconds, and
 	# switching decks inside that window must not redirect the result: it belongs to the
 	# deck that asked for it, and track_ready carries that deck back to player.gd.
-	var d := deck
+	var d := deck if for_deck < 0 else for_deck
+	if d == deck:
+		index = i   # the queue position is the DRIVEN deck's; loading the other one must not move it
+	load_on(d, queue[i])
+
+## Decodes `path` for deck `d` whether or not the queue holds it: the undriven deck's pick from
+## its own track list, leaving the queue and the driven deck's place in it untouched.
+func load_on(d: int, path: String) -> void:
+	if _shutdown:
+		return
 	_tokens[d] += 1
 	var token: int = _tokens[d]
-	var path := queue[i]
 	if path == _next_path and _next_stream:  # preloaded by the previous track
 		var s := _next_stream
 		_next_stream = null
@@ -309,8 +384,10 @@ func decode(path: String) -> AudioStream:
 	match path.get_extension().to_lower():
 		"mp3": return AudioStreamMP3.load_from_file(path)
 		"ogg": return AudioStreamOggVorbis.load_from_file(path)
-		"wav": return AudioStreamWAV.load_from_file(path)
+		"wav": return native_wav(path)
 		"flac": return native_flac(path)
+		"dsf", "dff": return native_dsd(path)
+		"mp4": return mp4_sound(path) if video_test else null   # the Video TEST gate, below
 	return null
 
 ## True when libsoundscape_dsp loaded and registered SsFlacStream. Without it a FLAC does not
@@ -329,13 +406,31 @@ static func native_flac(path: String) -> AudioStream:
 	var s: AudioStream = ClassDB.instantiate("SsFlacStream")
 	return s if int(s.call("load", path)) == OK else null
 
-## Every build before native FLAC cached an ffmpeg transcode of each FLAC in user:// as
-## pcm_<hash>.wav -- 30-120 MB apiece -- plus .part/.pcm leftovers from interrupted runs.
-## Nothing reads them any more. Swept once per session; returns the bytes reclaimed.
-static func purge_transcode_cache(dir := "user://") -> int:
+## DSD exists only through libsoundscape_dsp: nothing in Godot or on the ffmpeg path plays it as DSD.
+static func native_dsd(path: String) -> AudioStream:
+	if not ClassDB.class_exists("SsDsdStream"):
+		push_warning("%s: DSD needs libsoundscape_dsp, which did not load" % path.get_file())
+		return null
+	var s: AudioStream = ClassDB.instantiate("SsDsdStream")
+	return s if int(s.call("load", path)) == OK else null
+
+## SsWavStream when libsoundscape_dsp loaded; AudioStreamWAV otherwise, so an unbuilt extension
+## still plays ordinary 16-bit WAVs -- just not 24-bit, float or EXTENSIBLE ones, which it refuses.
+static func native_wav(path: String) -> AudioStream:
+	if not ClassDB.class_exists("SsWavStream"):
+		return AudioStreamWAV.load_from_file(path)
+	var s: AudioStream = ClassDB.instantiate("SsWavStream")
+	return s if int(s.call("load", path)) == OK else null
+
+## Deletes every file in `dir` whose name starts with `prefix`; returns the bytes reclaimed.
+##   "pcm_" -- every build before native FLAC cached an ffmpeg transcode of each FLAC here as
+##             pcm_<hash>.wav, 30-120 MB apiece, plus .part/.pcm leftovers. Nothing reads them.
+##   "rev_" -- reverse renders. REV re-renders on demand, so they are swept at every launch;
+##             before this nothing ever removed them (one short session left 30 MB).
+static func purge_cache(prefix: String, dir := "user://") -> int:
 	var freed := 0
 	for f in DirAccess.get_files_at(dir):
-		if not (f.begins_with("pcm_") and f.contains(".wav")):
+		if not f.begins_with(prefix):
 			continue
 		var path := dir.path_join(f)
 		var file := FileAccess.open(path, FileAccess.READ)
@@ -345,6 +440,118 @@ static func purge_transcode_cache(dir := "user://") -> int:
 		if DirAccess.remove_absolute(ProjectSettings.globalize_path(path)) == OK:
 			freed += size
 	return freed
+
+# --- Video TEST (TBS) ---------------------------------------------------------
+## Off by default, and while it is off an .mp4 does not exist to this program: the scan skips
+## it (player.gd _is_track), decode() refuses it whatever list it came from, and nothing
+## below ever runs.
+##
+## On, an MP4 is two renders, cached per file version in video_dir:
+##   SOUND   -- its audio stream decoded once to 24-bit FLAC at the source's own rate, then
+##              played through the native FLAC path like any other track, so the EQ, FX,
+##              beat tracker, sync and recorder all get it. Nothing is resampled and nothing
+##              is re-encoded lossy: 24-bit holds the decoded AAC to within a step
+##              (test_video_test.gd measures it against ffmpeg's own float decode).
+##   PICTURE -- a VIDEO_W-wide, VIDEO_FPS Theora proxy, because VideoStreamPlayer decodes
+##              nothing else. Small on purpose: the terminal look throws the detail away
+##              (video_test.gdshader), and a proxy this size renders fast.
+## ponytail: AAC decodes to float, and overs above 0 dBFS in a hot master clip at the 24-bit
+## step. Float WAV would keep them, but AudioStreamWAV truncates to 16-bit, which costs more.
+## ponytail: the cache is unbounded while the toggle is on (about 8 MB per minute of 48 kHz
+## sound); turning the toggle off purges it.
+signal video_ready(path: String, ogv: String)
+
+const VIDEO_DIR := "user://video_test"
+const VIDEO_W := 160
+const VIDEO_FPS := 15
+
+var video_test := false
+var video_dir := VIDEO_DIR   # tests point this away from a real cache
+
+func mp4_sound(path: String) -> AudioStream:
+	var af := dither_filter(24) if decodes_to_float(path) else "anull"
+	var flac := ffmpeg_render(path, "flac", ["-map", "0:a:0", "-af", af, "-c:a", "flac",
+		"-sample_fmt", "s32", "-bits_per_raw_sample", "24"], video_dir, "", is_shut_down)
+	return native_flac(flac) if not flac.is_empty() else null
+
+## The picture, rendered on a worker and announced on the main thread. Asked for once the sound
+## is already playing: pulling the audio out of an MP4 never decodes its video, while this has
+## to decode every frame of it -- seconds per minute for a 1080p H.264 stream.
+func request_video(path: String) -> void:
+	if not video_test or _shutdown:
+		return
+	var dir := video_dir
+	run_task(func() -> void:
+		if _shutdown:
+			return
+		var ogv := ffmpeg_render(path, "ogv", ["-map", "0:v:0", "-an",
+			"-vf", "scale=%d:-2:flags=area,fps=%d" % [VIDEO_W, VIDEO_FPS],
+			"-c:v", "libtheora", "-q:v", "5", "-g", str(VIDEO_FPS)], dir, "", is_shut_down)
+		if not ogv.is_empty():
+			call_deferred("emit_signal", "video_ready", path, ogv))
+
+## TPDF dither for an integer render, as an ffmpeg -af filter (swr): triangular noise of +/-1 LSB
+## added before quantising, so the error is noise independent of the signal rather than distortion
+## that follows it, and swr clamps at full scale instead of wrapping (measured: +/-1.2 in gives
+## 32767 / -32768 and 8388607 / -8388608). `bits` is the output word length. 24-bit needs
+## output_sample_bits: ffmpeg carries 24-bit samples in 32-bit ones, and without it swr sizes the
+## dither for a 32-bit LSB, 256 times too small to do anything (measured: variance 0.000 LSB^2).
+## 32-bit gets no dither. `rate` > 0 resamples in the same swr pass, in float, before the dither.
+## ponytail: ffmpeg's 24-bit encoders truncate rather than round, so the dithered error sits half an
+## LSB low -- a -144 dBFS DC offset, below the dither's own noise.
+static func dither_filter(bits: int, rate := 0) -> String:
+	var opts: Array[String] = []
+	if rate > 0:
+		opts.append("osr=%d" % rate)
+	if bits < 32:
+		opts.append("osf=%s" % ("s16" if bits <= 16 else "s32"))
+		opts.append("dither_method=triangular")
+		if bits > 16:
+			opts.append("output_sample_bits=%d" % bits)
+	return "aresample=" + ":".join(opts) if not opts.is_empty() else "anull"
+
+## Whether ffmpeg decodes `path` to floating point (MP3, AAC, Vorbis, float WAV, DSD) rather than to
+## integers (FLAC, integer PCM). Only a float source is dithered on its way into an integer render:
+## the same filter on an integer source changes samples that were already exact (measured: 23695 of
+## 48000 on a 24-bit WAV), which is noise added for nothing and breaks a bit-exact REV. A failed
+## probe answers false, so nothing is dithered on a guess.
+static func decodes_to_float(path: String) -> bool:
+	var out := []
+	OS.execute("ffprobe", ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_fmt",
+		"-of", "csv=p=0", path], out, true)
+	var fmt := str(out[0]).strip_edges() if not out.is_empty() else ""
+	return fmt.begins_with("flt") or fmt.begins_with("dbl")
+
+## One ffmpeg render of `path` into `dir`: its absolute path, or "" when ffmpeg fails (no such
+## stream, not a media file) or is killed. Named `prefix` + md5 of path + mtime + size, so an
+## edited or replaced file renders again. Written under a per-thread name and renamed in, because
+## preload and play can render the same file at once, and a render killed halfway must never pass
+## for a cache hit. Video TEST's sound and picture and every REV render come through here.
+static func ffmpeg_render(path: String, ext: String, args: Array, dir: String, prefix := "",
+		cancelled := Callable()) -> String:
+	var base := ProjectSettings.globalize_path(dir)
+	var out := base.path_join("%s%s.%s" % [prefix, (path + str(file_stamp(path))).md5_text(), ext])
+	if FileAccess.file_exists(out):
+		return out
+	DirAccess.make_dir_recursive_absolute(base)
+	var tmp := "%s.%d.%s" % [out.get_basename(), OS.get_thread_caller_id(), ext]
+	var ok := run_process("ffmpeg", ["-v", "error", "-y", "-nostdin", "-i", path] + args + [tmp], cancelled) == 0
+	if ok and not FileAccess.file_exists(out):
+		# Two workers finishing together both see no `out` and both rename. The loser's rename
+		# can fail outright -- Windows will not replace a file the winner has just opened to
+		# decode -- which is still a success: the finished file is there (test_video_test #3).
+		ok = DirAccess.rename_absolute(tmp, out) == OK or FileAccess.file_exists(out)
+	if FileAccess.file_exists(tmp):
+		DirAccess.remove_absolute(tmp)   # failed, killed, or another worker renamed its copy in first
+	return out if ok else ""
+
+## Everything a Video TEST render wrote. Run when the toggle goes off, and at launch while it is off,
+## which catches a render that was still finishing when the toggle flipped.
+static func purge_video_cache(dir := VIDEO_DIR) -> void:
+	if not DirAccess.dir_exists_absolute(dir):
+		return
+	for f in DirAccess.get_files_at(dir):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(dir.path_join(f)))
 
 # --- metadata --------------------------------------------------------------
 ## Godot cannot read FLAC/Vorbis/ID3 tags, so this shells out to ffprobe, which ships
@@ -400,7 +607,7 @@ func metadata(path: String) -> Dictionary:
 	# sane defaults, so the track still plays and still shows -- metadata is decoration
 	# here, never a gate. What was missing is that a non-zero exit left its temp JSON
 	# behind and said nothing, so a file that probed badly did so silently forever.
-	var probed := OS.execute("ffprobe", args, [], true) == 0
+	var probed := run_process("ffprobe", args, is_shut_down) == 0
 	if not probed:
 		push_warning("ffprobe failed on %s; using filename metadata" % path.get_file())
 	if probed:
@@ -637,13 +844,14 @@ static func key_tag_test() -> bool:
 		and key_shifted(9, 2) == 11 and key_shifted(-1, 5) == -1
 
 # --- reverse playback ---------------------------------------------------------
-## AudioStreamPlayer cannot play backwards -- pitch_scale has no negative half -- so a
-## reversed take is a real file: ffmpeg -af areverse into the same user:// cache the
-## FLAC transcode uses, keyed by path hash so a track is only ever reversed once.
-##
-## Forced to 44.1 kHz 16-bit PCM on the way out for the same reason the FLAC path is:
-## above 48 kHz ffmpeg writes WAVE_FORMAT_EXTENSIBLE, which Godot's wav parser rejects
-## by returning null with no error at all.
+## AudioStreamPlayer cannot play backwards -- pitch_scale has no negative half -- so a reversed
+## take is a real file: ffmpeg -af areverse, rendered once per file version through ffmpeg_render
+## as user://rev_<md5 of path+mtime+size>.flac. 24-bit FLAC at the source's own rate, played back
+## through SsFlacStream. The old render was forced to 44.1 kHz / 16-bit WAV because Godot's WAV
+## loader refused anything else, which cut a hi-res track to CD resolution and resampled it back
+## up; it was also keyed by path alone, so a file replaced in place reversed the OLD audio.
+## Compression level 0: fast to encode, still about half the size of the same take as float WAV.
+## player.gd sweeps rev_* at launch -- nothing needs them across sessions.
 signal reversed_ready(path: String, stream: AudioStream)
 
 func request_reversed(path: String) -> void:
@@ -652,16 +860,17 @@ func request_reversed(path: String) -> void:
 	run_task(func() -> void:
 		if _shutdown:
 			return
-		var out := ProjectSettings.globalize_path("user://rev_%d.wav" % hash(path))
-		if not FileAccess.file_exists(out):
-			var args := ["-v", "error", "-y", "-i", path, "-af", "areverse",
-				"-ar", "44100", "-c:a", "pcm_s16le", out]
-			if OS.execute("ffmpeg", args, [], true) != 0:
-				push_warning("could not reverse %s" % path.get_file())
-				return
-		var stream := AudioStreamWAV.load_from_file(out)
+		# a float-decoded source (MP3, AAC, DSD) is TPDF-dithered onto the 24-bit render; an integer
+		# one (FLAC, PCM WAV) reverses sample-exact with no dither at all
+		var af := "areverse," + dither_filter(24) if decodes_to_float(path) else "areverse"
+		var out := ffmpeg_render(path, "flac", ["-map", "0:a:0", "-af", af, "-c:a", "flac",
+			"-compression_level", "0", "-sample_fmt", "s32", "-bits_per_raw_sample", "24"],
+			"user://", "rev_", is_shut_down)
+		var stream := native_flac(out) if not out.is_empty() else null
 		if stream:
-			call_deferred("emit_signal", "reversed_ready", path, stream))
+			call_deferred("emit_signal", "reversed_ready", path, stream)
+		elif not _shutdown:
+			push_warning("could not reverse %s" % path.get_file()))
 
 # --- offline spectral key estimation ------------------------------------------------
 ## Everything above is what runs at playtime, and stays true to its own rule: no DSP
@@ -718,13 +927,49 @@ static func join_tasks(ids: Array[int]) -> void:
 
 ## Called before the scene tree frees this node: explicitly from player.gd's close
 ## handler, and from _exit_tree for everything else (a headless test that just quits).
-## The flag goes up first, so every queued task returns on its first check, then ALL of
-## them are joined. Idempotent, so the second call on the way out is free.
-## ponytail: a task already inside ffmpeg cannot be interrupted, so closing mid-transcode
-## waits for that one process; killing it would need OS.create_process and a pid.
+## The flag goes up first, so every queued task returns on its first check; then every ffmpeg
+## and ffprobe still running is killed, so a worker blocked inside one is released in
+## milliseconds instead of holding the window open for the rest of a render (10.6 s measured
+## before this); then ALL tasks are joined. Idempotent, so the second call on the way out is free.
 func shutdown() -> void:
 	_shutdown = true
+	kill_processes()
 	join_tasks(_tasks)
+
+## Every external process this program starts, so shutdown() can end them rather than wait them
+## out. Static because the recorder's conversions run through here too. Guarded by _pid_lock.
+static var _pids := {}
+static var _pid_lock := Mutex.new()
+
+## Runs `program` to completion on the CALLING thread -- a worker, or the main thread where a
+## caller already accepted blocking -- and returns its exit code, or -1 when it would not start or
+## was killed. `cancelled` is read under the lock kill_processes() takes, right after the pid is
+## registered: a spawn racing a shutdown is either in the registry when the kill sweep reads it,
+## or sees its flag already up and ends itself. Either way it does not outlive the shutdown.
+static func run_process(program: String, args: Array, cancelled := Callable()) -> int:
+	var pid := OS.create_process(program, PackedStringArray(args))
+	if pid <= 0:
+		return -1
+	_pid_lock.lock()
+	_pids[pid] = true
+	var doomed: bool = cancelled.is_valid() and cancelled.call()
+	_pid_lock.unlock()
+	if doomed:
+		OS.kill(pid)
+	while OS.is_process_running(pid):
+		OS.delay_msec(4)
+	_pid_lock.lock()
+	_pids.erase(pid)
+	_pid_lock.unlock()
+	return OS.get_process_exit_code(pid)
+
+## Kills everything run_process has running. Callers raise their own cancel flag FIRST. Under the
+## lock, so no pid is unregistered (and its number freed for reuse) between reading and killing.
+static func kill_processes() -> void:
+	_pid_lock.lock()
+	for pid in _pids:
+		OS.kill(pid)
+	_pid_lock.unlock()
 
 func _exit_tree() -> void:
 	shutdown()
@@ -816,9 +1061,9 @@ func _run_spectral_key(path: String) -> Dictionary:
 		return {}   # tagged -- nothing for a spectral guess to add
 	var tmp := ProjectSettings.globalize_path("user://spectral_%d_%d.raw" % [
 		hash(path), OS.get_thread_caller_id()])
-	var args := ["-v", "error", "-i", path, "-ac", "1", "-ar", str(SpectralKey.SAMPLE_RATE),
+	var args := ["-v", "error", "-nostdin", "-i", path, "-ac", "1", "-ar", str(SpectralKey.SAMPLE_RATE),
 		"-f", "s16le", "-y", tmp]
-	var ok := OS.execute("ffmpeg", args, [], true) == 0
+	var ok := run_process("ffmpeg", args, is_shut_down) == 0
 	var result := {}
 	if ok:
 		result = SpectralKey.estimate(tmp)
@@ -830,9 +1075,10 @@ func _run_spectral_key(path: String) -> Dictionary:
 func ticker_line(path: String) -> String:
 	var m := metadata(path)
 	var who: String = "%s - %s" % [m["artist"], m["title"]] if m["artist"] != "" else m["title"]
-	# what the mixer is actually handed: native FLAC and the mp3/ogg decoders deliver float,
-	# AudioStreamWAV is 16-bit. See FIDELITY at the top.
-	var engine_fmt := "16 BIT" if path.get_extension().to_lower() == "wav" else "FLOAT"
+	# what the mixer is actually handed: every decoder here delivers float, except the
+	# AudioStreamWAV fallback an unbuilt extension leaves WAV on. See FIDELITY at the top.
+	var engine_fmt := "16 BIT" if path.get_extension().to_lower() == "wav" \
+		and not ClassDB.class_exists("SsWavStream") else "FLOAT"
 	# the key rides along with the rest of the ffprobe result, so it is already there
 	# on the first frame of the track -- there is nothing to wait for and nothing to poll
 	var k: Dictionary = m.get("key", {})

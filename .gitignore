@@ -1,17 +1,26 @@
 .godot/
-export_presets.cfg
 .import/
 .DS_Store
 Thumbs.db
+
+# Tracked deliberately (2026-09-17): the preset carries the export path, the icon and the
+# version fields a release is built from, and it holds no keys -- encryption is off and both
+# codesign identities are empty. Re-check that before adding a signing identity or a PCK key.
+!export_presets.cfg
 
 # --- GDExtension (Phase 9) ---------------------------------------------------
 # Vendored dependency: cloned, never committed. See extension/STEP0.md for the
 # pinned commit -- that is what makes the build reproducible, not a checked-in copy.
 extension/godot-cpp/
-# SCons intermediates and the compiled library. bin/ is a build output directory;
-# the .gdextension file points at it, and it is rebuilt per platform per target.
+# SCons intermediates: rebuilt from source, never shipped.
 extension/.sconsign.dblite
 extension/**/*.o
 extension/**/*.os
 extension/**/*.obj
-bin/
+
+# bin/ is a build output directory, but the compiled extension IS a release artifact: a fresh
+# clone without it cannot play FLAC or DSD at all and falls back to 16-bit WAV. The Windows
+# DLLs are therefore tracked; everything else a build leaves here (import libraries, symbol
+# files, other platforms' outputs) is not.
+bin/*
+!bin/libsoundscape_dsp.*.dll

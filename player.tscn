@@ -252,13 +252,33 @@ layout_mode = 2
 text = "// LINK ESTABLISHED // CODEC OGG/THEORA READY // SAMPLE RATE 44100HZ // NODE 07 NOMINAL // AWAITING INPUT "
 clip_text = true
 
-[node name="Workspace" type="SplitContainer" parent="Margin/Main" unique_id=1604146333]
+[node name="Body" type="SplitContainer" parent="Margin/Main"]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_vertical = 3
 theme_override_constants/separation = 4
 
-[node name="LeftColumn" type="VBoxContainer" parent="Margin/Main/Workspace" unique_id=1419144795]
+[node name="DeckAPanel" type="PanelContainer" parent="Margin/Main/Body"]
+unique_name_in_owner = true
+visible = false
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+
+[node name="DeckADock" type="TabContainer" parent="Margin/Main/Body/DeckAPanel"]
+unique_name_in_owner = true
+clip_contents = true
+layout_mode = 2
+
+[node name="Workspace" type="SplitContainer" parent="Margin/Main/Body" unique_id=1604146333]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_stretch_ratio = 4.0
+size_flags_vertical = 3
+theme_override_constants/separation = 4
+
+[node name="LeftColumn" type="VBoxContainer" parent="Margin/Main/Body/Workspace" unique_id=1419144795]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
@@ -266,53 +286,60 @@ size_flags_stretch_ratio = 3.0
 theme_override_constants/separation = 4
 size_flags_vertical = 3
 
-[node name="ScreenPanel" type="PanelContainer" parent="Margin/Main/Workspace/LeftColumn" unique_id=1648431985]
+[node name="ScreenPanel" type="PanelContainer" parent="Margin/Main/Body/Workspace/LeftColumn" unique_id=1648431985]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_vertical = 3
 
-[node name="SVB" type="VBoxContainer" parent="Margin/Main/Workspace/LeftColumn/ScreenPanel" unique_id=796628666]
+[node name="SVB" type="VBoxContainer" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel" unique_id=796628666]
 layout_mode = 2
 theme_override_constants/separation = 4
 
-[node name="ScreenHeader" type="PanelContainer" parent="Margin/Main/Workspace/LeftColumn/ScreenPanel/SVB" unique_id=871427259]
+[node name="ScreenHeader" type="PanelContainer" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB" unique_id=871427259]
 layout_mode = 2
 theme_type_variation = &"Header"
 
-[node name="Label" type="Label" parent="Margin/Main/Workspace/LeftColumn/ScreenPanel/SVB/ScreenHeader" unique_id=1042004093]
+[node name="Label" type="Label" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB/ScreenHeader" unique_id=1042004093]
 layout_mode = 2
 theme_type_variation = &"HeaderLabel"
 text = "VISUAL_EQUALIZER_FEED"
 
-[node name="Screen" type="PanelContainer" parent="Margin/Main/Workspace/LeftColumn/ScreenPanel/SVB" unique_id=308654675]
+[node name="Screen" type="PanelContainer" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB" unique_id=308654675]
 layout_mode = 2
 size_flags_vertical = 3
 theme_type_variation = &"Screen"
 
-[node name="Video" type="VideoStreamPlayer" parent="Margin/Main/Workspace/LeftColumn/ScreenPanel/SVB/Screen" unique_id=1941458270]
+[node name="Video" type="VideoStreamPlayer" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB/Screen" unique_id=1941458270]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 expand = true
 
-[node name="VizBox" type="SubViewportContainer" parent="Margin/Main/Workspace/LeftColumn/ScreenPanel/SVB/Screen" unique_id=1730989502]
+[node name="VizStack" type="VBoxContainer" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB/Screen"]
+unique_name_in_owner = true
+layout_mode = 2
+mouse_filter = 2
+theme_override_constants/separation = 4
+
+[node name="VizBox" type="SubViewportContainer" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB/Screen/VizStack" unique_id=1730989502]
 unique_name_in_owner = true
 texture_filter = 1
 material = SubResource("Mat_crt")
 layout_mode = 2
+size_flags_vertical = 3
 mouse_filter = 2
 stretch = true
 stretch_shrink = 4
 
-[node name="SubViewport" type="SubViewport" parent="Margin/Main/Workspace/LeftColumn/ScreenPanel/SVB/Screen/VizBox" unique_id=2061559623]
+[node name="SubViewport" type="SubViewport" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB/Screen/VizStack/VizBox" unique_id=2061559623]
 transparent_bg = true
 handle_input_locally = false
 canvas_item_default_texture_filter = 0
 size = Vector2i(328, 225)
 render_target_update_mode = 4
 
-[node name="Viz" type="Control" parent="Margin/Main/Workspace/LeftColumn/ScreenPanel/SVB/Screen/VizBox/SubViewport" unique_id=1473859114]
+[node name="Viz" type="Control" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB/Screen/VizStack/VizBox/SubViewport" unique_id=1473859114]
 unique_name_in_owner = true
 layout_mode = 3
 anchors_preset = 15
@@ -321,7 +348,34 @@ anchor_bottom = 1.0
 mouse_filter = 2
 script = ExtResource("4_eq")
 
-[node name="NoSignal" type="Label" parent="Margin/Main/Workspace/LeftColumn/ScreenPanel/SVB/Screen" unique_id=1980638613]
+[node name="VizBoxB" type="SubViewportContainer" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB/Screen/VizStack"]
+unique_name_in_owner = true
+visible = false
+texture_filter = 1
+material = SubResource("Mat_crt")
+layout_mode = 2
+size_flags_vertical = 3
+mouse_filter = 2
+stretch = true
+stretch_shrink = 4
+
+[node name="SubViewport" type="SubViewport" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB/Screen/VizStack/VizBoxB"]
+transparent_bg = true
+handle_input_locally = false
+canvas_item_default_texture_filter = 0
+size = Vector2i(328, 225)
+render_target_update_mode = 0
+
+[node name="VizB" type="Control" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB/Screen/VizStack/VizBoxB/SubViewport"]
+unique_name_in_owner = true
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+mouse_filter = 2
+script = ExtResource("4_eq")
+
+[node name="NoSignal" type="Label" parent="Margin/Main/Body/Workspace/LeftColumn/ScreenPanel/SVB/Screen" unique_id=1980638613]
 unique_name_in_owner = true
 layout_mode = 2
 theme_type_variation = &"Green"
@@ -329,256 +383,290 @@ text = "[ NO SIGNAL ]"
 horizontal_alignment = 1
 vertical_alignment = 1
 
-[node name="RightSidebar" type="PanelContainer" parent="Margin/Main/Workspace" unique_id=1215320820]
+[node name="RightSidebar" type="PanelContainer" parent="Margin/Main/Body/Workspace" unique_id=1215320820]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(575, 0)
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 
-[node name="Tabs" type="TabContainer" parent="Margin/Main/Workspace/RightSidebar" unique_id=272235152]
+[node name="Tabs" type="TabContainer" parent="Margin/Main/Body/Workspace/RightSidebar" unique_id=272235152]
 unique_name_in_owner = true
 layout_mode = 2
 current_tab = 0
 
-[node name="TRACKS" type="VBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs" unique_id=971306051]
+[node name="TRACKS A" type="VBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs" unique_id=971306051]
 layout_mode = 2
 theme_override_constants/separation = 4
 metadata/_tab_index = 0
 
-[node name="Search" type="LineEdit" parent="Margin/Main/Workspace/RightSidebar/Tabs/TRACKS" unique_id=723729900]
+[node name="Search" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TRACKS A" unique_id=723729900]
 unique_name_in_owner = true
 layout_mode = 2
 placeholder_text = "SEARCH..."
 clear_button_enabled = true
 
-[node name="SortRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/TRACKS" unique_id=464819401]
+[node name="SortRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TRACKS A" unique_id=464819401]
 layout_mode = 2
 theme_override_constants/separation = 4
 
-[node name="Sort" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/TRACKS/SortRow" unique_id=1938417024]
+[node name="Sort" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TRACKS A/SortRow" unique_id=1938417024]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 text = "SORT: PATH"
 
-[node name="Playlist" type="OptionButton" parent="Margin/Main/Workspace/RightSidebar/Tabs/TRACKS/SortRow"]
+[node name="Playlist" type="OptionButton" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TRACKS A/SortRow"]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="Tracks" type="ItemList" parent="Margin/Main/Workspace/RightSidebar/Tabs/TRACKS" unique_id=469632169]
+[node name="TracksA" type="ItemList" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TRACKS A" unique_id=469632169]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_vertical = 3
 allow_reselect = true
 allow_rmb_select = true
 
-[node name="Count" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/TRACKS" unique_id=625848791]
+[node name="Count" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TRACKS A" unique_id=625848791]
 unique_name_in_owner = true
 layout_mode = 2
 text = "0 TRACKS // 0 FOLDERS"
 clip_text = true
 
-[node name="FOLDERS" type="VBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs" unique_id=138544178]
+[node name="TRACKS B" type="VBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs"]
 visible = false
 layout_mode = 2
 theme_override_constants/separation = 4
 metadata/_tab_index = 1
 
-[node name="FolderTree" type="Tree" parent="Margin/Main/Workspace/RightSidebar/Tabs/FOLDERS" unique_id=2011385958]
+[node name="SearchB" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TRACKS B"]
+unique_name_in_owner = true
+layout_mode = 2
+placeholder_text = "SEARCH..."
+clear_button_enabled = true
+
+[node name="SortRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TRACKS B"]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="SortB" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TRACKS B/SortRow"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+text = "SORT: PATH"
+
+[node name="PlaylistB" type="OptionButton" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TRACKS B/SortRow"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="TracksB" type="ItemList" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TRACKS B"]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_vertical = 3
+allow_reselect = true
+allow_rmb_select = true
+
+[node name="FOLDERS" type="VBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs" unique_id=138544178]
+visible = false
+layout_mode = 2
+theme_override_constants/separation = 4
+metadata/_tab_index = 1
+
+[node name="FolderTree" type="Tree" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/FOLDERS" unique_id=2011385958]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_vertical = 3
 hide_root = true
 select_mode = 1
 
-[node name="Row" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/FOLDERS" unique_id=1180919052]
+[node name="Row" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/FOLDERS" unique_id=1180919052]
 layout_mode = 2
 theme_override_constants/separation = 4
 
-[node name="AddFolder" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/FOLDERS/Row" unique_id=2011941274]
+[node name="AddFolder" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/FOLDERS/Row" unique_id=2011941274]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 text = "ADD FOLDER"
 
-[node name="RemoveFolder" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/FOLDERS/Row" unique_id=2004807346]
+[node name="RemoveFolder" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/FOLDERS/Row" unique_id=2004807346]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 text = "REMOVE FOLDER"
 
-[node name="Rescan" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/FOLDERS/Row" unique_id=267906757]
+[node name="Rescan" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/FOLDERS/Row" unique_id=267906757]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 text = "SCAN SONGS"
 
-[node name="VISUAL" type="VBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs" unique_id=1322001986]
+[node name="VISUAL" type="VBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs" unique_id=1322001986]
 visible = false
 layout_mode = 2
 theme_override_constants/separation = 4
 metadata/_tab_index = 2
 
-[node name="Skin" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=958039571]
+[node name="Skin" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=958039571]
 unique_name_in_owner = true
 layout_mode = 2
 text = "SKIN: WIN98"
 
-[node name="VizMode" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=849782670]
+[node name="VizMode" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=849782670]
 unique_name_in_owner = true
 layout_mode = 2
 text = "MODE: SEGMENTS"
 
-[node name="ColorRow" type="HFlowContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1050232331]
+[node name="ColorRow" type="HFlowContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1050232331]
 unique_name_in_owner = true
 layout_mode = 2
 theme_override_constants/h_separation = 3
 theme_override_constants/v_separation = 3
 
-[node name="SensLabel" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=919974982]
+[node name="SensLabel" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=919974982]
 unique_name_in_owner = true
 layout_mode = 2
 text = "SENSITIVITY"
 
-[node name="Sens" type="ProgressBar" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1162579438]
+[node name="Sens" type="ProgressBar" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1162579438]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(0, 14)
 layout_mode = 2
 show_percentage = false
 
-[node name="TiltLabel" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1450554535]
+[node name="TiltLabel" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1450554535]
 unique_name_in_owner = true
 layout_mode = 2
 text = "TILT"
 
-[node name="Tilt" type="ProgressBar" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=389914832]
+[node name="Tilt" type="ProgressBar" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=389914832]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(0, 14)
 layout_mode = 2
 show_percentage = false
 
-[node name="HeightLabel" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1003008467]
+[node name="HeightLabel" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1003008467]
 unique_name_in_owner = true
 layout_mode = 2
 text = "HEIGHT"
 
-[node name="Height" type="ProgressBar" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=62669292]
+[node name="Height" type="ProgressBar" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=62669292]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(0, 14)
 layout_mode = 2
 show_percentage = false
 
-[node name="SpeedLabel" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=236728132]
+[node name="SpeedLabel" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=236728132]
 layout_mode = 2
 text = "SPEED"
 
-[node name="Speed" type="ProgressBar" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=407863347]
+[node name="Speed" type="ProgressBar" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=407863347]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(0, 14)
 layout_mode = 2
 show_percentage = false
 
-[node name="Pad" type="Control" parent="Margin/Main/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1689130529]
+[node name="Pad" type="Control" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/VISUAL" unique_id=1689130529]
 layout_mode = 2
 size_flags_vertical = 3
 
-[node name="EQ" type="VBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs" unique_id=1062554345]
+[node name="EQ" type="VBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs" unique_id=1062554345]
 visible = false
 layout_mode = 2
 theme_override_constants/separation = 4
 metadata/_tab_index = 3
 
-[node name="TopRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ" unique_id=1672822435]
+[node name="TopRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ" unique_id=1672822435]
 layout_mode = 2
 theme_override_constants/separation = 4
 
-[node name="EqMode" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ/TopRow" unique_id=471200024]
+[node name="EqMode" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ/TopRow" unique_id=471200024]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 text = "EQ: OFF"
 
-[node name="EqAdapt" type="CheckBox" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ/TopRow" unique_id=1931688797]
+[node name="EqAdapt" type="CheckBox" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ/TopRow" unique_id=1931688797]
 unique_name_in_owner = true
 layout_mode = 2
 button_pressed = true
 text = "ADAPT"
 
-[node name="PresetRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ" unique_id=1983356053]
+[node name="PresetRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ" unique_id=1983356053]
 unique_name_in_owner = true
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ/PresetRow" unique_id=1643277970]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ/PresetRow" unique_id=1643277970]
 layout_mode = 2
 text = "PRESET:"
 
-[node name="EqPreset" type="OptionButton" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ/PresetRow" unique_id=1862083106]
+[node name="EqPreset" type="OptionButton" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ/PresetRow" unique_id=1862083106]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="EqPresetSave" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ/PresetRow" unique_id=1617017238]
+[node name="EqPresetSave" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ/PresetRow" unique_id=1617017238]
 unique_name_in_owner = true
 layout_mode = 2
 text = "SAVE"
 
-[node name="NameRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ" unique_id=337721958]
+[node name="NameRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ" unique_id=337721958]
 unique_name_in_owner = true
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ/NameRow" unique_id=1493843299]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ/NameRow" unique_id=1493843299]
 layout_mode = 2
 text = "NAME:"
 
-[node name="EqPresetName" type="LineEdit" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ/NameRow" unique_id=1342035835]
+[node name="EqPresetName" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ/NameRow" unique_id=1342035835]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 max_length = 18
 
-[node name="EzPanel" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ" unique_id=808878892]
+[node name="EzPanel" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ" unique_id=808878892]
 unique_name_in_owner = true
 visible = false
 layout_mode = 2
 size_flags_vertical = 3
 theme_override_constants/separation = 10
 
-[node name="AdvPanel" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/EQ" unique_id=715580073]
+[node name="AdvPanel" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/EQ" unique_id=715580073]
 unique_name_in_owner = true
 visible = false
 layout_mode = 2
 size_flags_vertical = 3
 theme_override_constants/separation = 2
 
-[node name="TBS" type="VBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs" unique_id=616485245]
+[node name="TBS" type="VBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs" unique_id=616485245]
 visible = false
 layout_mode = 2
 theme_override_constants/separation = 4
 metadata/_tab_index = 4
 
-[node name="FadeRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS" unique_id=1918302299]
+[node name="FadeRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=1918302299]
 layout_mode = 2
 theme_override_constants/separation = 4
 
-[node name="Fade" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/FadeRow" unique_id=2043920920]
+[node name="Fade" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FadeRow" unique_id=2043920920]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 text = "FADE: ON"
 
-[node name="FadeTimeRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS" unique_id=1789197361]
+[node name="FadeTimeRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=1789197361]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/FadeTimeRow" unique_id=1592443940]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FadeTimeRow" unique_id=1592443940]
 layout_mode = 2
 text = "FADE TIME (MS):"
 
-[node name="FadeMs" type="LineEdit" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/FadeTimeRow" unique_id=322705011]
+[node name="FadeMs" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FadeTimeRow" unique_id=322705011]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(110, 0)
 layout_mode = 2
@@ -587,15 +675,15 @@ text = "1000"
 alignment = 1
 max_length = 5
 
-[node name="PlayDelayRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS" unique_id=128861787]
+[node name="PlayDelayRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=128861787]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/PlayDelayRow" unique_id=442325572]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/PlayDelayRow" unique_id=442325572]
 layout_mode = 2
 text = "PLAY DELAY (MS):"
 
-[node name="DelayMs" type="LineEdit" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/PlayDelayRow" unique_id=1720157561]
+[node name="DelayMs" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/PlayDelayRow" unique_id=1720157561]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(110, 0)
 layout_mode = 2
@@ -604,28 +692,28 @@ text = "250"
 alignment = 1
 max_length = 4
 
-[node name="FeedSizeRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS" unique_id=1005053824]
+[node name="FeedSizeRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=1005053824]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/FeedSizeRow" unique_id=1384899945]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FeedSizeRow" unique_id=1384899945]
 layout_mode = 2
 text = "VISUAL FEED SIZE:"
 
-[node name="FeedSize" type="OptionButton" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/FeedSizeRow" unique_id=2097051602]
+[node name="FeedSize" type="OptionButton" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FeedSizeRow" unique_id=2097051602]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="FpsRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS" unique_id=98793351]
+[node name="FpsRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=98793351]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/FpsRow" unique_id=1299846815]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FpsRow" unique_id=1299846815]
 layout_mode = 2
 text = "MAX FRAMERATE:"
 
-[node name="MaxFps" type="LineEdit" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/FpsRow" unique_id=1144910952]
+[node name="MaxFps" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FpsRow" unique_id=1144910952]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(110, 0)
 layout_mode = 2
@@ -634,30 +722,30 @@ text = "30"
 alignment = 1
 max_length = 3
 
-[node name="BeatRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS"]
+[node name="BeatRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS"]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/BeatRow"]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/BeatRow"]
 layout_mode = 2
 text = "BEAT TRACKING:"
 
-[node name="BeatTrack" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/BeatRow"]
+[node name="BeatTrack" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/BeatRow"]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 text = "OFF"
 
-[node name="BoostRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS" unique_id=146351261]
+[node name="BoostRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=146351261]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="BoostLabel" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/BoostRow" unique_id=1586727178]
+[node name="BoostLabel" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/BoostRow" unique_id=1586727178]
 unique_name_in_owner = true
 layout_mode = 2
 text = "VOLUME BOOST: 0"
 
-[node name="Boost" type="ProgressBar" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/BoostRow" unique_id=1004281724]
+[node name="Boost" type="ProgressBar" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/BoostRow" unique_id=1004281724]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(0, 14)
 layout_mode = 2
@@ -665,37 +753,37 @@ size_flags_horizontal = 3
 size_flags_vertical = 4
 show_percentage = false
 
-[node name="LayoutRow" type="HBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS"]
+[node name="LayoutRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS"]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/LayoutRow"]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/LayoutRow"]
 layout_mode = 2
 text = "LAYOUT SETTINGS:"
 
-[node name="Layout" type="OptionButton" parent="Margin/Main/Workspace/RightSidebar/Tabs/TBS/LayoutRow"]
+[node name="Layout" type="OptionButton" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/LayoutRow"]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="STATS" type="VBoxContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs" unique_id=314964901]
+[node name="STATS" type="VBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs" unique_id=314964901]
 visible = false
 layout_mode = 2
 metadata/_tab_index = 5
 
-[node name="StatsScroll" type="ScrollContainer" parent="Margin/Main/Workspace/RightSidebar/Tabs/STATS"]
+[node name="StatsScroll" type="ScrollContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/STATS"]
 layout_mode = 2
 size_flags_vertical = 3
 horizontal_scroll_mode = 0
 
-[node name="Stats" type="Label" parent="Margin/Main/Workspace/RightSidebar/Tabs/STATS/StatsScroll" unique_id=1185936533]
+[node name="Stats" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/STATS/StatsScroll" unique_id=1185936533]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 clip_text = true
 text = "SOURCE..DEMO_TONE.WAV"
 
-[node name="Reboot" type="Button" parent="Margin/Main/Workspace/RightSidebar/Tabs/STATS" unique_id=1376236871]
+[node name="Reboot" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/STATS" unique_id=1376236871]
 unique_name_in_owner = true
 layout_mode = 2
 text = "REBOOT"

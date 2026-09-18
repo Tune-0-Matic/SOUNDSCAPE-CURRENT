@@ -13,6 +13,10 @@ godot-cpp checkout there is ~30 MB of files OneDrive will happily sync forever.
 
     scons godot_cpp_dir=C:/dev/godot-cpp target=template_debug
 
+The build tree (objects, SCons' signature database) goes beside godot-cpp, NOT into
+the project: <godot_cpp_dir>/../soundscape_dsp_build/<target>, so C:/dev/soundscape_dsp_build
+here. Override with build_dir=<path>. Only the finished library is copied into ../bin.
+
 api_version is pinned to 4.7 to match compatibility_minimum in
 soundscape.gdextension. godot-cpp master ships extension_api-4-7.json, whose
 AudioEffectInstance._process signature was diffed against this machine's own
@@ -49,6 +53,16 @@ if not os.path.isfile(os.path.join(godot_cpp_dir, "SConstruct")):
     print("")
     Exit(1)
 
+# --- build tree: outside OneDrive ----------------------------------------------
+# Object files and the signature database are rewritten on every build, and the database
+# alone is ~15 MB. Inside the OneDrive-synced project that is a sync lock waiting to land
+# in the middle of a link. One subdirectory per target, so switching between debug and
+# release stops recompiling the other one's objects. Popped for the same reason as above.
+build_root = os.path.abspath(ARGUMENTS.pop("build_dir", os.environ.get("SOUNDSCAPE_BUILD_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(godot_cpp_dir)), "soundscape_dsp_build"))))
+os.makedirs(build_root, exist_ok=True)
+SConsignFile(os.path.join(build_root, ".sconsign"))
+
 # api_version keeps the generated bindings on the 4.7 API. Passing it here rather
 # than relying on the default is what stops a godot-cpp master that has moved on to
 # 4.8 from silently generating bindings this engine cannot load.
@@ -56,7 +70,11 @@ env = SConscript(os.path.join(godot_cpp_dir, "SConstruct"), {"api_version": "4.7
 
 # --- our sources --------------------------------------------------------------
 env.Append(CPPPATH=["src/"])
-sources = Glob("src/*.cpp")
+build_dir = os.path.join(build_root, env["target"])
+objects = [
+    env.SharedObject(os.path.join(build_dir, os.path.splitext(os.path.basename(str(s)))[0]), s)
+    for s in Glob("src/*.cpp")
+]
 
 # --- RT-safety hardening ------------------------------------------------------
 # Exceptions are already off in godot-cpp's own flags; these are the two that matter
@@ -85,12 +103,16 @@ if env["platform"] == "macos":
         "../bin/libsoundscape_dsp.{}.{}.framework/libsoundscape_dsp.{}.{}".format(
             env["platform"], env["target"], env["platform"], env["target"]
         ),
-        source=sources,
+        source=objects,
     )
 else:
-    library = env.SharedLibrary(
-        "../bin/libsoundscape_dsp{}{}".format(env["suffix"], env["SHLIBSUFFIX"]),
-        source=sources,
-    )
+    # Linked in the build tree, then copied into ../bin: the project only ever receives
+    # the finished file, never a half-written one. no_import_lib because nothing links
+    # against this library -- Godot loads it at runtime -- so the MinGW import .a is waste.
+    library = env.Install("../bin", env.SharedLibrary(
+        os.path.join(build_dir, "libsoundscape_dsp{}{}".format(env["suffix"], env["SHLIBSUFFIX"])),
+        source=objects,
+        no_import_lib=True,
+    ))
 
 Default(library)

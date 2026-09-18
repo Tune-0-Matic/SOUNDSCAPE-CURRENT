@@ -199,6 +199,7 @@ The compiler gap is closed with a **portable** MinGW, nothing installed system-w
 | w64devkit (GCC, binutils, make) | `C:\dev\w64devkit` | 2.10.0, GCC 16.2.0 |
 | godot-cpp | `C:\dev\godot-cpp` (outside OneDrive) | pinned `6cceaf6a`, `extension_api-4-7.json` |
 | dr_flac | `extension/src/dr_flac.h` (vendored) | 0.13.4, public domain / MIT-0 |
+| dr_wav | `extension/src/dr_wav.h` (vendored) | 0.14.6, dr_libs `019e75ba`, public domain / MIT-0 |
 | SCons | pip | 4.11.1 |
 
 ```bash
@@ -209,7 +210,14 @@ PATH="/c/dev/w64devkit/bin:$PATH" scons godot_cpp_dir=C:/dev/godot-cpp platform=
 
 The first build of each target compiles all of godot-cpp (6-10 minutes); after that only
 `src/*.cpp` rebuild. godot-cpp links MinGW builds with `-static-libgcc -static-libstdc++`, so
-the DLL needs no MinGW runtime beside it.
+the DLL needs no MinGW runtime beside it. Its only imports are `KERNEL32.dll` and `msvcrt.dll`
+(the C runtime every Windows install ships) -- no Visual C++ redistributable.
+
+Nothing of the build tree lives in the project. Objects and SCons' signature database go to
+`C:\dev\soundscape_dsp_build\<target>` (beside godot-cpp; `build_dir=` overrides), the DLL is
+linked there and only then copied into `bin/`, and no MinGW import `.a` is produced. Before
+2026-09-14 the `.o` files, a 15 MB `.sconsign.dblite` and the `.a` files all sat inside the
+OneDrive-synced project.
 
 One binding detail cost a build: in the 4.7 API every playback virtual returns `double`
 except `AudioStreamPlaybackResampled._get_stream_sampling_rate`, which is `float`. Check
@@ -220,3 +228,35 @@ Verified on the debug DLL:
 - `test_flac_native.gd`: **PASS**, a 24-bit / 96 kHz FLAC decoded by `SsFlacStream` matches
   ffmpeg's own float decode sample for sample (576000 samples, 0 mismatches), and plays,
   seeks and finishes on a real `AudioStreamPlayer`
+
+---
+
+## 8. Audiophile DSP pass (2026-09-16)
+
+New in `src/`, all on the rt.h contract (no allocation, locks, Godot API or I/O on the audio thread):
+
+| File | What |
+|---|---|
+| `resampler.h` | `SincResampler` + `StreamPlayer`. Kaiser windowed sinc, 120 dB stopband starting at the passband's mirror about the lower Nyquist (transition leakage lands above the passband, never in it), passband to 91 % of that Nyquist, one precomputed tap row per EXACT rational phase (out/gcd per source frame), so rate conversion has no drift. Equal rates are a straight copy. Taps in eight fixed-order float lanes (AVX or SSE2, same bits either way); unity pitch on its own integer-phase loop. DSD keeps its stopband at Nyquist. |
+| `ss_flac.*`, `ss_wav.*` | Playbacks now derive from `AudioStreamPlayback` and implement `_mix` at the mix rate through `StreamPlayer`, replacing `AudioStreamPlaybackResampled` (Godot's 4-point cubic). `render(out_rate, from_seconds, frames)` drives the same `_mix` offline for tests. |
+| `ss_dsd.*` | `SsDsdStream` / `SsDsdPlayback` for `.dsf` and `.dff` (DSD64/128/256, 44.1 and 48 kHz families; DST refused). Stage 1: 128-taps-per-byte-of-rate Kaiser FIR (beta 14.5) as one table lookup per byte, to 8x base rate. Stage 2: `SincResampler` to the mix rate, passband held to 30 kHz. |
+| `ss_parallel.*` | `SsParallel` TAP/BLEND pair: TAP copies the block, BLEND outputs `wet * mix + dry * (1 - mix)`, MIX ramped per block. `fx_rack.gd` wraps every module in a pair. |
+
+Measured through the real `_mix` path (`test_flac_native.gd`, `test_wav_native.gd`, `test_dsd_native.gd`, `test_fx_rack.gd`):
+
+- 24-bit 44.1 kHz -> 96 kHz: exactly 96000 frames per second of source; 1 kHz THD+N -139.1 dB, 18 kHz -124.3 dB (its image at 26.1 kHz, 2 kHz into the stopband), both flat to 0.00001 dB. 48, 88.2 and 192 kHz and float WAV: -135 to -142 dB. Before: Godot's cubic, -26 dB at 10 kHz and -19.9 ppm.
+- A seek lands on exactly the samples a continuous render gives; 96 kHz at a 96 kHz mix is bit-identical to `decode_frames`.
+- DSD: the same bit stream as DSF and DFF decodes bit-identically; tones at +0.0000 / +0.0003 dB; channel bleed -111 / -168 dB; hostile chunk sizes, DST and non-DSD rates refused.
+- SsParallel on a live bus: MIX 0 bit-identical to dry, MIX 1 and 0.25 exact to the formula (worst error < 1e-10).
+- Cost over a 96 kHz passthrough, one core: 1.3-1.8 ms per second of 44.1 -> 96 kHz stereo, 0.7-1.1 ms at 48 kHz, 2.0-2.7 ms at 192 kHz (was 13.9 ms at 44.1 kHz before the lanes, mirrored stopband and unity loop).
+- Why cost gets this much care: Godot's Dummy audio driver (every headless test) sleeps a fixed whole number of milliseconds after each mix, so mix time slows the audio clock against wall time, by several times what a benchmark predicts on this laptop. `test_video_test.gd` and `test_video_fixture.gd` compare a wall-clock picture to that clock at 0.12 s. With the first sinc they failed; now they pass as often as with the old cubic path. The fixture test flakes with EITHER DLL when the machine is loaded (measured 2026-09-16: old DLL 0.120-0.123 s on three runs in a row while the new one passed).
+
+## 9. LISTENING MODE, BBE / T-BASS in the rack (2026-09-16)
+
+| File | What |
+|---|---|
+| `ss_casual.*` | `SsCasualCurve`, LISTENING MODE CASUAL (SMOOTH), a warm phase-linear curve: +2.2 dB below 120 Hz, a -0.8 dB bell at 3 kHz, flat to 8.5 kHz rolling off to -1.5 dB at 16 kHz. Low shelf = the input delayed plus 0.288 x four cascaded moving averages (half amplitude at 120 Hz); then ONE symmetric FIR, the design-time convolution of the bell (an impulse plus -0.088 x a Gaussian window modulated to 3 kHz) and the rolloff (a Kaiser lowpass with its transition exactly 8.5 -> 16 kHz at 60 dB). `AudioEngine` puts it on Master directly ahead of the safety limiter and switches it OUT for AUDIOPHILE (DIRECT), so DIRECT is bit-exact and free. `reset()` clears the delay lines before it is switched in. |
+
+Measured (`test_ss_effect.gd` 7-9, 96 kHz mix): switched out, bit-identical; switched in, an impulse peaks exactly `get_latency_frames()` = 604 frames (6.29 ms) after it starts and is symmetric about the peak (linear phase), no crosstalk, and the response matches the double-precision design to 0.01 dB: +2.12 dB at 30 Hz, +1.17 at 120 Hz, -0.05 at 1 kHz, -0.39 at 2 kHz, -0.80 at 3 kHz, 0.00 at 8.5 kHz, -0.72 at 12.25 kHz, -1.50 at 16 and 40 kHz.
+
+T-BASS and BBE moved out of `equalizer.gd` (serial, forced to zero, no control since the fixed rack went) into `fx_rack.gd` modules, each inside its own SsParallel TAP/BLEND pair with the old tuning. Any rack module at MIX 0 is now switched out whole once its BLEND has run three blocks at 0 (no click, no CPU), and pairs switch TAP and BLEND in before the wet effects and out after them, so a block mixed between two lock-taking enables still passes dry. `test_fx_rack.gd` 8: both modules change the signal at MIX 1 and give the dry signal bit-identical at MIX 0 and removed.

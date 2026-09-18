@@ -8,6 +8,8 @@ extends SceneTree
 ##      themselves instead of freezing on their last frame -- while the hue keeps drifting
 ## The director never enters the tree, so nothing but this script writes its levels; a real,
 ## playing AudioStreamPlayer is what makes is_live() true.
+##   4. nobody can see it: inside a SubViewport switched to UPDATE_DISABLED -- what its container
+##      does while a Video TEST picture hides the cell -- _process does no work, and wakes when on
 ##   godot --headless --path . --script res://test_viz_fps.gd
 
 const RATES := [60.0, 144.0, 240.0]
@@ -126,6 +128,32 @@ func _initialize() -> void:
 		print("%s: lit while playing %s; stopped 8 s -> bars at 0 %s, residue %.5f, hue still drifting %s: %s" % [
 			Visualizer.Mode.keys()[mode], lit, bars_zero, left, drifting, empty])
 		viz.free()
+
+	# 4. inside a disabled SubViewport nothing moves; switched back on, the bars rise. The viewport
+	# is disabled BEFORE the visualizer enters it: the engine steps _process once on the way in,
+	# and that frame must already see a viewport nobody can look at.
+	await _start(player)
+	var sub := SubViewport.new()
+	sub.render_target_update_mode = SubViewport.UPDATE_DISABLED
+	root.add_child(sub)
+	var hidden := Visualizer.new()
+	hidden.director = director
+	director.levels.fill(1.0)
+	sub.add_child(hidden)
+	await process_frame
+	hidden.set_process(false)   # stepped by hand from here on, as everywhere in this test
+	hidden.color_index = Visualizer.PRESETS.size()   # the rainbow slot, so the hue would drift
+	var hue_before: float = hidden._hue
+	_run(hidden, 60.0, 0.5)
+	var idle: bool = hidden._v[0] == 0.0 and hidden._hue == hue_before
+	sub.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	_run(hidden, 60.0, 0.5)
+	var wakes: bool = hidden._v[0] > 0.5
+	var skipped := idle and wakes
+	ok = ok and skipped
+	print("inside a disabled SubViewport: bars held at 0 and the hue still %s; viewport back on, bars rose %s: %s" % [
+		idle, wakes, skipped])
+	sub.queue_free()
 
 	player.stop()
 	print("RESULT ", "PASS" if ok else "FAIL")

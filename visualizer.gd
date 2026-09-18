@@ -27,6 +27,11 @@ var color_index := 0
 ## 0..1 -> dB floor -80..-40 (0.5 is the -60 the display is tuned around). A higher
 ## setting raises the floor, so quieter detail reaches full height.
 var sensitivity := 0.5
+
+## The dB an empty bar sits at for the current sensitivity. The Video TEST picture's kick pulse
+## reads the same scale (VideoTest.kick), so the bars and the colour agree on what loud is.
+func db_floor() -> float:
+	return lerpf(-80.0, -40.0, clampf(sensitivity, 0.0, 1.0))
 ## Cancels the library's ~39 dB natural slope (band 0 peaks -7 dBFS, band 28 -46).
 ## At 0 the top two thirds of the display never leave the floor.
 var tilt_db := 20.0
@@ -312,6 +317,13 @@ static func gradient_test() -> bool:
 func _process(delta: float) -> void:
 	if not director:
 		return
+	# Nothing can see this: the SubViewportContainer switches its viewport to UPDATE_DISABLED
+	# while it is hidden -- a Video TEST picture over the cell, or the feed at GONE -- and the
+	# band smoothing, the stepped modes' texture uploads and the redraw would all be work for no
+	# pixels (measured: 60 redraws in 60 frames behind a video picture, audit P1).
+	var vp := get_viewport() as SubViewport
+	if vp and vp.render_target_update_mode == SubViewport.UPDATE_DISABLED:
+		return
 	var n := AudioDirector.BAND_COUNT
 	if color_index >= PRESETS.size():
 		# ~16 s per full cycle at the middle SPEED setting: a slow drift, not a strobe.
@@ -362,7 +374,7 @@ func _process(delta: float) -> void:
 		_peak.fill(0.0)
 		_db.fill(0.0)
 	else:
-		var floor_db: float = lerpf(-80.0, -40.0, clampf(sensitivity, 0.0, 1.0))
+		var floor_db := db_floor()
 		var atk := _attack()
 		var rel := _release()
 		var pf := _peak_fall()

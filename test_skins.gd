@@ -6,6 +6,8 @@ extends SceneTree
 ##   3. applying the user skin paints its colours, puts its border width ONLY on boxes that
 ##      already had a border, and rounds corners
 ##   4. switching back to a built-in restores the stock 1 px borders and square corners
+##   5. a skin's video palette runs screen -> accent -> screen text, a user skin's included,
+##      an accent that repeats an end is left out, and an unknown name falls back to WIN98's
 ## Works in user://skin_test and removes it; the real user://skins is never touched.
 ##   godot --headless --path . --script res://test_skins.gd
 
@@ -50,6 +52,16 @@ func _initialize() -> void:
 		and panel.corner_radius_top_left == 0 and panel.bg_color == Skins.SCHEMES["WIN98"]["panel"]
 	ok = ok and restored
 	print("back on WIN98: stock borders, square corners and colours restored: %s" % restored)
+
+	var tokyo: Dictionary = Skins.SCHEMES["TOKYO"]
+	var amber: Dictionary = Skins.SCHEMES["AMBER"]
+	var neon_ramp := Skins.video_ramp("NEON")
+	var ramps: bool = Skins.video_ramp("TOKYO").colors == PackedColorArray([tokyo["screen"], tokyo["accent"], tokyo["screen_text"]]) \
+		and Skins.video_ramp("AMBER").colors == PackedColorArray([amber["screen"], amber["screen_text"]]) \
+		and neon_ramp.get_color(1) == Color.html("#39ff14") and neon_ramp.get_color(0) == Skins.SCHEMES["WIN98"]["screen"] \
+		and Skins.video_ramp("NO_SUCH_SKIN").colors == Skins.video_ramp("WIN98").colors
+	ok = ok and ramps
+	print("video palettes run screen -> accent -> screen text (TOKYO, user NEON), AMBER's repeated accent dropped, unknown names are WIN98: %s" % ramps)
 
 	root.free()
 	for f in DirAccess.get_files_at(DIR):

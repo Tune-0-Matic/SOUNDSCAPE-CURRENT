@@ -5,10 +5,15 @@
 
 #include "register_types.h"
 
+#include "ss_casual.h"
+#include "ss_dsd.h"
 #include "ss_effect.h"
 #include "ss_flac.h"
+#include "ss_parallel.h"
+#include "ss_wav.h"
 
 #include <gdextension_interface.h>
+#include <godot_cpp/classes/audio_server.hpp>
 #include <godot_cpp/core/defs.hpp>
 #include <godot_cpp/godot.hpp>
 
@@ -27,16 +32,42 @@ void initialize_soundscape_dsp(ModuleInitializationLevel p_level) {
 	GDREGISTER_CLASS(SsEffect);
 	GDREGISTER_CLASS(SsFlacPlayback);
 	GDREGISTER_CLASS(SsFlacStream);
+	GDREGISTER_CLASS(SsWavPlayback);
+	GDREGISTER_CLASS(SsWavStream);
+	GDREGISTER_CLASS(SsDsdPlayback);
+	GDREGISTER_CLASS(SsDsdStream);
+	GDREGISTER_CLASS(SsParallelInstance);
+	GDREGISTER_CLASS(SsParallel);
+	GDREGISTER_CLASS(SsCasualCurveInstance);
+	GDREGISTER_CLASS(SsCasualCurve);
 }
 
 void uninitialize_soundscape_dsp(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
-	// Nothing to tear down: every SharedState is owned by its SsEffect's shared_ptr
-	// and dies with it. There is no global state in this extension, deliberately --
-	// a static that outlives the engine's audio server is a shutdown crash waiting
-	// for a user to close the program while a track is playing.
+	// Every SharedState is owned by its effect's shared_ptr and dies with it. There is no global state
+	// in this extension, deliberately -- a static that outlives the engine's audio server is a
+	// shutdown crash waiting for a user to close the program while a track is playing.
+	//
+	// But the EFFECTS can outlive us. Godot 4.7's Main::cleanup deinitializes extensions at this level
+	// BEFORE audio_server->finish() frees the buses, so an SsParallel, SsCasualCurve or SsEffect still
+	// on a bus at quit was destroyed after its class had been unregistered -- a dangling pointer that
+	// crashed about one exit in ten (measured 2026-09-16 with the CASUAL curve left on Master). The
+	// server is still alive here, so every effect of ours comes off every bus now, while its class exists.
+	AudioServer *server = AudioServer::get_singleton();
+	if (server == nullptr) {
+		return;
+	}
+	for (int32_t bus = server->get_bus_count() - 1; bus >= 0; --bus) {
+		for (int32_t i = server->get_bus_effect_count(bus) - 1; i >= 0; --i) {
+			const Ref<AudioEffect> effect = server->get_bus_effect(bus, i);
+			if (Object::cast_to<SsParallel>(effect.ptr()) || Object::cast_to<SsCasualCurve>(effect.ptr())
+					|| Object::cast_to<SsEffect>(effect.ptr())) {
+				server->remove_bus_effect(bus, i);
+			}
+		}
+	}
 }
 
 extern "C" {

@@ -129,6 +129,26 @@ static func names() -> Array:
 		out.append(n)
 	return out
 
+## A built-in or user scheme by name; anything unknown is WIN98.
+static func scheme(name: String) -> Dictionary:
+	return SCHEMES.get(name, user_schemes.get(name, SCHEMES["WIN98"]))
+
+## The Video TEST picture's palette for a skin, dark to light as video_test.gdshader samples
+## it: the screen's own background, through the accent, up to the screen's text colour. The
+## picture then reads as part of that skin's screen instead of a green terminal pasted in.
+## An accent that repeats an end (AMBER, TERMINAL and BLACK use their text colour) is left
+## out: the shader draws four stops, and a repeated colour would spend one of them twice.
+static func video_ramp(name: String) -> Gradient:
+	var s := scheme(name)
+	var g := Gradient.new()
+	if s.accent.is_equal_approx(s.screen) or s.accent.is_equal_approx(s.screen_text):
+		g.offsets = PackedFloat32Array([0.0, 1.0])
+		g.colors = PackedColorArray([s.screen, s.screen_text])
+	else:
+		g.offsets = PackedFloat32Array([0.0, 0.5, 1.0])
+		g.colors = PackedColorArray([s.screen, s.accent, s.screen_text])
+	return g
+
 ## Rescans `dir` (created if missing, so the folder itself documents where skins go) and
 ## returns the names that loaded. Cheap enough to call on every SKIN click.
 static func load_user_skins(dir := USER_SKIN_DIR) -> Array[String]:
@@ -184,7 +204,7 @@ static func parse_skin(path: String) -> Dictionary:
 	return s
 
 static func apply(theme: Theme, root: Control, name: String) -> void:
-	var s: Dictionary = SCHEMES.get(name, user_schemes.get(name, SCHEMES["WIN98"]))
+	var s: Dictionary = scheme(name)
 	var a2: Color = s.get("accent2", s.accent)
 	# One theme-changed pass, not sixty-odd.
 	#

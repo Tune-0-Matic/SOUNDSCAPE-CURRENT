@@ -2,7 +2,15 @@ extends SceneTree
 ## The recorder against a live Master bus: it must capture real audio, drop NOTHING even
 ## across a STALL_MS main-thread stall mid-take, lose nothing the drop counter would miss,
 ## keep RAM flat (it streams to disk rather than accumulating an AudioStreamWAV), and
-## produce a file ffmpeg will actually open.
+## produce a file ffmpeg will actually open -- converted on a worker, so stop() returns at once.
+## Then the conversion itself, offline, on float takes written here:
+##   - 16-bit and 24-bit are TPDF-dithered: a DC input of 0.3 LSB comes out as a signal whose
+##     error variance is 0.25 LSB^2 (TPDF's 1/6 plus quantisation's 1/12) over at least three
+##     codes, with the mean carried rather than rounded away (16-bit +0.3 LSB; ffmpeg's 24-bit
+##     encoders truncate, so -0.2)
+##   - 32-bit WAV is not dithered: the same input comes out as a single code
+##   - +/-1.2 full-scale overs clamp at the top and bottom codes, never wrap
+##   - FLAC is 24-bit and dithered the same way
 ##   godot --headless --path . --script res://test_recorder.gd
 
 ## Main-thread stall injected mid-take -- about what a synchronous rescan of a large
@@ -69,7 +77,10 @@ func _initialize() -> void:
 	while Time.get_ticks_msec() - t1 < 2000:
 		await process_frame
 	var wall_s := float(Time.get_ticks_msec() - t0) / 1000.0
-	rec.stop(0, 0, 1)   # synchronous: drains what is left, patches the header, converts
+	var stop_at := Time.get_ticks_usec()
+	rec.stop(0, 0, 1)   # drains what is left and patches the header; the conversion runs on a worker
+	var stop_ms := (Time.get_ticks_usec() - stop_at) / 1000.0
+	var async_finish: bool = not done[0]   # a synchronous conversion would have emitted finished inside stop()
 	var captured := rec.frames_written
 	var dropped := rec.discarded
 	guard = 0
@@ -111,8 +122,84 @@ func _initialize() -> void:
 	ok = ok and no_temp
 	print("float intermediate cleaned up after conversion: %s" % no_temp)
 
+	var nonblocking: bool = async_finish and stop_ms < 250.0
+	ok = ok and nonblocking
+	print("stop() returned in %.1f ms, before the conversion finished on its worker: %s" % [stop_ms, nonblocking])
+
 	if FileAccess.file_exists(out_path[0]):
 		DirAccess.remove_absolute(out_path[0])
+
+	# the conversion, offline: TPDF dither, no dither at 32 bits, and clean full scale
+	for spec in [["WAV", 0, 16], ["WAV", 1, 24], ["WAV", 2, 32], ["FLAC", 1, 24]]:
+		var good := _dither_case(rec, dir, spec[0], spec[1], spec[2])
+		ok = ok and good
 	DirAccess.remove_absolute(dir)
 	print("RESULT ", "PASS" if ok else "FAIL")
 	quit(0 if ok else 1)
+
+## One conversion at the mix rate (no resampling): 1 s of DC at 0.3 of the TARGET's LSB, then
+## +1.2 and -1.2 overs. Read back as 32-bit integers and measured in target LSBs.
+func _dither_case(rec: Recorder, dir: String, type: String, quality: int, bits: int) -> bool:
+	var rate := 96000
+	var lsb := 1.0 / float(1 << (bits - 1)) if bits < 32 else 1.0 / 32768.0
+	var n := rate
+	var raw := dir.path_join("dither_%s_%d.f32.wav" % [type, bits])
+	var f := FileAccess.open(raw, FileAccess.WRITE)
+	var data := PackedByteArray()
+	data.resize((n + 200) * 8)
+	for i in n:
+		data.encode_float(i * 8, 0.3 * lsb)
+		data.encode_float(i * 8 + 4, 0.3 * lsb)
+	for i in 200:
+		var v := 1.2 if i < 100 else -1.2
+		data.encode_float((n + i) * 8, v)
+		data.encode_float((n + i) * 8 + 4, v)
+	f.store_string("RIFF")
+	f.store_32(36 + data.size())
+	f.store_string("WAVEfmt ")
+	f.store_32(16)
+	f.store_16(3)
+	f.store_16(2)
+	f.store_32(rate)
+	f.store_32(rate * 8)
+	f.store_16(8)
+	f.store_16(32)
+	f.store_string("data")
+	f.store_32(data.size())
+	f.store_buffer(data)
+	f.close()
+	var out := rec._convert(raw, Recorder.FILE_TYPES.find(type), Recorder.RATES.find(rate), quality)
+	var pcm := dir.path_join("dither_%s_%d.s32" % [type, bits])
+	var read_back := not out.is_empty() and OS.execute("ffmpeg", ["-v", "error", "-y", "-i", out,
+		"-f", "s32le", "-c:a", "pcm_s32le", pcm], [], true) == 0
+	var probe := []
+	OS.execute("ffprobe", ["-v", "error", "-show_entries", "stream=bits_per_raw_sample,bits_per_sample",
+		"-of", "csv=p=0", out], probe, true)
+	var ints := FileAccess.get_file_as_bytes(pcm) if read_back else PackedByteArray()
+	var scale := float(1 << (32 - bits)) if bits < 32 else 65536.0
+	var sum := 0.0
+	var sq := 0.0
+	var codes := {}
+	for i in n * 2:
+		var v := float(ints.decode_s32(i * 4)) / scale
+		sum += v
+		sq += v * v
+		codes[v] = true
+	var mean := sum / float(n * 2)
+	var variance := sq / float(n * 2) - mean * mean
+	var top := float(ints.decode_s32(n * 2 * 4 + 100)) / scale if ints.size() > (n + 150) * 8 else 0.0
+	var bottom := float(ints.decode_s32((n + 150) * 2 * 4)) / scale if ints.size() > (n + 150) * 8 else 0.0
+	var hi := float((1 << (bits - 1)) - 1) if bits < 32 else 32767.99998
+	var lo := -float(1 << (bits - 1)) if bits < 32 else -32768.0
+	var good: bool
+	if bits < 32:
+		good = read_back and absf(variance - 0.25) < 0.03 and codes.size() >= 3 and mean > -0.3 and mean < 0.35 \
+			and absf(top - hi) < 0.001 and absf(bottom - lo) < 0.001
+	else:
+		good = read_back and codes.size() == 1 and top > 32767.0 and bottom <= -32768.0
+	print("dither %s %d-bit: 0.3 LSB DC -> mean %+.3f LSB, error variance %.3f LSB^2 over %d codes; +/-1.2 overs -> %.1f / %.1f (limits %.1f / %.1f); stream bits %s: %s" % [
+		type, bits, mean, variance, codes.size(), top, bottom, hi, lo, str(probe[0]).strip_edges() if not probe.is_empty() else "?", good])
+	for p in [raw, out, pcm]:
+		if FileAccess.file_exists(p):
+			DirAccess.remove_absolute(p)
+	return good

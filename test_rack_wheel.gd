@@ -17,7 +17,7 @@ func _initialize() -> void:
 	var p := PanelContainer.new()
 	p.set_script(load("res://player.gd"))
 	var rack := FxRack.new()
-	p.set("_rack", rack)
+	(p.get("_rack_decks") as Array).append(rack)   # deck 0's rack; the rows take a deck index
 	var parent := VBoxContainer.new()
 	var up := InputEventMouseButton.new()
 	up.button_index = MOUSE_BUTTON_WHEEL_UP
@@ -34,8 +34,8 @@ func _initialize() -> void:
 			var lo: float = spec[1]
 			var hi: float = spec[2]
 			var eps := (hi - lo) * 1e-6
-			p.call("_rack_row", parent, type, key)
-			var bar: ProgressBar = (p.get("_rack_bars") as Dictionary)["%s/%s" % [type, key]][0]
+			p.call("_rack_row", 0, parent, type, key)
+			var bar: ProgressBar = (p.get("_rack_bars")[0] as Dictionary)["%s/%s" % [type, key]][0]
 			rack.set_param(type, key, lo)
 			_tick(p, bar, up, true)
 			var one := absf(float(rack.fx[type][key]) - (lo + (hi - lo) * fine)) <= eps
