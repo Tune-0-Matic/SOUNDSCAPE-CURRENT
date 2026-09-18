@@ -105,6 +105,35 @@ func _initialize() -> void:
 	ok = ok and media
 	print("media keys resolve to their transport actions: %s" % media)
 
+	# the two focus contexts. The rule they exist for: SPACE, the arrows and TAB are transport
+	# keys, so in the MOUSE context nothing may hold focus and take them, and in the KEYBOARD
+	# context the same controls must be reachable.
+	var probes: Array[Control] = [Button.new(), OptionButton.new(), ItemList.new(), Tree.new(), TabBar.new()]
+	var typed := LineEdit.new()
+	var mouse_ctx := true
+	var kb_ctx := true
+	for mode in [false, true]:
+		p.set("_kb_nav", mode)
+		for probe in probes:
+			p.call("_drop_focus", probe)
+			var want: int = Control.FOCUS_ALL if mode else Control.FOCUS_NONE
+			if mode:
+				kb_ctx = kb_ctx and probe.focus_mode == want
+			else:
+				mouse_ctx = mouse_ctx and probe.focus_mode == want
+		# a text field is never touched by either context: typing has to keep working
+		var typed_was := typed.focus_mode
+		p.call("_drop_focus", typed)
+		mouse_ctx = mouse_ctx and typed.focus_mode == typed_was
+	var nav_bound: bool = p.call("_action_for_key", KEY_F2) == "kb_nav"
+	var contexts := mouse_ctx and kb_ctx and nav_bound
+	ok = ok and contexts
+	print("focus contexts: mouse takes no focus %s, keyboard takes it %s, LineEdit untouched, F2 enters %s: %s" % [
+		mouse_ctx, kb_ctx, nav_bound, contexts])
+	for probe in probes:
+		probe.free()
+	typed.free()
+
 	print("RESULT ", "PASS" if ok else "FAIL")
 	p.free()
 	quit(0 if ok else 1)

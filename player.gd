@@ -122,6 +122,7 @@ const KEYBIND_SPEC := {
 	"deck_a": ["DECK A", KEY_1],
 	"deck_b": ["DECK B", KEY_2],
 	"deck_both": ["DECK A+B", KEY_TAB],
+	"kb_nav":      ["KEYBOARD NAVIGATION", KEY_F2],
 	"mark_mode":   ["MARK MODE", KEY_M],
 	"cursor":      ["HIDE CURSOR", KEY_H],
 	"simple_mode": ["VISUALIZER FULLSCREEN", KEY_F1],
@@ -297,6 +298,7 @@ func _ready() -> void:
 	assert(cue_test())                  # marker hit-testing and cue id allocation
 	assert(DeckController.deck_test())  # cue mirroring under REV, and the skip-and-stop rule
 	assert(settings_test())             # every settings row lands in exactly one group, and is findable
+	assert(set_export_test())           # the recorded set's running order, as text and as a CUE sheet
 	assert(ts_test())                   # MM:SS:MS formatting and its round trip
 	assert(key_test())                  # reserved keys, collisions, and clearing
 	assert(AudioEngine.deck_test())     # crossfader gain law and its silence floor
@@ -573,6 +575,11 @@ func _ready() -> void:
 		_note = ""
 		_clear_note_later())
 	_engine.track_failed.connect(_on_track_failed)
+	# the overview arrives from a worker some seconds after the track starts; without this the
+	# bar would only pick it up at the next redraw it happened to do for another reason
+	_engine.waveform_ready.connect(func(path: String) -> void:
+		if path == _bar_path() and is_instance_valid(_cue_overlay):
+			_cue_overlay.queue_redraw())
 	# a spectral estimate arrives asynchronously, well after the track may already be
 	# playing (or may have already changed) -- only worth repainting for the track it
 	# is actually about
@@ -1445,6 +1452,7 @@ func _on_track_ready(path: String, stream: AudioStream, _meta: Dictionary, deck:
 		return
 	_note = ""
 	_current = path
+	_note_track_for_set(path)     # the running order of a take, if one is recording
 	_decks.fail_streak = 0        # something played: whatever came before it was a run of bad files
 	_decks.auto_advancing = false
 	_refresh_rev_btn()
@@ -4316,6 +4324,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			_toggle_both()
 			get_viewport().set_input_as_handled()
 			return
+		"kb_nav":
+			_set_kb_nav(not _kb_nav)
+			get_viewport().set_input_as_handled()
+			return
 		"mark_mode":
 			%Mark.button_pressed = not %Mark.button_pressed
 			get_viewport().set_input_as_handled()
@@ -4355,7 +4367,12 @@ func _unhandled_input(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 		return
 	if k.keycode == KEY_ESCAPE:
-		if _feed == Feed.FULLSCREEN:
+		# the innermost thing first: leaving keyboard navigation should not also drop the
+		# window out of fullscreen
+		if _kb_nav:
+			_set_kb_nav(false)
+			get_viewport().set_input_as_handled()
+		elif _feed == Feed.FULLSCREEN:
 			_toggle_simple_mode()
 			get_viewport().set_input_as_handled()
 		elif _window_is_fullscreen():
@@ -4646,6 +4663,11 @@ func _begin_boot() -> void:
 ## Godot's own GUI dispatch, so the rebind button holding focus never turns a captured
 ## SPACE or ENTER into a click on itself first.
 func _input(event: InputEvent) -> void:
+	# A press anywhere returns to the mouse context. Without this, clicking a button in keyboard
+	# mode would leave it focused and eating SPACE -- the exact failure the two contexts exist
+	# to prevent, arrived at from the other direction.
+	if _kb_nav and event is InputEventMouseButton and (event as InputEventMouseButton).pressed:
+		_set_kb_nav(false)
 	if not _awaiting_rebind.is_empty():
 		if event is InputEventKey and event.pressed and not event.is_echo():
 			_finish_rebind(event.keycode)
@@ -4900,8 +4922,84 @@ func _label_clipped_controls(from: Node = null) -> void:
 				ctrl.tooltip_text = ""
 				ctrl.remove_meta("clip_tip")
 
+## FOCUS IS A CONTEXT, and the reason is the keyboard map. SPACE is PAUSE/PLAY, the arrows are
+## seek and volume, TAB is DECK A+B -- which is every key focus navigation needs. Turning focus
+## on for everything, the obvious reading of "remove the blanket FOCUS_NONE", would hand all five
+## to whichever button was last clicked and take the transport off the keyboard.
+##
+## So there are two contexts and the program is always plainly in one of them:
+##
+##   MOUSE (default)  no control takes focus, and every shortcut means what it says.
+##   KEYBOARD (F2)    buttons, lists and tabs take focus; TAB and the arrows move between them
+##                    and ENTER/SPACE press the one you are on, because Godot's GUI consumes
+##                    those before _unhandled_input ever sees them. ESC or F2 goes back.
+##
+## Nothing is lost in either direction: the shortcuts the GUI does not want (1, 2, M, H, F1,
+## F11, the media keys) still work while navigating, and a click anywhere drops straight back to
+## the mouse context so a stray focus can never be why SPACE stopped playing.
+var _kb_nav := false
+## The control the focus ring is on, tinted so it is visible on a theme with no focus stylebox.
+var _kb_focused: Control
+const KB_FOCUS_TINT := Color(1.35, 1.35, 1.0)
+
+func _set_kb_nav(on: bool) -> void:
+	if _kb_nav == on:
+		return
+	_kb_nav = on
+	_apply_focus_policy()
+	if on:
+		# start where the user is looking: the page of whichever tab is open
+		var page: Control = _tabs.get_current_tab_control() if is_instance_valid(_tabs) else null
+		var first := _first_focusable(page if page else self)
+		if first:
+			first.grab_focus()
+		_note = "  //  KEYBOARD NAVIGATION  //  TAB AND ARROWS MOVE  //  ENTER PRESSES  //  ESC LEAVES"
+	else:
+		_tint_focus(null)
+		var owner := get_viewport().gui_get_focus_owner()
+		if owner and not owner is LineEdit:
+			owner.release_focus()
+		_note = "  //  MOUSE MODE"
+		_clear_note_later()
+
+func _first_focusable(from: Node) -> Control:
+	var stack: Array[Node] = [from]
+	while not stack.is_empty():
+		var n: Node = stack.pop_front()
+		var c := n as Control
+		if c and c.focus_mode != Control.FOCUS_NONE and c.is_visible_in_tree():
+			return c
+		for child in n.get_children():
+			stack.append(child)
+	return null
+
+## Re-walks every control for the context that is now current. Cheap enough to run on a mode
+## switch and never run otherwise.
+func _apply_focus_policy() -> void:
+	var stack: Array[Node] = [self]
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		_drop_focus(n)
+		for c in n.get_children():
+			stack.append(c)
+
+func _on_focus_changed(control: Control) -> void:
+	if _kb_nav:
+		_tint_focus(control)
+
+## A visible ring without depending on the theme having a focus stylebox: the skins define
+## normal/hover/pressed and Skins repaints them, so a focus box would be one more thing every
+## skin had to remember. A tint is theme-independent and cannot be forgotten.
+func _tint_focus(control: Control) -> void:
+	if is_instance_valid(_kb_focused):
+		_kb_focused.modulate = Color.WHITE
+	_kb_focused = control
+	if is_instance_valid(_kb_focused):
+		_kb_focused.modulate = KB_FOCUS_TINT
+
 func _setup_focus_policy() -> void:
 	get_tree().node_added.connect(_drop_focus)
+	get_viewport().gui_focus_changed.connect(_on_focus_changed)
 	# _tabs has to exist before the initial walk below, or the clip_text half of
 	# _drop_focus silently does nothing for every control the scene shipped with
 	assert(is_instance_valid(_tabs))
@@ -4915,8 +5013,10 @@ func _setup_focus_policy() -> void:
 func _drop_focus(n: Node) -> void:
 	if n is LineEdit:
 		return
-	if n is Button or n is TabBar:
-		(n as Control).focus_mode = Control.FOCUS_NONE
+	# in the keyboard context these are exactly the things worth landing on; in the mouse
+	# context none of them may hold focus, because the keys that would move it are the transport
+	if n is Button or n is TabBar or n is ItemList or n is OptionButton or n is Tree:
+		(n as Control).focus_mode = Control.FOCUS_ALL if _kb_nav else Control.FOCUS_NONE
 	# Inside the sidebar only: a caption is not allowed to be the reason the divider
 	# stops moving. Outside it (the transport, the ticker, popups) the old sizing still
 	# applies, because nothing there is being dragged narrower than its content.
@@ -5003,7 +5103,9 @@ func _setup_record_tab() -> void:
 		return "RECORDS THE MASTER BUS TO DISK  //  LENGTH IS LIMITED BY FREE SPACE, NOT RAM")
 	# a take that outlives the window would be a truncated file with no header sizes
 	_recorder.finished.connect(func(path: String, ok: bool) -> void:
-		_note = "  //  %s %s" % ["SAVED" if ok else "KEPT RAW", path.get_file()]
+		_write_setlist(path)
+		_note = "  //  %s %s%s" % ["SAVED" if ok else "KEPT RAW", path.get_file(),
+			"  //  +%d TRACK SET LIST" % _set_log.size() if not _set_log.is_empty() else ""]
 		_clear_note_later()
 		_refresh_rec())
 	# A take that stopped because the disk would not take it. Deliberately NOT cleared on the
@@ -5066,6 +5168,12 @@ static func _elide_head(path: String, keep: int) -> String:
 		out = candidate
 	return ".." + out if not out.is_empty() else ".." + path.substr(path.length() - keep)
 
+## What has played since the take started, as {at (seconds into the take), path, title, artist}.
+## A recorded set is the audio plus the running order, and until now only the audio was kept --
+## the one thing anyone wants afterwards, to put in a description or a tag, had to be
+## reconstructed from memory.
+var _set_log: Array[Dictionary] = []
+
 func _toggle_record() -> void:
 	if not _recorder:
 		return
@@ -5074,7 +5182,92 @@ func _toggle_record() -> void:
 	elif _recorder.start(_rec_dir).is_empty():
 		_note = "  //  CANNOT WRITE TO %s" % _rec_dir
 		_clear_note_later()
+	else:
+		_set_log.clear()
+		_note_track_for_set(_current)   # whatever was already playing when RECORD was pressed
 	_refresh_rec()
+
+## Adds a track to the running order at wherever the take has reached. Called when a track
+## starts and once at the top, so a set that began mid-track still names it.
+func _note_track_for_set(path: String) -> void:
+	if not _recorder or not _recorder.recording or path.is_empty():
+		return
+	var m := _engine.cached_meta(path)
+	var at := float(_recorder.frames_written) / maxf(AudioServer.get_mix_rate(), 1.0)
+	# the same track twice in a row is a re-cue, not a new entry in the running order
+	if not _set_log.is_empty() and str(_set_log[-1]["path"]) == path:
+		return
+	_set_log.append({"at": at, "path": path,
+		"title": str(m.get("title", path.get_file().get_basename())),
+		"artist": str(m.get("artist", ""))})
+
+## The running order as plain text and as a CUE SHEET, written beside the take. Text because it
+## is what gets pasted into a description; .cue because every DJ tool and most players read it,
+## which is what makes the recording navigable instead of one long file.
+##
+## Pure, so the formatting is checkable without recording anything.
+static func setlist_text(entries: Array, take_name: String) -> String:
+	var out := PackedStringArray(["SOUNDSCAPE SET  //  %s" % take_name, ""])
+	for i in entries.size():
+		var e: Dictionary = entries[i]
+		var who := str(e.get("artist", ""))
+		var what := str(e.get("title", ""))
+		out.append("%s  %2d. %s" % [ts_text(float(e.get("at", 0.0))).left(8), i + 1,
+			"%s - %s" % [who, what] if not who.is_empty() else what])
+	return "\n".join(out) + "\n"
+
+## MM:SS:FF at 75 frames a second, which is what the CUE format counts in -- not milliseconds.
+static func cue_stamp(secs: float) -> String:
+	var total := maxf(secs, 0.0)
+	var m := int(total / 60.0)
+	var sec := int(total) % 60
+	var frames := int((total - floor(total)) * 75.0)
+	return "%02d:%02d:%02d" % [m, sec, frames]
+
+static func cue_sheet(entries: Array, audio_file: String) -> String:
+	var out := PackedStringArray([
+		'TITLE "SOUNDSCAPE SET"',
+		'FILE "%s" WAVE' % audio_file])
+	for i in entries.size():
+		var e: Dictionary = entries[i]
+		out.append("  TRACK %02d AUDIO" % (i + 1))
+		out.append('    TITLE "%s"' % str(e.get("title", "")).replace('"', "'"))
+		var who := str(e.get("artist", ""))
+		if not who.is_empty():
+			out.append('    PERFORMER "%s"' % who.replace('"', "'"))
+		out.append("    INDEX 01 %s" % cue_stamp(float(e.get("at", 0.0))))
+	return "\n".join(out) + "\n"
+
+static func set_export_test() -> bool:
+	var entries := [
+		{"at": 0.0, "path": "a.flac", "title": "Opener", "artist": "Someone"},
+		{"at": 185.5, "path": "b.flac", "title": "Second", "artist": ""},
+	]
+	var txt := setlist_text(entries, "TAKE.wav")
+	var cue := cue_sheet(entries, "TAKE.wav")
+	return txt.contains("Someone - Opener") and txt.contains(" 2. Second") \
+		and not txt.contains(" - Second") \
+		and cue.contains('FILE "TAKE.wav" WAVE') and cue.contains("TRACK 01 AUDIO") \
+		and cue.contains("INDEX 01 00:00:00") and cue.contains("INDEX 01 03:05:37") \
+		and cue.contains('PERFORMER "Someone"') \
+		and cue_stamp(0.0) == "00:00:00" and cue_stamp(61.5) == "01:01:37" \
+		and setlist_text([], "T").contains("SOUNDSCAPE SET")
+
+## Writes the two companion files beside a finished take. Failure is reported and never fatal:
+## the audio is the recording, and these are notes about it.
+func _write_setlist(take_path: String) -> void:
+	if _set_log.is_empty() or take_path.is_empty():
+		return
+	var base := take_path.get_basename()
+	for pair in [[".txt", setlist_text(_set_log, take_path.get_file())],
+			[".cue", cue_sheet(_set_log, take_path.get_file())]]:
+		var f := FileAccess.open(base + str(pair[0]), FileAccess.WRITE)
+		if not f:
+			_log_fault("SET LIST NOT WRITTEN", "%s%s: %s" % [base, pair[0],
+				error_string(FileAccess.get_open_error())])
+			continue
+		f.store_string(str(pair[1]))
+		f.close()
 
 ## Rebuilt from the recorder's own counters rather than a second tally kept here, so
 ## the readout cannot disagree with what was actually written.
@@ -6005,12 +6198,17 @@ const CUE_TAB := Vector2(9.0, 6.0)
 ##
 ## The overlay's top CUE_TAB.y pixels are the cap strip above the bar; the line starts
 ## where the bar does and runs to the bottom.
+## How dark the waveform sits against the bar. It is context, not the subject: the playhead, the
+## fill and the markers all have to stay easier to read than the shape behind them.
+const WAVE_ALPHA := 0.30
+
 func _draw_cues() -> void:
 	var length := _len()
 	if _bar_path().is_empty() or length <= 0.0:
 		return
 	var w := _cue_overlay.size.x
 	var top := CUE_TAB.y
+	_draw_waveform(w, top)
 	for c in _cues_for(_bar_path()):
 		var col := Color(str(c["color"]))
 		var x := cue_x(_cue_stream(float(c["time"])), length, w)
@@ -6030,6 +6228,33 @@ func _draw_cues() -> void:
 	# no label or keybind is painted into the strip: rendered and measured, a character
 	# that small is a smudge. The hover readout says all of it in the status bar, where
 	# there is room for words.
+
+## The track's shape, under the markers. The bar was a bare rail: it said how far through you
+## were and nothing about what was there, so finding the point where the intro ends meant
+## scrubbing for it. Asking the engine is what starts the build, and until it lands this draws
+## nothing and the bar looks exactly as it did.
+##
+## Drawn UNDER the cue lines deliberately -- a marker has to stay findable against it, which is
+## also why WAVE_ALPHA is as low as it is. Mirrored about the middle of the strip, min below and
+## max above, so a track with a loud left channel does not read as lopsided.
+func _draw_waveform(w: float, top: float) -> void:
+	var wave := _engine.waveform_for(_bar_path())
+	if wave.is_empty() or w <= 0.0:
+		return
+	var buckets := wave.size() / 2
+	var h := _cue_overlay.size.y - top
+	if h <= 0.0:
+		return
+	var mid := top + h * 0.5
+	var col := Color(theme.get_color("font_color", "Green"), WAVE_ALPHA)
+	var step := w / float(buckets)
+	for b in buckets:
+		var lo: float = wave[b * 2]
+		var hi: float = wave[b * 2 + 1]
+		var y0 := mid - hi * h * 0.5
+		var y1 := mid - lo * h * 0.5
+		# at least a pixel, so silence is a centre line rather than a gap in the drawing
+		_cue_overlay.draw_rect(Rect2(float(b) * step, y0, maxf(step, 1.0), maxf(y1 - y0, 1.0)), col)
 
 ## The cue under a click, or {} -- returned by reference, so the caller can hand the same
 ## Dictionary to the scope and delete paths and have them find it in whichever store it

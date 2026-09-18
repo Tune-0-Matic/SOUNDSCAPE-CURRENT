@@ -620,6 +620,97 @@ static func ffmpeg_render(path: String, ext: String, args: Array, dir: String, p
 		DirAccess.remove_absolute(tmp)   # failed, killed, or another worker renamed its copy in first
 	return out if ok else ""
 
+# --- waveform overviews -----------------------------------------------------------
+## The shape of a track, for the scrub bar: WAVE_BUCKETS min/max pairs spanning the whole file,
+## so the bar shows where the quiet intro ends and the drop lands instead of being a bare
+## progress rail with markers floating on it.
+##
+## Built by ffmpeg on a worker, from mono at WAVE_RATE. That rate is the deliberate part: a peak
+## meter would need the full rate to catch inter-sample peaks, and this is not a meter -- it is a
+## few hundred pixels wide, and 8 kHz already carries far more detail than one bucket can show.
+## The whole overview is 512 pairs, so the cache file is 4 KB per track however long the track is.
+const WAVE_DIR := "user://waveforms"
+const WAVE_BUCKETS := 512
+const WAVE_RATE := 8000
+
+signal waveform_ready(path: String)
+
+var _waves := {}          # path -> PackedFloat32Array of 2 * WAVE_BUCKETS, min then max per bucket
+var _waves_wanted := {}   # path -> true while a worker is on it, so one track is never queued twice
+
+## The overview for a track, or an empty array if it has not been built yet. Asking is what
+## starts the build, so the scrub bar can simply ask on every draw.
+func waveform_for(path: String) -> PackedFloat32Array:
+	var have: PackedFloat32Array = _waves.get(path, PackedFloat32Array())
+	if not have.is_empty() or path.is_empty():
+		return have
+	if not _waves_wanted.has(path):
+		_waves_wanted[path] = true
+		WorkerThreadPool.add_task(_build_waveform.bind(path))
+	return have
+
+func _build_waveform(path: String) -> void:
+	var wave := read_waveform(path)
+	_deliver_waveform.call_deferred(path, wave)
+
+func _deliver_waveform(path: String, wave: PackedFloat32Array) -> void:
+	_waves_wanted.erase(path)
+	if wave.is_empty():
+		return
+	_waves[path] = wave
+	waveform_ready.emit(path)
+
+## WORKER THREAD. Decodes to mono f32 at WAVE_RATE and folds it into WAVE_BUCKETS min/max pairs.
+## Returns an empty array if ffmpeg is missing or the file will not decode -- a track with no
+## overview draws the plain bar, which is what it did before any of this existed.
+static func read_waveform(path: String, dir := WAVE_DIR) -> PackedFloat32Array:
+	var raw := ffmpeg_render(path, "f32", ["-map", "0:a:0", "-ac", "1", "-ar", str(WAVE_RATE),
+		"-f", "f32le", "-c:a", "pcm_f32le"], dir, "wave_")
+	if raw.is_empty():
+		return PackedFloat32Array()
+	var samples := FileAccess.get_file_as_bytes(raw).to_float32_array()
+	return fold_waveform(samples, WAVE_BUCKETS)
+
+## The pure half: n samples into `buckets` min/max pairs. Separate so the folding can be checked
+## without ffmpeg, a file or a thread.
+static func fold_waveform(samples: PackedFloat32Array, buckets: int) -> PackedFloat32Array:
+	var out := PackedFloat32Array()
+	if samples.is_empty() or buckets <= 0:
+		return out
+	out.resize(buckets * 2)
+	var n := samples.size()
+	for b in buckets:
+		# span computed from the ends rather than by accumulating a step, so the last bucket
+		# always finishes exactly at the last sample however the division falls
+		var from := int(float(b) * float(n) / float(buckets))
+		var to := int(float(b + 1) * float(n) / float(buckets))
+		if to <= from:
+			to = mini(from + 1, n)
+		var lo := 1.0
+		var hi := -1.0
+		for i in range(from, to):
+			var v := samples[i]
+			lo = minf(lo, v)
+			hi = maxf(hi, v)
+		out[b * 2] = clampf(lo, -1.0, 1.0)
+		out[b * 2 + 1] = clampf(hi, -1.0, 1.0)
+	return out
+
+static func waveform_test() -> bool:
+	var samples := PackedFloat32Array()
+	samples.resize(1000)
+	for i in 1000:
+		samples[i] = sin(TAU * float(i) / 100.0)
+	var folded := fold_waveform(samples, 10)
+	var shaped: bool = folded.size() == 20
+	for b in 10:
+		# a full cycle sits in every bucket, so each one spans very nearly the whole range
+		shaped = shaped and folded[b * 2] < -0.9 and folded[b * 2 + 1] > 0.9
+	# a bucket count past the sample count must still produce one pair each, not divide by zero
+	var sparse := fold_waveform(PackedFloat32Array([0.5, -0.25]), 8)
+	return shaped and sparse.size() == 16 and fold_waveform(PackedFloat32Array(), 4).is_empty() \
+		and fold_waveform(samples, 0).is_empty()
+
 ## Everything a Video TEST render wrote. Run when the toggle goes off, and at launch while it is off,
 ## which catches a render that was still finishing when the toggle flipped.
 static func purge_video_cache(dir := VIDEO_DIR) -> void:
