@@ -129,7 +129,7 @@ func _initialize() -> void:
 	# ones that would otherwise never run are run here: cue times mirroring while a deck is
 	# reversed, what an unplayable track does depending on who asked for it, and the equal-power
 	# crossfader law. They moved to DeckController and AudioEngine when player.gd was split up.
-	var rules: bool = DeckController.deck_test() and AudioEngine.deck_test() and LibraryModel.model_test()
+	var rules: bool = DeckController.deck_test() and AudioEngine.deck_test() and LibraryModel.model_test() 		and load("res://player.gd").settings_test()
 	ok = ok and rules
 	print("deck rules (REV cue mirroring, auto-advance faults), the equal-power crossfader and the library model: %s" % rules)
 

@@ -642,31 +642,31 @@ layout_mode = 2
 size_flags_vertical = 3
 theme_override_constants/separation = 2
 
-[node name="TBS" type="VBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs" unique_id=616485245]
+[node name="SETTINGS" type="VBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs" unique_id=616485245]
 visible = false
 layout_mode = 2
 theme_override_constants/separation = 4
 metadata/_tab_index = 4
 
-[node name="FadeRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=1918302299]
+[node name="FadeRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS" unique_id=1918302299]
 layout_mode = 2
 theme_override_constants/separation = 4
 
-[node name="Fade" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FadeRow" unique_id=2043920920]
+[node name="Fade" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/FadeRow" unique_id=2043920920]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 text = "FADE: ON"
 
-[node name="FadeTimeRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=1789197361]
+[node name="FadeTimeRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS" unique_id=1789197361]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FadeTimeRow" unique_id=1592443940]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/FadeTimeRow" unique_id=1592443940]
 layout_mode = 2
 text = "FADE TIME (MS):"
 
-[node name="FadeMs" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FadeTimeRow" unique_id=322705011]
+[node name="FadeMs" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/FadeTimeRow" unique_id=322705011]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(110, 0)
 layout_mode = 2
@@ -675,15 +675,15 @@ text = "1000"
 alignment = 1
 max_length = 5
 
-[node name="PlayDelayRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=128861787]
+[node name="PlayDelayRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS" unique_id=128861787]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/PlayDelayRow" unique_id=442325572]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/PlayDelayRow" unique_id=442325572]
 layout_mode = 2
 text = "PLAY DELAY (MS):"
 
-[node name="DelayMs" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/PlayDelayRow" unique_id=1720157561]
+[node name="DelayMs" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/PlayDelayRow" unique_id=1720157561]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(110, 0)
 layout_mode = 2
@@ -692,28 +692,28 @@ text = "250"
 alignment = 1
 max_length = 4
 
-[node name="FeedSizeRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=1005053824]
+[node name="FeedSizeRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS" unique_id=1005053824]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FeedSizeRow" unique_id=1384899945]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/FeedSizeRow" unique_id=1384899945]
 layout_mode = 2
 text = "VISUAL FEED SIZE:"
 
-[node name="FeedSize" type="OptionButton" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FeedSizeRow" unique_id=2097051602]
+[node name="FeedSize" type="OptionButton" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/FeedSizeRow" unique_id=2097051602]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="FpsRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=98793351]
+[node name="FpsRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS" unique_id=98793351]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FpsRow" unique_id=1299846815]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/FpsRow" unique_id=1299846815]
 layout_mode = 2
 text = "MAX FRAMERATE:"
 
-[node name="MaxFps" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/FpsRow" unique_id=1144910952]
+[node name="MaxFps" type="LineEdit" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/FpsRow" unique_id=1144910952]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(110, 0)
 layout_mode = 2
@@ -722,30 +722,30 @@ text = "30"
 alignment = 1
 max_length = 3
 
-[node name="BeatRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS"]
+[node name="BeatRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS"]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/BeatRow"]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/BeatRow"]
 layout_mode = 2
 text = "BEAT TRACKING:"
 
-[node name="BeatTrack" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/BeatRow"]
+[node name="BeatTrack" type="Button" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/BeatRow"]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3
 text = "OFF"
 
-[node name="BoostRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS" unique_id=146351261]
+[node name="BoostRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS" unique_id=146351261]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="BoostLabel" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/BoostRow" unique_id=1586727178]
+[node name="BoostLabel" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/BoostRow" unique_id=1586727178]
 unique_name_in_owner = true
 layout_mode = 2
 text = "VOLUME BOOST: 0"
 
-[node name="Boost" type="ProgressBar" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/BoostRow" unique_id=1004281724]
+[node name="Boost" type="ProgressBar" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/BoostRow" unique_id=1004281724]
 unique_name_in_owner = true
 custom_minimum_size = Vector2(0, 14)
 layout_mode = 2
@@ -753,15 +753,15 @@ size_flags_horizontal = 3
 size_flags_vertical = 4
 show_percentage = false
 
-[node name="LayoutRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS"]
+[node name="LayoutRow" type="HBoxContainer" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS"]
 layout_mode = 2
 theme_override_constants/separation = 6
 
-[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/LayoutRow"]
+[node name="L" type="Label" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/LayoutRow"]
 layout_mode = 2
 text = "LAYOUT SETTINGS:"
 
-[node name="Layout" type="OptionButton" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/TBS/LayoutRow"]
+[node name="Layout" type="OptionButton" parent="Margin/Main/Body/Workspace/RightSidebar/Tabs/SETTINGS/LayoutRow"]
 unique_name_in_owner = true
 layout_mode = 2
 size_flags_horizontal = 3

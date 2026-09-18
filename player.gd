@@ -296,6 +296,7 @@ func _ready() -> void:
 	assert(count_test())                # TRACKS readout: both branches, partial marker
 	assert(cue_test())                  # marker hit-testing and cue id allocation
 	assert(DeckController.deck_test())  # cue mirroring under REV, and the skip-and-stop rule
+	assert(settings_test())             # every settings row lands in exactly one group, and is findable
 	assert(ts_test())                   # MM:SS:MS formatting and its round trip
 	assert(key_test())                  # reserved keys, collisions, and clearing
 	assert(AudioEngine.deck_test())     # crossfader gain law and its silence floor
@@ -523,6 +524,7 @@ func _ready() -> void:
 	_setup_tab_arrows()
 	_setup_tab_fade()
 	_setup_focus_policy()
+	_label_clipped_controls.call_deferred()   # after the first layout has given everything a width
 	_crt_mat = %VizBox.material as ShaderMaterial
 	_apply_crt()
 	_apply_mono()
@@ -2704,11 +2706,13 @@ func _on_reboot() -> void:
 	get_tree().quit()
 
 
-# --- TBS: the settings screen ----------------------------------------------
+# --- SETTINGS --------------------------------------------------------------
 func _setup_tbs() -> void:
-	# TBS is a settings screen and nothing else: the TO BE SORTED list, its REMOVE/CLEAR
-	# row, its count and the "-> TBS" button on the TRACKS tab are gone from player.tscn
-	# outright, rather than being built at load and freed a frame later.
+	# The tab is called SETTINGS, because that is what it is. It was TBS -- "to be sorted" --
+	# when it held a staging list for tracks, and it kept the name for two releases after that
+	# list, its REMOVE/CLEAR row, its count and the "-> TBS" button were deleted outright. The
+	# internals are still _tbs_* so the detached window, the tear-off and the config keys do not
+	# all have to move at once; nothing the user sees says TBS any more.
 	#
 	# Anchored off %Layout because the old list used to be how this found the tab.
 	var tab: Control = %Layout.get_parent().get_parent()
@@ -2738,6 +2742,133 @@ func _setup_tbs() -> void:
 	_tbs_home = col
 	_tbs_tab = tab
 	_add_settings_rows()
+	_group_settings()
+
+## WHICH GROUP EACH SETTING BELONGS TO, by the row's node name. Anything not named here lands
+## in ADVANCED, so a row added later shows up somewhere rather than vanishing -- and a keybind
+## row (Bind_*) is matched by prefix, because there is one per action and the list grows.
+##
+## The order of the keys is the order the groups appear.
+const SETTING_GROUPS := {
+	"AUDIO": ["FadeRow", "FadeTimeRow", "PlayDelayRow", "BoostRow", "BeatRow", "MonoRow",
+		"ListeningModeRow"],
+	"LIBRARY": ["ShowMsRow"],
+	"DISPLAY": ["FeedSizeRow", "FpsRow", "LayoutRow", "ClockRow", "FontRow", "FontsRow",
+		"CursorRow", "CrtRow", "PlayBarRow", "VisualWinRow", "DualDeckRow", "FadeSpeedRow"],
+	"VIDEO": ["IntroRow", "VideoTestRow", "VideoColorRow"],
+	"INPUT": ["SkipSecsRow"],
+	"ADVANCED": ["CheatRow", "AutopsyPanel"],
+}
+
+var _setting_sections := {}   # group name -> the VBoxContainer holding its rows
+var _settings_search: LineEdit
+
+## Which group a row belongs in. Pure, so the table can be checked without building a screen.
+static func setting_group(row_name: String) -> String:
+	for group in SETTING_GROUPS:
+		if row_name in (SETTING_GROUPS[group] as Array):
+			return group
+	# every keybind lands under INPUT beside SKIP SECONDS, the only other thing on that screen
+	# about what the keyboard does; anything else added later shows up in ADVANCED rather than
+	# vanishing, which is what an unlisted row would otherwise do
+	return "INPUT" if row_name.begins_with("Bind_") else "ADVANCED"
+
+static func settings_test() -> bool:
+	var named := {}
+	for group in SETTING_GROUPS:
+		for row_name in SETTING_GROUPS[group]:
+			if named.has(row_name):
+				return false   # one row in two groups would be reparented twice
+			named[row_name] = group
+	var probe := HBoxContainer.new()
+	var cap := Label.new()
+	cap.text = "LISTENING MODE"
+	probe.add_child(cap)
+	var btn := Button.new()
+	btn.text = "[ CASUAL (SMOOTH) ]"
+	probe.add_child(btn)
+	probe.name = "ListeningModeRow"
+	var hay := setting_haystack(probe)
+	probe.free()
+	return setting_group("FadeRow") == "AUDIO" 		and setting_group("Bind_play") == "INPUT" 		and setting_group("SkipSecsRow") == "INPUT" 		and setting_group("VideoColorRow") == "VIDEO" 		and setting_group("SomethingAddedLater") == "ADVANCED" 		and hay.contains("listening mode") and hay.contains("casual") and hay.contains("listeningmoderow")
+
+## Forty-two rows in one flat column, in the order they happened to be built: FADE, FADE TIME,
+## PLAY DELAY, FEED SIZE, MAX FPS, BEAT, BOOST, LAYOUT, CLOCK, FONT... with ten keybinds in the
+## middle of it. Finding anything meant scrolling the whole list and reading every caption.
+##
+## The rows themselves are untouched -- they keep their names, their %UniqueNames and their
+## signal connections, and the detached settings window still carries the lot across, because
+## what moves is the same nodes into section containers rather than anything rebuilt.
+func _group_settings() -> void:
+	# snapshot before reparenting: the child list is about to change underneath the walk
+	var rows := _tbs_home.get_children()
+	for group in SETTING_GROUPS:
+		var section := VBoxContainer.new()
+		section.name = "Group_%s" % group
+		section.add_theme_constant_override("separation", 4)
+		var header := Label.new()
+		header.name = "GroupHeader"
+		header.text = "-- %s --" % group
+		section.add_child(header)
+		_tbs_home.add_child(section)
+		_setting_sections[group] = section
+	for row: Node in rows:
+		row.reparent(_setting_sections[setting_group(str(row.name))] as Node, false)
+	# reparent() re-registers the node it is CALLED ON, never its descendants, and every
+	# %UniqueName on this screen is a child of a row rather than the row itself
+	_restore_unique_names(_tbs_home)
+	_add_settings_search()
+
+## Type-to-find over the whole screen. Matches a row's caption, the text on its control and its
+## group name, so "FADE" finds FADE, FADE TIME and TAB FADE SPEED, and "AUDIO" brings back the
+## whole audio group. A group with nothing left showing hides its header too, rather than
+## leaving a run of titles over empty space.
+func _add_settings_search() -> void:
+	var row := HBoxContainer.new()
+	row.name = "SettingsSearchRow"
+	var caption := Label.new()
+	caption.text = "FIND"
+	row.add_child(caption)
+	_settings_search = LineEdit.new()
+	_settings_search.name = "SettingsSearch"
+	_settings_search.placeholder_text = "TYPE TO FILTER SETTINGS"
+	_settings_search.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_settings_search.clear_button_enabled = true
+	row.add_child(_settings_search)
+	_tbs_home.add_child(row)
+	_tbs_home.move_child(row, 0)
+	_settings_search.text_changed.connect(_filter_settings)
+
+## The text a row can be found by: its caption, whatever its control currently reads, and the
+## name of the node itself, so a row whose caption is an icon or a symbol is still reachable.
+static func setting_haystack(row: Node) -> String:
+	var parts := PackedStringArray([str(row.name)])
+	var stack: Array[Node] = [row]
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		for c in n.get_children():
+			stack.append(c)
+		if n is Label:
+			parts.append((n as Label).text)
+		elif n is Button:
+			parts.append((n as Button).text)
+		elif n is LineEdit:
+			parts.append((n as LineEdit).text)
+	return " ".join(parts).to_lower()
+
+func _filter_settings(needle: String) -> void:
+	var want := needle.strip_edges().to_lower()
+	for group in _setting_sections:
+		var section: VBoxContainer = _setting_sections[group]
+		var any := false
+		var in_group: bool = want.is_empty() or str(group).to_lower().contains(want)
+		for row: Node in section.get_children():
+			if str(row.name) == "GroupHeader":
+				continue
+			var show: bool = in_group or setting_haystack(row).contains(want)
+			(row as CanvasItem).visible = show
+			any = any or show
+		section.visible = any
 
 ## Builds one settings row in the shape the scene's own rows use: a caption sized to
 ## match its siblings so the controls line up in a column, then a control filling the
@@ -3284,7 +3415,7 @@ func _close_tbs_window() -> void:
 
 func _refresh_tbs_button() -> void:
 	if is_instance_valid(_tbs_btn):
-		_tbs_btn.text = "[ TBS SCREEN * ]" if is_instance_valid(_tbs_win) else "[ TBS SCREEN ]"
+		_tbs_btn.text = "[ SETTINGS * ]" if is_instance_valid(_tbs_win) else "[ SETTINGS ]"
 
 
 # --- tear-off tabs ---------------------------------------------------------
@@ -4004,6 +4135,7 @@ static func _chunky_arrow_texture(flip: bool) -> ImageTexture:
 ## tab comes back with the short name intact.
 const TAB_SHORT_TITLES := {
 	"RECORD SET": "REC", "FOLDERS": "DIRS", "VISUAL": "VIS", "TRACKS A": "TRK A", "TRACKS B": "TRK B",
+	"SETTINGS": "SET",
 }
 const TAB_MAX_WIDTH := 108
 
@@ -4493,6 +4625,8 @@ func _setup_layout() -> void:
 ## Runs on every viewport resize, so dragging a window across the threshold restructures
 ## the UI live rather than only at startup.
 func _update_orientation() -> void:
+	# a width change is exactly when a caption starts or stops fitting
+	_label_clipped_controls.call_deferred()
 	var vp := get_viewport().get_visible_rect().size
 	var aspect: float = vp.x / maxf(vp.y, 1.0)
 	var want: bool = aspect < PORTRAIT_BELOW
@@ -4617,6 +4751,62 @@ func _resolved_key(path: String) -> Dictionary:
 ## controls at runtime constantly (the FX rack, the gradient editor, torn-off windows,
 ## the asset managers), and a rule that has to be remembered at 40 call sites is a rule
 ## that gets missed at the 41st.
+## Nothing in this program is wide. The deck A wing is a sidebar, the settings screen is a
+## sidebar, and both hold rows whose captions were written for a maximised window: "LISTENING
+## MODE", "ROTATE GRADIENTS", "DUAL DECK MODE". Narrow either one and Godot simply CLIPS the
+## text mid-glyph -- there is no ellipsis by default and no tooltip, so a button can read
+## "ROTATE GRADI" with no way to find out what the rest of it said.
+##
+## So: every Button, Label and OptionButton that cannot fit its own text gets TRIM_ELLIPSIS,
+## which makes the truncation visible rather than ambiguous, and a tooltip carrying the full
+## text. Controls that DO fit are left alone -- a tooltip repeating a label you can already
+## read is noise, and it would cover the thing it describes.
+##
+## Deferred by a frame because none of this is knowable until the first layout pass has given
+## every control its real width, and re-run on resize for the same reason.
+func _label_clipped_controls(from: Node = null) -> void:
+	var stack: Array[Node] = [from if from else self]
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		for c in n.get_children():
+			stack.append(c)
+		var text := ""
+		if n is OptionButton:
+			var ob := n as OptionButton
+			text = ob.get_item_text(ob.selected) if ob.selected >= 0 else ""
+		elif n is Button:
+			text = (n as Button).text
+		elif n is Label:
+			text = (n as Label).text
+		if text.strip_edges().is_empty():
+			continue
+		var ctrl := n as Control
+		if ctrl == null or ctrl.size.x <= 0.0:
+			continue
+		var font := ctrl.get_theme_font("font")
+		var font_size := ctrl.get_theme_font_size("font_size")
+		if font == null:
+			continue
+		# the room the glyphs actually have: the control less whatever its style box eats
+		var pad := 0.0
+		var sb := ctrl.get_theme_stylebox("normal")
+		if sb:
+			pad = sb.get_margin(SIDE_LEFT) + sb.get_margin(SIDE_RIGHT)
+		var needed := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1.0, font_size).x
+		var clipped: bool = needed > ctrl.size.x - pad + 0.5
+		if n is Button:
+			(n as Button).text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS if clipped else TextServer.OVERRUN_NO_TRIMMING
+		elif n is Label:
+			(n as Label).text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS if clipped else TextServer.OVERRUN_NO_TRIMMING
+		# never overwrite a tooltip somebody wrote on purpose -- those say more than the label
+		if ctrl.tooltip_text.is_empty() or ctrl.tooltip_text == str(ctrl.get_meta("clip_tip", "")):
+			if clipped:
+				ctrl.tooltip_text = text
+				ctrl.set_meta("clip_tip", text)
+			elif ctrl.has_meta("clip_tip"):
+				ctrl.tooltip_text = ""
+				ctrl.remove_meta("clip_tip")
+
 func _setup_focus_policy() -> void:
 	get_tree().node_added.connect(_drop_focus)
 	# _tabs has to exist before the initial walk below, or the clip_text half of
@@ -5477,7 +5667,16 @@ func _on_menu_id(id: int) -> void:
 	elif id == MENU_INFO:
 		_show_info(path)
 	elif id == MENU_DELETE:
-		_delete_track(path)
+		# The one menu item that changes the disk, and it sat one mis-click away from RENAME
+		# TAG in the same list. The recycle bin makes it recoverable, not harmless: the cues,
+		# the RENAME tag and every playlist entry for the track go with it, and none of those
+		# come back out of the bin.
+		_confirm("DELETE FROM DISK
+
+%s
+
+MOVES THE FILE TO THE RECYCLE BIN AND FORGETS ITS CUES, TAG AND PLAYLIST ENTRIES." % path.get_file(),
+			_delete_track.bind(path))
 	elif id == MENU_CUE_GLOBAL:
 		_move_cue(cue, false)
 	elif id == MENU_CUE_LOCAL:
