@@ -19,8 +19,13 @@ extension/**/*.os
 extension/**/*.obj
 
 # bin/ is a build output directory, but the compiled extension IS a release artifact: a fresh
-# clone without it cannot play FLAC or DSD at all and falls back to 16-bit WAV. The Windows
-# DLLs are therefore tracked; everything else a build leaves here (import libraries, symbol
-# files, other platforms' outputs) is not.
+# clone without it cannot play FLAC or DSD at all and falls back to 16-bit WAV. The built
+# libraries are therefore tracked; everything else a build leaves here (import libraries,
+# symbol files, SCons intermediates) is not.
+#
+# The .so pair comes off the Linux CI runner (.github/workflows/build-linux.yml), because this
+# project is developed on Windows and cannot produce ELF. Without this line they would land in
+# bin/, be ignored, and the Linux export would go on failing with no sign of why.
 bin/*
 !bin/libsoundscape_dsp.*.dll
+!bin/libsoundscape_dsp.*.so

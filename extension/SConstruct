@@ -111,13 +111,19 @@ if env["platform"] == "macos":
         source=objects,
     )
 else:
-    # Linked in the build tree, then copied into ../bin: the project only ever receives
-    # the finished file, never a half-written one. no_import_lib because nothing links
-    # against this library -- Godot loads it at runtime -- so the MinGW import .a is waste.
+    # Linked in the build tree, then copied into ../bin: the project only ever receives the
+    # finished file, never a half-written one.
+    #
+    # no_import_lib is a WINDOWS linker concept and is passed only there: nothing links against
+    # this library -- Godot loads it at runtime -- so the MinGW import .a is waste. On a gnulink
+    # platform it is a meaningless construction override rather than a supported argument, and
+    # this build has never run on one; keeping it off that path is one fewer thing for the first
+    # Linux build to discover.
+    extra = {"no_import_lib": True} if env["platform"] == "windows" else {}
     library = env.Install("../bin", env.SharedLibrary(
         os.path.join(build_dir, "libsoundscape_dsp{}{}".format(env["suffix"], env["SHLIBSUFFIX"])),
         source=objects,
-        no_import_lib=True,
+        **extra,
     ))
 
 Default(library)
