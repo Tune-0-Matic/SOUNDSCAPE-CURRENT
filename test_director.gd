@@ -80,12 +80,20 @@ func _initialize() -> void:
 		ranked.sort()
 		var median: float = ranked[ranked.size() / 2] if ranked.size() > 0 else INF
 		var d_bpm: float = absf(director.bpm - track_bpm)
-		var ok := d_bpm <= TOL_BPM and absf(median) <= TOL_PHASE
+		# A tolerated TEMPO error is a phase error: a grid running d_bpm fast slides against the
+		# clicks, and the easing holds it at an offset rather than at zero. The fit is centred in
+		# its HISTORY window, so the slide reaches about half a window's worth before the next fit
+		# pulls it back. Judging a 0.5 BPM lock against the same 20 ms as an exact one asks the
+		# phase to be right about a tempo the test just accepted as wrong; an exact lock still
+		# faces the flat 20 ms.
+		var drift: float = d_bpm / track_bpm * AudioDirector.HISTORY * 0.5
+		var ok := d_bpm <= TOL_BPM and absf(median) <= TOL_PHASE + drift
 		if not ok:
 			failures += 1
-		print("%s %6.1f BPM -> locked %6.2f (d %4.2f)  phase median %+.1f ms, mean %+.1f (sd %.1f)  conf %.2f  beats %d" % [
+		print("%s %6.1f BPM -> locked %6.2f (d %4.2f)  phase median %+.1f ms (want %.1f), mean %+.1f (sd %.1f)  conf %.2f  beats %d" % [
 			"OK  " if ok else "FAIL", track_bpm, director.bpm, d_bpm,
-			median * 1000.0, mean * 1000.0, sd * 1000.0, director.confidence, errors.size()])
+			median * 1000.0, (TOL_PHASE + drift) * 1000.0,
+			mean * 1000.0, sd * 1000.0, director.confidence, errors.size()])
 
 		print("      onsets=%d spectrum=%s driver=%s" % [director.get("_onsets").size(), director.get("_spectrum") != null, AudioServer.get_driver_name() if AudioServer.has_method("get_driver_name") else OS.get_name()])
 	print("RESULT ", "ALL PASS" if failures == 0 else "%d FAILED" % failures)

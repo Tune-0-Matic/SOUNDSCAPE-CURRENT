@@ -331,6 +331,7 @@ func _ready() -> void:
 	assert(roots_test())                # library root nesting and path normalisation
 	assert(count_test())                # TRACKS readout: both branches, partial marker
 	assert(cue_test())                  # marker hit-testing and cue id allocation
+	assert(fail_test())                 # skip past an unplayable track, stop after a run of them
 	assert(ts_test())                   # MM:SS:MS formatting and its round trip
 	assert(key_test())                  # reserved keys, collisions, and clearing
 	assert(AudioEngine.deck_test())     # crossfader gain law and its silence floor
@@ -589,7 +590,7 @@ func _ready() -> void:
 			_audio.play(land[2])
 			_audio.stream_paused = land[1]
 		_sync_attach(_engine.deck)
-		_reversed = true
+		_set_reversed(_engine.deck, true)
 		_refresh_rev_btn()
 		_note = ""
 		_clear_note_later())
@@ -1473,9 +1474,14 @@ func _notification(what: int) -> void:
 ## `i` indexes the ENGINE QUEUE, which is the visible list -- not _paths. The two are the
 ## same array until a search narrows it, and bounds-checking against the wrong one is how
 ## a filtered queue would load the wrong track.
-func _open(i: int) -> void:
+##
+## `auto` says a track ENDED and this is the queue moving on, rather than somebody asking for
+## this track. Only that case may skip past a file that will not decode: a track picked by hand
+## stays picked, and the failure is reported instead of quietly playing something else.
+func _open(i: int, auto := false) -> void:
 	if i < 0 or i >= _engine.queue.size():
 		return
+	_auto_advancing = auto
 	_video.stream = null
 	# The outgoing track is NOT stopped here any more. Stopping up front cut to silence
 	# the instant a track was picked and held it until the decode landed -- which for an
@@ -1490,6 +1496,7 @@ func _open(i: int) -> void:
 
 func _on_track_ready(path: String, stream: AudioStream, _meta: Dictionary, deck: int) -> void:
 	_busy = false
+	_set_reversed(deck, false)   # a new track always loads forward, on whichever deck it lands on
 	# requested on `deck`; if the user has switched away since, it plays there and nothing
 	# about the live deck changes
 	if deck != _engine.deck:
@@ -1497,7 +1504,8 @@ func _on_track_ready(path: String, stream: AudioStream, _meta: Dictionary, deck:
 		return
 	_note = ""
 	_current = path
-	_reversed = false   # a new track always loads forward
+	_fail_streak = 0        # something played: whatever came before it was a run of bad files
+	_auto_advancing = false
 	_refresh_rev_btn()
 	if _fade_on and _audio.playing:
 		_crossfade(stream, deck)
@@ -1535,9 +1543,63 @@ func _video_palette() -> Gradient:
 	var gi: int = _viz.gradient_index()
 	return _gradients[gi] if gi >= 0 and gi < _gradients.size() else _skin_ramp
 
-func _on_track_failed(path: String, reason: String) -> void:
+## How many unplayable tracks in a row end the set rather than being skipped past. Three is
+## enough to step over a broken file or two mid-playlist, and few enough that a whole folder
+## gone offline -- an unplugged drive, a cloud library with nothing downloaded -- stops the
+## program on the third rather than tearing through a thousand tracks announcing each one.
+const MAX_AUTO_SKIPS := 3
+
+## Set while the load in flight came from a track ENDING. Consumed by _on_track_ready and
+## _on_track_failed, which are the two ways that load can finish.
+var _auto_advancing := false
+var _fail_streak := 0
+## path -> why, for this session. The STATS column prints the count; the log carries each one.
+var _failed_tracks := {}
+
+## A decode that did not produce a stream. On a track the user picked, that is a note and
+## nothing else. During AUTO-ADVANCE it used to be the end of the set: one FLAC on a build
+## without the extension, one DST-compressed DSD, one track whose cloud copy is not on this
+## disk, and playback simply stopped behind a note that cleared itself four seconds later.
+func _on_track_failed(path: String, reason: String, deck: int) -> void:
 	_busy = false
-	_note = "  //  %s: %s" % [reason.to_upper(), path.get_file()]
+	_failed_tracks[path] = reason
+	push_warning("cannot play %s: %s" % [path, reason])
+	match fail_action(_auto_advancing, deck == _engine.deck, _fail_streak):
+		Fail.REPORT:
+			_note = "  //  %s: %s" % [reason.to_upper(), path.get_file()]
+			_clear_note_later()
+		Fail.SKIP:
+			_fail_streak += 1
+			_note = "  //  SKIPPED %s (%s)" % [path.get_file(), reason.to_upper()]
+			_clear_note_later()
+			_next(true)
+		Fail.STOP:
+			_auto_advancing = false
+			_fail_streak = 0
+			_stop(deck)
+			# left on screen: playback has stopped, and the reason is the only way to tell that
+			# from the end of a queue
+			_note = "  //  [!] PLAYBACK STOPPED: %d TRACKS IN A ROW WOULD NOT PLAY  //  LAST %s (%s)" % [
+				MAX_AUTO_SKIPS, path.get_file(), reason.to_upper()]
+
+enum Fail { REPORT, SKIP, STOP }
+
+## What a track that would not decode should DO, given who asked for it and how many failed
+## before it. A track somebody PICKED is never skipped past -- the failure is reported and the
+## deck stays where it is -- and neither is a failure on the deck nobody is driving. Pure, so
+## the rule is checkable without a deck, a file or an audio device.
+static func fail_action(auto: bool, same_deck: bool, streak: int) -> Fail:
+	if not auto or not same_deck:
+		return Fail.REPORT
+	return Fail.STOP if streak + 1 >= MAX_AUTO_SKIPS else Fail.SKIP
+
+static func fail_test() -> bool:
+	return fail_action(false, true, 0) == Fail.REPORT \
+		and fail_action(false, true, MAX_AUTO_SKIPS) == Fail.REPORT \
+		and fail_action(true, false, 0) == Fail.REPORT \
+		and fail_action(true, true, 0) == Fail.SKIP \
+		and fail_action(true, true, MAX_AUTO_SKIPS - 2) == Fail.SKIP \
+		and fail_action(true, true, MAX_AUTO_SKIPS - 1) == Fail.STOP
 
 ## A decode that finished after the user switched decks. The parked deck gets exactly what
 ## the live one would -- a crossfade when FADE is on and it is sounding, a straight swap
@@ -1562,8 +1624,8 @@ func _load_parked(deck: int, path: String, stream: AudioStream) -> void:
 	_note = "  //  LOADED ON %s: %s" % [AudioEngine.DECK_NAMES[deck], path.get_file()]
 	_clear_note_later()
 
-func _next() -> void:
-	_open(_engine.next_index())
+func _next(auto := false) -> void:
+	_open(_engine.next_index(), auto)
 
 func _prev() -> void:
 	_open(_engine.prev_index())
@@ -1772,6 +1834,7 @@ func _refresh_stats() -> void:
 		"USER....%s" % (_user_name if _user_name else "-"),
 		"SOURCE..%s" % _src(),
 		"LIBRARY.%d" % _paths.size(),
+		"FAILED..%d" % _failed_tracks.size(),
 		"MOUSE...[H] %s" % ("HIDDEN" if _cursor_hidden else "SHOWN"),
 		"VOLUME..%03d%%" % int(_vol.value),
 		"XFADE...%s" % _xfade_stat(),
@@ -4723,6 +4786,11 @@ func _drop_focus(n: Node) -> void:
 		n.set("clip_text", true)
 
 # --- RECORD SET tab ----------------------------------------------------------
+## The one colour in the program that does not come from the skin. A failed take has to read as
+## wrong on every palette, including the ones whose accent IS red, so it is fixed here and always
+## paired with the "[!] WRITE FAILED" text rather than carrying the meaning on its own.
+const REC_ERROR_COLOR := Color(0.87, 0.26, 0.22)
+
 var _recorder: Recorder
 var _rec_dir := ""
 var _rec_rate := 0        # index into Recorder.RATES
@@ -4796,6 +4864,13 @@ func _setup_record_tab() -> void:
 		_note = "  //  %s %s" % ["SAVED" if ok else "KEPT RAW", path.get_file()]
 		_clear_note_later()
 		_refresh_rec())
+	# A take that stopped because the disk would not take it. Deliberately NOT cleared on the
+	# usual four-second timer: every other note is something you can miss without losing
+	# anything, and this one is a recording that stopped while you thought it was running.
+	_recorder.failed.connect(func(path: String, reason: String) -> void:
+		_note = "  //  [!] RECORDING STOPPED: %s  //  RAW TAKE KEPT AS %s" % [
+			reason.to_upper(), path.get_file()]
+		_refresh_rec())
 	_refresh_rec()
 
 func _rec_row(parent: Control, caption: String) -> Button:
@@ -4864,11 +4939,22 @@ func _refresh_rec() -> void:
 	if not is_instance_valid(_rec_btn):
 		return
 	var on: bool = _recorder.recording
-	_rec_btn.text = "[*] STOP AND SAVE" if on else "[ ] RECORD SET"
+	var broke: bool = not on and not _recorder.error.is_empty()
+	# The readout carries the error in its own right -- text first, colour second, so it still
+	# reads on a skin whose palette is nothing like this red and for anyone who cannot see it.
+	if broke:
+		_rec_status.add_theme_color_override("font_color", REC_ERROR_COLOR)
+	else:
+		_rec_status.remove_theme_color_override("font_color")
+	_rec_btn.text = "[*] STOP AND SAVE" if on else ("[!] RECORD SET" if broke else "[ ] RECORD SET")
 	_rec_dir_btn.text = _elide_head(_rec_dir, 34) if not _rec_dir.is_empty() else "[ CHOOSE... ]"
 	var q: String = Recorder.QUALITY_NAMES[_rec_quality]
 	var detail := "%s / %s" % [Recorder.FILE_TYPES[_rec_type], q]
-	if on:
+	if broke:
+		_rec_status.text = "[!] WRITE FAILED  //  %s  //  %.1f MB KEPT AS %s" % [
+			_recorder.error.to_upper(), float(_recorder.frames_written) * 8.0 / 1048576.0,
+			_recorder.last_take().get_file()]
+	elif on:
 		# discarded is the one number that matters while running: anything but 0 means
 		# the capture buffer overran and audio is missing from the take
 		_rec_status.text = "REC %s  //  %.1f MB  //  DROPPED %d  //  %s" % [
@@ -5746,8 +5832,23 @@ static func cue_test() -> bool:
 		and Color.html_is_valid("d84445") and not Color.html_is_valid("nope") \
 		and cue_too_close(cues, 30.03, MIN_CUE_GAP_SEC) \
 		and not cue_too_close(cues, 30.10, MIN_CUE_GAP_SEC) \
-		and not cue_too_close([], 30.0, MIN_CUE_GAP_SEC)
+		and not cue_too_close([], 30.0, MIN_CUE_GAP_SEC) \
+		and rev_cue_test()
 		# keys moved out to key_test() when the rules grew past "is it a letter"
+
+## REV mirrors what is SOUNDING, never what is stored. A marker at 30 s of a 120 s track sits at
+## 90 s of the reversed render, and a marker dropped at 90 s of that render is the same 30 s of
+## the track -- the round trip that stops REV from rewriting the cue store.
+static func rev_cue_test() -> bool:
+	var mirrored := cue_stream_time(30.0, 120.0, true)
+	return is_equal_approx(cue_stream_time(30.0, 120.0, false), 30.0) \
+		and is_equal_approx(mirrored, 90.0) \
+		and is_equal_approx(cue_stream_time(mirrored, 120.0, true), 30.0) \
+		and is_equal_approx(cue_stream_time(0.0, 120.0, true), 120.0) \
+		and is_equal_approx(cue_stream_time(120.0, 120.0, true), 0.0) \
+		and is_equal_approx(cue_stream_time(150.0, 120.0, true), 0.0) \
+		and is_equal_approx(cue_stream_time(-5.0, 120.0, true), 120.0) \
+		and is_equal_approx(cue_stream_time(30.0, 0.0, true), 30.0)   # no length: nothing to mirror
 
 ## The tab is the marker's handle: the line is 2 px and nothing can reliably hit 2 px,
 ## so the clickable part is a wider cap at the top. Drawn INSIDE the bar rather than
@@ -5769,7 +5870,7 @@ func _draw_cues() -> void:
 	var top := CUE_TAB.y
 	for c in _cues_for(_bar_path()):
 		var col := Color(str(c["color"]))
-		var x := cue_x(float(c["time"]), length, w)
+		var x := cue_x(_cue_stream(float(c["time"])), length, w)
 		_cue_overlay.draw_rect(Rect2(x - 1.0, top, 2.0, _cue_overlay.size.y - top), col)
 		# the handle. Its footprint is the same CUE_TAB box whatever the shape, so the
 		# hit test stays one rectangle and a triangle is no harder to grab than a square.
@@ -5797,7 +5898,7 @@ func _cue_at(x: float) -> Dictionary:
 	var best := {}
 	var best_dx := CUE_GRAB
 	for c in _cues_for(_bar_path()):
-		var dx: float = absf(cue_x(float(c["time"]), length, _cue_overlay.size.x) - x)
+		var dx: float = absf(cue_x(_cue_stream(float(c["time"])), length, _cue_overlay.size.x) - x)
 		if dx <= best_dx:
 			best_dx = dx
 			best = c
@@ -5813,7 +5914,7 @@ func _tab_at(pos: Vector2) -> Dictionary:
 	var cue := _cue_at(pos.x)
 	if cue.is_empty():
 		return {}
-	return cue if on_tab(pos, cue_x(float(cue["time"]), _len(), _cue_overlay.size.x)) else {}
+	return cue if on_tab(pos, cue_x(_cue_stream(float(cue["time"])), _len(), _cue_overlay.size.x)) else {}
 
 ## Marker input, in overlay coordinates. Anything that is not a marker is left
 ## unaccepted, and MOUSE_FILTER_PASS hands it straight down to %Scrub -- which is why
@@ -5855,7 +5956,8 @@ func _drag_cue_step() -> void:
 		if absf(x - _drag_from_x) > DRAG_SLOP:
 			_drag_moved = true
 		if _drag_moved and _len() > 0.0:
-			var t := _ratio_at(x, _cue_overlay.size.x) * _len()
+			# where the pointer is in what is SOUNDING, mapped back to the track's own time
+			var t := _cue_stream(_ratio_at(x, _cue_overlay.size.x) * _len())
 			# the same floor _add_cue enforces on a new marker -- a drag that would land
 			# this one within it of another simply refuses the move; the marker holds at
 			# its last valid position rather than stacking on top of its neighbour
@@ -5902,11 +6004,14 @@ static func cue_too_close(cues: Array, t: float, min_gap: float) -> bool:
 			return true
 	return false
 
+## `at` arrives as a position in what is currently SOUNDING. While the deck is reversed that is
+## the mirror of the track's own time, and the marker is stored in the track's terms.
 func _add_cue(at: float) -> void:
 	if _bar_path().is_empty() or _len() <= 0.0:
 		_note = "  //  NOTHING PLAYING TO MARK"
 		_clear_note_later()
 		return
+	at = _cue_stream(at)
 	# Range check BEFORE the clamp. Clamping first mapped every click past the end onto
 	# the same instant, so the first one landed and every one after it was refused as
 	# "too close" to the marker the clamp had just created -- which reads as markers
@@ -6045,7 +6150,7 @@ func _set_cue_key(cue: Dictionary, raw: String) -> void:
 func _jump_to_key(k: String) -> bool:
 	for c in _cues_for(_bar_path()):
 		if str(c.get("key", "")) == k:
-			_seek(float(c["time"]))
+			_seek(_cue_stream(float(c["time"])))
 			_note = "  //  JUMP %s @ %s" % [c["label"], _time_text(float(c["time"]))]
 			_clear_note_later()
 			return true
@@ -6083,7 +6188,7 @@ func _audition(cue: Dictionary) -> void:
 		return
 	_audition_gen += 1
 	var gen := _audition_gen
-	_seek(float(cue["time"]))
+	_seek(_cue_stream(float(cue["time"])))   # where that marker sits in what is sounding
 	_play()
 	_note = "  //  AUDITION %s @ %s" % [cue["label"], _time_text(float(cue["time"]))]
 	_clear_note_later()
@@ -6115,7 +6220,7 @@ func _setup_decks() -> void:
 			# neither must the deck nobody is driving
 			pl.finished.connect(func() -> void:
 				if pl == _audio and not _fade_running(_engine.deck):
-					_next())
+					_next(true))   # the queue moving on, not a click
 	_engine.set_crossfader(_crossfader)
 	_bind_deck(_engine.deck)
 	_setup_deck_ui()
@@ -6231,9 +6336,38 @@ func _select_deck(which: int) -> void:
 
 # --- reverse playback ---------------------------------------------------------
 var _rev_btn: Button
-var _reversed := false
+## REV is PER DECK. One shared flag meant reversing deck A also bracketed deck B's button and
+## switched deck B's cue mirroring on, so markers on the deck that was still playing forwards
+## were drawn, grabbed and jumped to mirrored. The deck you are not driving keeps playing
+## whatever it was playing, in whichever direction it was playing it.
+var _reversed_deck_a := false
+var _reversed_deck_b := false
 ## Which deck A+B was entered from, so leaving it puts you back where you were.
 var _deck_before_both := 0
+
+func _is_reversed(deck: int) -> bool:
+	return _reversed_deck_b if deck == 1 else _reversed_deck_a
+
+func _set_reversed(deck: int, on: bool) -> void:
+	if deck == 1:
+		_reversed_deck_b = on
+	else:
+		_reversed_deck_a = on
+
+## A cue's time is ALWAYS stored against the track as recorded, forwards. While a deck plays the
+## reversed render, that same instant sits at `length - t` in what is actually sounding -- so
+## every marker crosses this on its way to the screen or the playhead, and every marker the user
+## drops or drags crosses it on the way back. Stored times therefore never mirror, which is what
+## stops a cue marked during REV from being written at the wrong place for good.
+func _cue_stream(t: float) -> float:
+	return cue_stream_time(t, _len(), _is_reversed(_bar_deck()))
+
+## The pure rule, so it is checkable without a deck or a track. Its own inverse: applying it to a
+## stream time hands back the stored time, which is why one function serves both directions.
+static func cue_stream_time(t: float, length: float, reversed: bool) -> float:
+	if not reversed or length <= 0.0:
+		return t
+	return clampf(length - t, 0.0, length)
 
 ## AudioStreamPlayer has no negative pitch_scale, so this is a real reversed FILE,
 ## produced once by ffmpeg and cached. That takes a moment on a long track, which is
@@ -6243,17 +6377,17 @@ func _toggle_reverse() -> void:
 		_note = "  //  NOTHING LOADED TO REVERSE"
 		_clear_note_later()
 		return
-	if _reversed:
+	if _is_reversed(_engine.deck):
 		# the flag follows the AUDIO, not the click. _open() refuses an index of -1,
 		# which is exactly what queue.find() returns for a track filtered out by a
-		# search or a playlist -- clearing _reversed first left the button reading
+		# search or a playlist -- clearing the flag first left the button reading
 		# FORWARD while the reversed file carried on playing.
 		var at := _engine.queue.find(_current)
 		if at < 0:
 			_note = "  //  TRACK NOT IN THE VISIBLE QUEUE  //  CLEAR THE FILTER TO GO FORWARD"
 			_clear_note_later()
 			return
-		_reversed = false
+		_set_reversed(_engine.deck, false)
 		_refresh_rev_btn()
 		_open(at)
 		return
@@ -6268,7 +6402,7 @@ static func rev_landing(state: String, at: float, full: float, rev_len: float) -
 
 func _refresh_rev_btn() -> void:
 	if is_instance_valid(_rev_btn):
-		_rev_btn.text = "[*] REV" if _reversed else "REV"
+		_rev_btn.text = "[*] REV" if _is_reversed(_engine.deck) else "REV"
 
 func _refresh_deck_ui() -> void:
 	if is_instance_valid(_deck_btn):
@@ -6369,6 +6503,7 @@ func _bind_deck(which: int) -> void:
 		_eq.set_boost(_boost_gain())
 	_director.attach(_bar())   # the bar's player, not _audio: an empty deck would blank it
 	_refresh_deck_ui()
+	_refresh_rev_btn()   # REV belongs to the deck, so the button changes with it
 	if not _current.is_empty():
 		_key = _resolved_key(_current)
 		_ticker.text = _engine.ticker_line(_current)

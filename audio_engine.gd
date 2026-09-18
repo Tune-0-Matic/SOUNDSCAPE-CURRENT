@@ -15,7 +15,9 @@ extends Node
 ## back to AudioStreamWAV (16-bit, no EXTENSIBLE files), and FLAC and DSD do not play.
 
 signal track_ready(path: String, stream: AudioStream, meta: Dictionary, deck: int)
-signal track_failed(path: String, reason: String)
+## Carries the deck the decode was requested for, the same way track_ready does: a failure on the
+## deck nobody is driving must not make the live deck skip the track it is playing.
+signal track_failed(path: String, reason: String, deck: int)
 signal queue_changed()
 
 enum Repeat { OFF, ALL, ONE }
@@ -343,7 +345,17 @@ func _deliver(d: int, token: int, path: String, s: AudioStream, m: Dictionary = 
 	if _shutdown or token != _tokens[d]:
 		return  # superseded on this deck, or closing; drop it rather than hijack playback
 	if not s:
-		track_failed.emit(path, "decode failed")
+		# what failed, in the caller's terms: the extension is the difference between "this file
+		# is broken" and "this build cannot play this format at all"
+		var why := "decode failed"
+		match path.get_extension().to_lower():
+			"flac":
+				why = "decode failed" if native_flac_available() else "FLAC needs libsoundscape_dsp"
+			"dsf", "dff":
+				why = "decode failed" if ClassDB.class_exists("SsDsdStream") else "DSD needs libsoundscape_dsp"
+			"mp4":
+				why = "decode failed" if video_test else "Video TEST is off"
+		track_failed.emit(path, why, d)
 		return
 	track_ready.emit(path, s, m if not m.is_empty() else metadata(path), d)
 	_preload(next_index(), d)

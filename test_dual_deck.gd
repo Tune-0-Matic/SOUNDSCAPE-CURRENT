@@ -125,5 +125,13 @@ func _initialize() -> void:
 	dock.free()
 	window.free()
 
+	# player.gd asserts its pure rules at boot, and nothing in the suite boots player.tscn, so the
+	# two Phase 1 ones are run here as well: cue times mirroring while a deck is reversed, and what
+	# an unplayable track does depending on who asked for it.
+	var script := load("res://player.gd")
+	var rules: bool = script.rev_cue_test() and script.fail_test()
+	ok = ok and rules
+	print("cue mirroring and auto-advance fault rules (rev_cue_test, fail_test): %s" % rules)
+
 	print("RESULT ", "PASS" if ok else "FAIL")
 	quit(0 if ok else 1)

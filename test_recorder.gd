@@ -11,6 +11,12 @@ extends SceneTree
 ##   - 32-bit WAV is not dithered: the same input comes out as a single code
 ##   - +/-1.2 full-scale overs clamp at the top and bottom codes, never wrap
 ##   - FLAC is 24-bit and dithered the same way
+## Then the two things that only show up on a long or a failing take:
+##   - the RF64 container: a header written in the 64-bit form is one ffmpeg reads, with the
+##     rate, channels and duration it was written with (the size arithmetic past 4 GiB is
+##     Recorder.recorder_test(), which needs no disk)
+##   - a write that cannot land ends the take, keeps what reached the disk, and says so
+##   - two takes started back to back never share a filename
 ##   godot --headless --path . --script res://test_recorder.gd
 
 ## Main-thread stall injected mid-take -- about what a synchronous rescan of a large
@@ -133,6 +139,19 @@ func _initialize() -> void:
 	for spec in [["WAV", 0, 16], ["WAV", 1, 24], ["WAV", 2, 32], ["FLAC", 1, 24]]:
 		var good := _dither_case(rec, dir, spec[0], spec[1], spec[2])
 		ok = ok and good
+
+	# the pure half: option tables and the header arithmetic at sizes past 4 GiB. Asserted at
+	# boot too, but nothing in the suite boots player.tscn, so it is run here as well.
+	var pure := Recorder.recorder_test()
+	ok = ok and pure
+	print("header arithmetic and option tables (Recorder.recorder_test): %s" % pure)
+
+	ok = _rf64_case(dir) and ok
+	ok = await _write_failure_case(rec, dir, player) and ok
+	ok = _unique_name_case(rec, dir) and ok
+
+	for leftover in DirAccess.get_files_at(dir):
+		DirAccess.remove_absolute(dir.path_join(leftover))
 	DirAccess.remove_absolute(dir)
 	print("RESULT ", "PASS" if ok else "FAIL")
 	quit(0 if ok else 1)
@@ -202,4 +221,93 @@ func _dither_case(rec: Recorder, dir: String, type: String, quality: int, bits: 
 	for p in [raw, out, pcm]:
 		if FileAccess.file_exists(p):
 			DirAccess.remove_absolute(p)
+	return good
+
+## The 64-bit container, at a size nobody has to wait for: a take written in the RF64 form has
+## to be a file ffmpeg opens, not merely one that parses here. Half a second of tone, written
+## through the same header builder with force_rf64, then read back with ffprobe.
+func _rf64_case(dir: String) -> bool:
+	var rate := 48000
+	var frames := rate / 2
+	var path := dir.path_join("rf64_probe.wav")
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if not f:
+		print("RF64: could not write the probe file")
+		return false
+	f.store_buffer(Recorder.header_bytes(frames, rate, true))
+	var data := PackedByteArray()
+	data.resize(frames * 8)
+	for i in frames:
+		var v := sin(TAU * 440.0 * float(i) / float(rate)) * 0.25
+		data.encode_float(i * 8, v)
+		data.encode_float(i * 8 + 4, v)
+	f.store_buffer(data)
+	f.close()
+	var head := FileAccess.get_file_as_bytes(path).slice(0, 16)
+	var shaped: bool = head.slice(0, 4).get_string_from_ascii() == "RF64" \
+		and head.slice(12, 16).get_string_from_ascii() == "ds64"
+	var probe := []
+	OS.execute("ffprobe", ["-v", "error", "-select_streams", "a:0", "-show_entries",
+		"stream=codec_name,sample_rate,channels:format=duration", "-of", "csv=p=0", path], probe, true)
+	var reply := str(probe[0] if not probe.is_empty() else "").strip_edges()
+	var secs := 0.0
+	for line in reply.split("\n", false):
+		var last: String = line.split(",")[-1].strip_edges()
+		if last.is_valid_float() and float(last) > 0.0 and float(last) < 5.0:
+			secs = float(last)
+	var read: bool = reply.contains("pcm_f32le") and reply.contains("48000") \
+		and absf(secs - 0.5) < 0.01
+	DirAccess.remove_absolute(path)
+	var good := shaped and read
+	print("RF64: header is RF64 + ds64 %s; ffmpeg reads it as %s, %.3f s: %s" % [
+		shaped, reply.split("\n", false)[0] if not reply.is_empty() else "(nothing)", secs, good])
+	return good
+
+## A write that cannot land. The take's own handle is swapped for a read-only one mid-take,
+## which is what a full disk or a pulled drive looks like from inside _drain: the take must end
+## itself, keep the audio that already reached the disk, and report why.
+func _write_failure_case(rec: Recorder, dir: String, player: AudioStreamPlayer) -> bool:
+	player.play()
+	var take := rec.start(dir)
+	if take.is_empty():
+		print("write failure: could not start a take")
+		return false
+	var reported := [""]
+	rec.failed.connect(func(_path: String, reason: String) -> void: reported[0] = reason, CONNECT_ONE_SHOT)
+	for _f in 25:
+		await process_frame
+	var before := rec.frames_written
+	rec._file = FileAccess.open(take, FileAccess.READ)   # the next drain cannot write
+	var guard := 0
+	while rec.recording and guard < 180:
+		await process_frame
+		guard += 1
+	player.stop()
+	var size := 0
+	if FileAccess.file_exists(take):
+		var f := FileAccess.open(take, FileAccess.READ)
+		size = f.get_length()
+		f.close()
+	var good: bool = not rec.recording and not reported[0].is_empty() and not rec.error.is_empty() \
+		and before > 0 and size > Recorder.HEADER_BYTES
+	print("write failure: take stopped %s, reported \"%s\", %d frames and %d bytes kept: %s" % [
+		not rec.recording, reported[0], before, size, good])
+	if FileAccess.file_exists(take):
+		DirAccess.remove_absolute(take)
+	return good
+
+## Two takes started back to back. The name carries microseconds, so the second one cannot land
+## on the file the first one is still being converted from -- which used to truncate both.
+func _unique_name_case(rec: Recorder, dir: String) -> bool:
+	var first := rec.start(dir)
+	rec._fail("ending the first probe take")   # closes it without spawning a conversion
+	var second := rec.start(dir)
+	rec._fail("ending the second probe take")
+	var good: bool = not first.is_empty() and not second.is_empty() and first != second \
+		and FileAccess.file_exists(first) and FileAccess.file_exists(second)
+	print("two takes in a row: %s and %s: %s" % [first.get_file(), second.get_file(), good])
+	for p in [first, second]:
+		if FileAccess.file_exists(p):
+			DirAccess.remove_absolute(p)
+	rec.error = ""   # the probe takes are not a real failure state for anything that follows
 	return good

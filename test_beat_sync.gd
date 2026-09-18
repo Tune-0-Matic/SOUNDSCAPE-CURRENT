@@ -84,9 +84,12 @@ func _initialize() -> void:
 		await process_frame
 	var nudges: Array[float] = []
 	var errs: Array[float] = []
+	var span_from := players[0].get_playback_position()
+	var span_frames := 0
 	for k in READINGS:
 		for _f in (30 if k > 0 else 0):
 			await process_frame
+			span_frames += 1
 		var n := AudioDirector.sync_seek(trackers[0], trackers[1], 0.015)
 		if not is_nan(n):
 			nudges.append(n)
@@ -100,11 +103,20 @@ func _initialize() -> void:
 	for _f in 20:
 		await process_frame
 	var after := _grid_gap(players[0], players[1], period)
-	var aligned := usable and absf(after) < 0.015
+	# An onset is stamped at the FRAME the analysis first sees it, so each tracker's phase carries
+	# up to one frame of audio time as bias, and the two decks' clicks sit at different sub-frame
+	# offsets, so that bias does not cancel between them. Sixty real frames a second keeps it under
+	# 17 ms; a headless frame under load covers far more audio than that, and the check was asking
+	# the residual to beat sync_seek's own 15 ms tolerance with nothing left over for it. The bar is
+	# the tolerance plus the frame it is actually running at -- a sync that genuinely failed leaves
+	# the 150 ms it started with, which is nowhere near either number.
+	var frame_secs: float = (players[0].get_playback_position() - span_from) / maxf(span_frames, 1)
+	var bar := 0.015 + frame_secs
+	var aligned := usable and absf(after) < bar
 	ok = ok and aligned
-	print("2. %d sync readings, error %+.1f to %+.1f ms; median nudged deck B %+.1f ms; grid gap now %+.1f ms (want < 15): %s" % [
+	print("2. %d sync readings, error %+.1f to %+.1f ms; median nudged deck B %+.1f ms; grid gap now %+.1f ms (want < %.1f = 15 + %.1f ms/frame): %s" % [
 		nudges.size(), errs[0] * 1000.0 if usable else 0.0, errs[-1] * 1000.0 if usable else 0.0,
-		nudge * 1000.0, after * 1000.0, aligned])
+		nudge * 1000.0, after * 1000.0, bar * 1000.0, frame_secs * 1000.0, aligned])
 
 	# 3. a real tempo mismatch is refused
 	players[1].stream = _click_track(128.0, 40.0)
