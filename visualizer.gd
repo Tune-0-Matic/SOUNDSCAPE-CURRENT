@@ -191,10 +191,22 @@ var rotate_gradients := false
 const ROTATE_PERIOD_SEC := 20.0
 var _rotate_t := 0.0
 
-## color_index layout: 0..PRESETS.size()-1 fixed, PRESETS.size() rainbow, then one slot
-## per user gradient. Returns -1 when the current selection is not a gradient.
+## color_index layout: SKIN_INDEX, then 0..PRESETS.size()-1 fixed, PRESETS.size() rainbow, then
+## one slot per user gradient. Returns a negative number when the selection is not a user gradient.
 func gradient_index() -> int:
 	return color_index - PRESETS.size() - 1
+
+## The SKIN swatch: the active skin's accents, which player.gd hands over as `skin_gradient` on
+## every skin switch. Below zero so that no saved preset, rainbow or gradient slot renumbers.
+const SKIN_INDEX := -1
+var skin_gradient: Gradient
+
+## The Gradient the current selection draws from -- a user gradient or the skin's -- else null.
+func _gradient() -> Gradient:
+	if color_index == SKIN_INDEX:
+		return skin_gradient
+	var gi := gradient_index()
+	return gradients[gi] if gi >= 0 and gi < gradients.size() else null
 
 ## Fraction of one cycle spent crossfading the last stop back to the first.
 ##
@@ -245,12 +257,11 @@ const SPREAD_RAINBOW := 0.6
 ## Colour for a bar at t in 0..1 across the spectrum. The fixed presets are deliberately
 ## one flat colour; everything else varies across the bands.
 func color_at(t: float) -> Color:
-	var gi := gradient_index()
-	if gi < 0 or gi >= gradients.size():
+	var grad := _gradient()
+	if grad == null:
 		if color_index >= PRESETS.size():
 			return Color.from_hsv(fposmod(_hue + t * SPREAD_RAINBOW, 1.0), 0.85, 1.0)
 		return color()
-	var grad := gradients[gi]
 	match color_anim:
 		ColorAnim.LEFT_RIGHT:
 			return sample_looped(grad, t + _hue)
@@ -262,12 +273,11 @@ func color_at(t: float) -> Color:
 			return grad.sample(clampf(t, 0.0, 1.0))
 
 func color() -> Color:
-	var gi := gradient_index()
-	if gi >= 0 and gi < gradients.size():
+	var grad := _gradient()
+	if grad:
 		# a mode that wants ONE colour per frame still animates unless STATIC, walking
 		# the same phase the per-bar modes use so every mode stays in sync
-		return gradients[gi].sample(0.0) if color_anim == ColorAnim.STATIC \
-			else sample_looped(gradients[gi], _hue)
+		return grad.sample(0.0) if color_anim == ColorAnim.STATIC else sample_looped(grad, _hue)
 	if color_index >= PRESETS.size():
 		# full saturation, full value: the bars are drawn on black, so a desaturated
 		# sweep would just read as grey at the ends of the cycle
@@ -365,7 +375,7 @@ func _process(delta: float) -> void:
 	if vp and vp.render_target_update_mode == SubViewport.UPDATE_DISABLED:
 		return
 	var n := AudioDirector.BAND_COUNT
-	if color_index >= PRESETS.size():
+	if color_index >= PRESETS.size() or color_index == SKIN_INDEX:
 		# ~16 s per full cycle at the middle SPEED setting: a slow drift, not a strobe.
 		# WRAPPED every frame rather than left to grow: an unbounded phase loses float
 		# precision as it climbs (after an hour it is past 200, and the gap between

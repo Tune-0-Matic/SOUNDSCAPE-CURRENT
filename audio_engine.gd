@@ -306,6 +306,17 @@ static func deck_gains_db(x: float) -> Array:
 static func deck_gain_db(gain: float) -> float:
 	return DECK_SILENT_DB if gain <= 0.001 else linear_to_db(gain)
 
+## The deck that is playing while the crossfader holds it at DECK_SILENT_DB, or -1. `playing` is
+## [deck A playing, deck B playing]. A+B ignores the fader, so nothing is silenced then.
+static func silenced_deck(both_on: bool, x: float, playing: Array) -> int:
+	if both_on:
+		return -1
+	var gains := deck_gains_db(x)
+	for d in gains.size():
+		if playing[d] and gains[d] <= DECK_SILENT_DB:
+			return d
+	return -1
+
 static func deck_test() -> bool:
 	var ends := deck_gains_db(0.0)
 	var other := deck_gains_db(1.0)
@@ -327,7 +338,12 @@ static func deck_test() -> bool:
 		and is_equal_approx(ends[0], 0.0) and ends[1] == DECK_SILENT_DB \
 		and is_equal_approx(other[1], 0.0) and other[0] == DECK_SILENT_DB \
 		and absf(mid[0] - (-3.0103)) < 0.001 and absf(mid[1] - (-3.0103)) < 0.001 \
-		and flat
+		and flat \
+		and silenced_deck(false, 0.0, [true, true]) == 1 \
+		and silenced_deck(false, 1.0, [true, false]) == 0 \
+		and silenced_deck(false, 0.0, [true, false]) == -1 \
+		and silenced_deck(false, 0.5, [true, true]) == -1 \
+		and silenced_deck(true, 0.0, [false, true]) == -1
 
 # --- queue ----------------------------------------------------------------
 ## `current` re-anchors the play position after the queue is rebuilt. Re-sorting or

@@ -1687,6 +1687,16 @@ func _process(delta: float) -> void:
 		_bar_seen = bar
 		_director.attach(bar)
 		_cue_overlay.queue_redraw()
+	# A deck playing with the crossfader holding it silent is the fader working, not a fault --
+	# but it reads as a dead deck, so the deck button marks it and the status line says why once.
+	var silenced := AudioEngine.silenced_deck(_engine.both, _decks.crossfader,
+		[_live_player(0).playing, _live_player(1).playing])
+	if silenced != _silenced:
+		_silenced = silenced
+		_refresh_deck_ui()
+		if silenced >= 0:
+			_note = "  //  %s IS PLAYING, SILENT AT THIS CROSSFADER" % AudioEngine.DECK_NAMES[silenced]
+			_clear_note_later()
 	_elapsed.text = _time_text(p)
 	_total.text = _time_text(l)
 	_clock.text = _clock_text()
@@ -1787,7 +1797,7 @@ static func log_line(entry: Dictionary, clock: String) -> String:
 	return "%s  %-5s  %s%s" % [clock, entry.get("kind", LOG_ERROR), entry.get("what", ""),
 		"  //  %s" % detail if not detail.is_empty() else ""]
 
-## MESSAGE LOG, from SETTINGS > ADVANCED or by clicking ERR in the status bar.
+## MESSAGE LOG, from TBS > ADVANCED or by clicking ERR in the status bar.
 func _open_log_window() -> void:
 	if _refocus_asset("MESSAGE LOG"):
 		return
@@ -2324,6 +2334,13 @@ func _hover_note(c: Control, text: Callable) -> void:
 
 
 # --- visualizer settings (VISUAL tab) -------------------------------------
+## The skin's colours outside the theme: the Video TEST picture's ramp, and the SKIN swatch
+## on both visualizer halves.
+func _refresh_skin_ramps() -> void:
+	_skin_ramp = Skins.video_ramp(_skin)
+	for v: Visualizer in [%Viz, %VizB]:
+		v.skin_gradient = Skins.accent_ramp(_skin)
+
 ## SNAKE is last and only reachable once unlocked -- see _viz_mode_count().
 const VIZ_NAMES := ["SEGMENTS", "MIRROR", "WATERFALL", "GRID", "RADIAL", "MATRIX",
 	"TUNNEL", "CRUISE", "FIRE", "KALEIDO", "SNAKE"]
@@ -2339,7 +2356,7 @@ func _setup_visual() -> void:
 	if not _skin in Skins.names():
 		_skin = "WIN98"
 	Skins.apply(theme, self, _skin)
-	_skin_ramp = Skins.video_ramp(_skin)
+	_refresh_skin_ramps()
 	%Skin.text = "SKIN: %s" % _skin
 	%Skin.pressed.connect(func() -> void:
 		# rescanned per click, like FONT: a .cfg dropped into user://skins is one click away
@@ -2347,7 +2364,8 @@ func _setup_visual() -> void:
 		var all := Skins.names()
 		_skin = all[(all.find(_skin) + 1) % all.size()]
 		Skins.apply(theme, self, _skin)
-		_skin_ramp = Skins.video_ramp(_skin)
+		_refresh_skin_ramps()
+		_rebuild_color_row()   # the SKIN swatch shows the new accents
 		%Skin.text = "SKIN: %s" % _skin
 		_refill()  # folder headers carry the accent colour, so they need repainting
 		_save())
@@ -2364,7 +2382,7 @@ func _setup_visual() -> void:
 		# PRESETS.size() is the rainbow slot, one past the last fixed colour
 		v.gradients = _gradients
 		# one slot per gradient past the rainbow, so a saved gradient selection survives
-		v.color_index = clampi(c.get("color", 0), 0, v.PRESETS.size() + _gradients.size())
+		v.color_index = clampi(c.get("color", Visualizer.SKIN_INDEX), Visualizer.SKIN_INDEX, v.PRESETS.size() + _gradients.size())
 		v.sensitivity = c.get("sens", 0.5)
 		v.tilt_db = c.get("tilt", 20.0)
 		v.height_scale = c.get("height", 0.62)
@@ -2811,13 +2829,10 @@ func _on_reboot() -> void:
 	get_tree().quit()
 
 
-# --- SETTINGS --------------------------------------------------------------
+# --- TBS -------------------------------------------------------------------
 func _setup_tbs() -> void:
-	# The tab is called SETTINGS, because that is what it is. It was TBS -- "to be sorted" --
-	# when it held a staging list for tracks, and it kept the name for two releases after that
-	# list, its REMOVE/CLEAR row, its count and the "-> TBS" button were deleted outright. The
-	# internals are still _tbs_* so the detached window, the tear-off and the config keys do not
-	# all have to move at once; nothing the user sees says TBS any more.
+	# TBS means TO BE SORTED, and is the settings screen. Phase 3 renamed it SETTINGS; it went
+	# back to TBS at Gavin's request (2026-09-19).
 	#
 	# Anchored off %Layout because the old list used to be how this found the tab.
 	var tab: Control = %Layout.get_parent().get_parent()
@@ -2917,6 +2932,10 @@ func _group_settings() -> void:
 		header.text = "-- %s --" % group
 		section.add_child(header)
 		_tbs_home.add_child(section)
+		# Owned, because the detached window moves SECTIONS: reparent() gives back the owner only
+		# to nodes sharing the moved node's owner, and an ownerless section left every row inside
+		# it -- and every %UniqueName -- ownerless after the first TBS open. See _move_rows.
+		section.owner = self
 		_setting_sections[group] = section
 	for row: Node in rows:
 		row.reparent(_setting_sections[setting_group(str(row.name))] as Node, false)
@@ -2937,7 +2956,7 @@ func _add_settings_search() -> void:
 	row.add_child(caption)
 	_settings_search = LineEdit.new()
 	_settings_search.name = "SettingsSearch"
-	_settings_search.placeholder_text = "TYPE TO FILTER SETTINGS"
+	_settings_search.placeholder_text = "TYPE TO FILTER TBS"
 	_settings_search.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_settings_search.clear_button_enabled = true
 	row.add_child(_settings_search)
@@ -3427,26 +3446,26 @@ var _tbs_col: VBoxContainer     # the window-side column they live in while deta
 var _tbs_win: Window
 var _tbs_btn: Button
 
-## Moves ONE row between the tab and the detached window.
-##
-## Every row is moved individually and nothing is ever wrapped in a carrier container,
-## and that is the whole design constraint. Measured in the running app, crossing into
-## another Window:
+## Moves everything on the TBS screen between the tab and the detached window. Measured,
+## crossing into another Window:
 ##
 ##   reparent() called ON a node        -> its %UniqueName survives, both directions
 ##   node carried inside a moved parent -> its %UniqueName is lost, permanently
 ##
-## reparent() re-registers the node it is called on; a descendant just receives
-## EXIT_TREE, which releases the registration, and nothing puts it back. Move the rows
-## in a wrapper and all thirteen of %Fade %FadeMs %DelayMs %FeedSize %MaxFps %BeatTrack
-## %Boost %BoostLabel %Layout and the rest stop resolving,
-## which silently breaks _refresh_boost, _refresh_beat, _commit_max_fps, _apply_feed
-## and _on_reboot. So: one call per row, never a carrier.
+## Since _group_settings, what moves is the search row and the Group_* sections, and every
+## row rides inside one. The rows keep their owner -- and so their %UniqueNames -- only
+## because the sections are owned by the scene root too: reparent() restores the owner of
+## every descendant that shares the MOVED node's owner, and nothing else. With ownerless
+## sections one open of TBS lost all nine of %Fade %FadeMs %DelayMs %FeedSize %MaxFps
+## %BeatTrack %Boost %BoostLabel %Layout for the session (9/9 -> 0/9, and closing did not
+## bring them back); the next FADE click or MAX FPS commit was a null access, which halts a
+## DEBUG run in the editor's debugger.
 ##
 ## keep_global_transform is false: a Control's screen position means nothing once it is
 ## inside a different window.
-static func _move_row(node: Node, to: Node) -> void:
-	node.reparent(to, false)
+static func _move_rows(from: Node, to: Node) -> void:
+	for row in from.get_children():   # a snapshot, safe to reparent while iterating
+		row.reparent(to, false)
 
 func _setup_tbs_window() -> void:
 	# The TBS tab comes off the tab bar. Everything that was on it lives in the detached
@@ -3480,7 +3499,7 @@ func _open_tbs_window() -> void:
 
 	var win := Window.new()
 	win.name = "TbsWindow"
-	win.title = "SOUNDSCAPE // SETTINGS"
+	win.title = "SOUNDSCAPE // TBS"
 	win.size = TBS_WIN_SIZE
 	win.min_size = TBS_WIN_MIN
 	win.unresizable = false
@@ -3513,8 +3532,7 @@ func _open_tbs_window() -> void:
 	_tbs_col = VBoxContainer.new()
 	_tbs_col.add_theme_constant_override("separation", 4)
 	pad.add_child(_tbs_col)
-	for row in _tbs_home.get_children():   # a snapshot, safe to reparent while iterating
-		_move_row(row, _tbs_col)
+	_move_rows(_tbs_home, _tbs_col)
 
 	_tbs_win = win
 	win.show()
@@ -3534,8 +3552,7 @@ func _open_tbs_window() -> void:
 func _close_tbs_window() -> void:
 	if not is_instance_valid(_tbs_win):
 		return
-	for row in _tbs_col.get_children():
-		_move_row(row, _tbs_home)
+	_move_rows(_tbs_col, _tbs_home)
 	_tbs_col = null
 	var win := _tbs_win
 	_tbs_win = null   # cleared first, so a re-entrant close_requested is a no-op
@@ -3544,7 +3561,7 @@ func _close_tbs_window() -> void:
 
 func _refresh_tbs_button() -> void:
 	if is_instance_valid(_tbs_btn):
-		_tbs_btn.text = "[ SETTINGS * ]" if is_instance_valid(_tbs_win) else "[ SETTINGS ]"
+		_tbs_btn.text = "[ TBS * ]" if is_instance_valid(_tbs_win) else "[ TBS ]"
 
 
 # --- tear-off tabs ---------------------------------------------------------
@@ -3832,7 +3849,7 @@ static func _restore_unique_names(root: Node) -> void:
 
 
 # --- crossfade -------------------------------------------------------------
-## The transition itself is DeckController's; these are the limits the SETTINGS fields clamp
+## The transition itself is DeckController's; these are the limits the TBS fields clamp
 ## to, and the levels the transport writes directly when it is not fading.
 const ACTIVE_DB := DeckController.ACTIVE_DB
 const SILENT_DB := DeckController.SILENT_DB
@@ -4264,7 +4281,6 @@ static func _chunky_arrow_texture(flip: bool) -> ImageTexture:
 ## tab comes back with the short name intact.
 const TAB_SHORT_TITLES := {
 	"RECORD SET": "REC", "FOLDERS": "DIRS", "VISUAL": "VIS", "TRACKS A": "TRK A", "TRACKS B": "TRK B",
-	"SETTINGS": "SET",
 }
 const TAB_MAX_WIDTH := 108
 
@@ -6643,8 +6659,10 @@ func _setup_deck_ui() -> void:
 	_refresh_rev_btn()
 	%ControlDeck.move_child(_deck_btn, 0)
 	_hover_note(_deck_btn, func() -> String:
-		return "PLAYING INTO %s  //  CLICK FOR %s  //  THE OTHER DECK KEEPS PLAYING" % [
-			AudioEngine.DECK_NAMES[_engine.deck], AudioEngine.DECK_NAMES[1 - _engine.deck]])
+		var why := "" if _silenced < 0 else "  //  %s! IS PLAYING BUT THE CROSSFADER HAS IT SILENT" % (
+			"A" if _silenced == 0 else "B")
+		return "PLAYING INTO %s  //  CLICK FOR %s  //  THE OTHER DECK KEEPS PLAYING%s" % [
+			AudioEngine.DECK_NAMES[_engine.deck], AudioEngine.DECK_NAMES[1 - _engine.deck], why])
 
 	var panel := PanelContainer.new()
 	var row := HBoxContainer.new()
@@ -6739,6 +6757,8 @@ func _select_deck(which: int) -> void:
 var _rev_btn: Button
 ## Which deck A+B was entered from, so leaving it puts you back where you were.
 var _deck_before_both := 0
+## The deck playing while the crossfader holds it silent, or -1; watched in _process.
+var _silenced := -1
 
 func _is_reversed(deck: int) -> bool:
 	return _decks.is_reversed(deck)
@@ -6797,9 +6817,13 @@ func _refresh_rev_btn() -> void:
 func _refresh_deck_ui() -> void:
 	if is_instance_valid(_deck_btn):
 		# both names always on the button, the live one bracketed: a label that shows only
-		# the current deck reads as a command to switch to it
+		# the current deck reads as a command to switch to it. "!" marks a deck that is
+		# playing while the crossfader holds it silent.
+		var names := ["A", "B"]
+		if _silenced >= 0:
+			names[_silenced] += "!"
 		_deck_btn.text = "[A+B]" if _engine.both else (
-			"[A] B" if _engine.deck == 0 else "A [B]")
+			"[%s] %s" % names if _engine.deck == 0 else "%s [%s]" % names)
 	if is_instance_valid(_xfade):
 		_xfade.value = _decks.crossfader * 100.0
 
@@ -7427,9 +7451,9 @@ func _gradient_swatch(grad: Gradient) -> StyleBoxTexture:
 	sb.texture = ImageTexture.create_from_image(img)
 	return sb
 
-## Swatches for the VISUAL tab: the fixed presets, the rainbow, then one per gradient.
+## Swatches for the VISUAL tab: SKIN, the fixed presets, the rainbow, then one per gradient.
 ## Rebuilt wholesale rather than patched, because adding or deleting a gradient renumbers
-## every slot after it and color_index is a position in this row.
+## every slot after it and color_index is a position in this row (SKIN sits at -1).
 func _rebuild_color_row() -> void:
 	for c in %ColorRow.get_children():
 		# removed as well as freed: queue_free alone leaves the old swatches in the child
@@ -7438,14 +7462,23 @@ func _rebuild_color_row() -> void:
 		c.queue_free()
 	_viz.gradients = _gradients
 	var fixed: int = _viz.PRESETS.size()
-	for i in fixed + 1 + _gradients.size():
+	for i in range(Visualizer.SKIN_INDEX, fixed + 1 + _gradients.size()):
 		var b := Button.new()
 		# %ColorRow is an HFlowContainer now, not a single fixed row -- a swatch needs its
 		# own width to wrap sanely, where the old HBoxContainer could rely on
 		# SIZE_EXPAND_FILL dividing one row evenly among however many there were
 		b.custom_minimum_size = Vector2(40, 18)
 		var sb: StyleBox
-		if i < fixed:
+		if i == Visualizer.SKIN_INDEX:
+			sb = _gradient_swatch(Skins.accent_ramp(_skin))
+			# labelled, because a mono skin's swatch is one flat colour -- on WIN98 the very
+			# green of the first preset -- and in the screen colour, which reads on every accent
+			b.text = "SKIN"
+			for key in ["font_color", "font_hover_color", "font_pressed_color", "font_focus_color",
+					"font_hover_pressed_color"]:
+				b.add_theme_color_override(key, Skins.scheme(_skin).screen)
+			_hover_note(b, func() -> String: return "SKIN ACCENTS  //  FOLLOWS %s" % _skin)
+		elif i < fixed:
 			var flat := StyleBoxFlat.new()
 			flat.bg_color = _viz.PRESETS[i]
 			flat.border_color = Color(0, 0, 0)

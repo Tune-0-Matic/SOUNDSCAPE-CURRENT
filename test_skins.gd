@@ -8,6 +8,7 @@ extends SceneTree
 ##   4. switching back to a built-in restores the stock 1 px borders and square corners
 ##   5. a skin's video palette runs screen -> accent -> screen text, a user skin's included,
 ##      an accent that repeats an end is left out, and an unknown name falls back to WIN98's
+##   6. the visualizer's SKIN swatch draws accent -> accent2, and a gradient or preset overrides it
 ## Works in user://skin_test and removes it; the real user://skins is never touched.
 ##   godot --headless --path . --script res://test_skins.gd
 
@@ -62,6 +63,25 @@ func _initialize() -> void:
 		and Skins.video_ramp("NO_SUCH_SKIN").colors == Skins.video_ramp("WIN98").colors
 	ok = ok and ramps
 	print("video palettes run screen -> accent -> screen text (TOKYO, user NEON), AMBER's repeated accent dropped, unknown names are WIN98: %s" % ramps)
+
+	# the visualizer's SKIN swatch draws the skin's accents; a gradient or preset pick still wins
+	var maroon: Dictionary = Skins.SCHEMES["MAROON"]
+	var viz := Visualizer.new()
+	viz.color_anim = Visualizer.ColorAnim.STATIC
+	viz.skin_gradient = Skins.accent_ramp("MAROON")
+	viz.gradients = [Visualizer.parse_hex_list("000000,ffffff")]
+	viz.color_index = Visualizer.SKIN_INDEX
+	var skin_on: bool = viz.color_at(0.0).is_equal_approx(maroon["accent"]) \
+		and viz.color_at(1.0).is_equal_approx(maroon["accent2"]) \
+		and Skins.accent_ramp("TOKYO").colors == PackedColorArray([tokyo["accent"], tokyo["accent"]])
+	viz.color_index = Visualizer.PRESETS.size() + 1   # the user gradient
+	var grad_wins: bool = viz.color_at(0.0).is_equal_approx(Color.BLACK)
+	viz.color_index = 0
+	var preset_wins: bool = viz.color_at(0.5) == Visualizer.PRESETS[0]
+	viz.free()
+	ok = ok and skin_on and grad_wins and preset_wins
+	print("SKIN swatch runs accent -> accent2 (MAROON), flat on a mono skin (TOKYO): %s; gradient and preset picks override it: %s %s" % [
+		skin_on, grad_wins, preset_wins])
 
 	root.free()
 	for f in DirAccess.get_files_at(DIR):

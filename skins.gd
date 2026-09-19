@@ -149,6 +149,15 @@ static func video_ramp(name: String) -> Gradient:
 		g.colors = PackedColorArray([s.screen, s.accent, s.screen_text])
 	return g
 
+## The visualizer's SKIN swatch: accent to accent2. A mono skin has no accent2, so it draws flat
+## in its one accent, the way a fixed preset does.
+static func accent_ramp(name: String) -> Gradient:
+	var s := scheme(name)
+	var g := Gradient.new()
+	g.offsets = PackedFloat32Array([0.0, 1.0])
+	g.colors = PackedColorArray([s.accent, s.get("accent2", s.accent)])
+	return g
+
 ## Rescans `dir` (created if missing, so the folder itself documents where skins go) and
 ## returns the names that loaded. Cheap enough to call on every SKIN click.
 static func load_user_skins(dir := USER_SKIN_DIR) -> Array[String]:

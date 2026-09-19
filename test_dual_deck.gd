@@ -10,6 +10,8 @@ extends SceneTree
 ##      focus returning restores the user's cap, uncapped included
 ##   4. player.gd's sleep_hidden_pages: a tab page processes only while it is visible in the
 ##      tree -- through a tab click, a tear-off, re-docking and its dock hiding -- and keeps its state
+##   5. the TBS group sections are owned by the scene root, which is what keeps %FadeMs and the
+##      other TBS %UniqueNames alive when the detached window moves them
 ## Builds its own bus and never boots player.tscn (no _ready), so user:// is never touched.
 ##   godot --headless --path . --script res://test_dual_deck.gd
 
@@ -83,6 +85,15 @@ func _initialize() -> void:
 	var throttle: bool = caps == [[30, 60], [30, 0], [24, 24], [30, 144]]
 	ok = ok and throttle
 	print("unfocused cap for user caps 60 / uncapped / 24 / 144, then restored [away, back]: %s: %s" % [caps, throttle])
+
+	# the detached TBS window moves the Group_* SECTIONS, and reparent() gives the owner back only
+	# to nodes sharing the moved node's owner: an ownerless section lost %FadeMs and the rest
+	scene.set("_tbs_home", scene.get_node("%Layout").get_parent().get_parent())
+	scene.call("_group_settings")
+	var sections: Array = (scene.get("_setting_sections") as Dictionary).values()
+	var owned: bool = not sections.is_empty() and sections.all(func(s: Node) -> bool: return s.owner == scene)
+	ok = ok and owned
+	print("TBS group sections owned by the scene root, so a TBS open keeps every %%UniqueName: %s" % owned)
 	scene.free()
 
 	# 4. off-screen tab pages sleep, and wake with their state, however they got there
