@@ -762,6 +762,25 @@ func cached_meta(path: String) -> Dictionary:
 		d = _from_disk(path)   # a stat, never a probe
 	return d if d else {}
 
+## What this session holds for `path`, or {} -- no index check, so no disk access at all. For
+## loops over the whole library on the main thread; validate_index() fills it from a worker.
+func peek_meta(path: String) -> Dictionary:
+	_meta_lock.lock()
+	var d: Variant = _meta.get(path)
+	_meta_lock.unlock()
+	return d if d else {}
+
+## Promotes every index entry for `paths` whose file is unchanged: one stat each, which is why
+## it runs on a worker. Anything not in the index costs nothing here. Returns how many landed.
+func validate_index(paths: Array[String]) -> int:
+	var landed := 0
+	for p in paths:
+		if _shutdown:
+			break
+		if _from_disk(p) != null:
+			landed += 1
+	return landed
+
 func metadata(path: String) -> Dictionary:
 	_meta_lock.lock()
 	var cached: Variant = _meta.get(path)
@@ -913,8 +932,8 @@ func load_index(path := INDEX_PATH) -> int:
 	return _disk.size()
 
 ## An index entry promoted into the session cache if its file still matches, else null.
-## ponytail: one stat per indexed track on first use, on whichever thread asks -- for the
-## TRACKS readout that is the main thread. Validate on a worker if huge libraries ever stall.
+## One stat, on whichever thread asks. The whole-library loops use peek_meta() and leave this
+## to validate_index() on a worker.
 func _from_disk(path: String) -> Variant:
 	_meta_lock.lock()
 	var e: Variant = _disk.get(path)

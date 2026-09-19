@@ -1,8 +1,8 @@
 extends SceneTree
 ## Runnable check for LibraryModel, the library's data layer:
 ##   1. the pure rules (path nesting, sort keys, track ids, RELOCATE, id migration)
-##   2. a real disk scan on a worker thread: progress arrives, the walk finds what is there,
-##      and the folder filter drops what is switched off
+##   2. a real disk scan on a worker thread: progress arrives, the walk finds what is there, each
+##      new track's id is sized on the worker, and the folder filter drops what is switched off
 ##   3. a scan can be cancelled mid-walk and leaves the library it was replacing untouched
 ##   4. cues and labels survive the library MOVING, which is the whole point of keying by id
 ## Touches only a scratch directory it makes and removes. No audio device, no user://.
@@ -39,6 +39,7 @@ func _initialize() -> void:
 
 	var model := LibraryModel.new()
 	root.add_child(model)
+	model.engine = AudioEngine.new()   # never enters the tree: only its id map and file stamps are used
 	model.folders = [base]
 	for d in ["rock", "rock/live", "jazz"]:
 		model.enabled_folders[base.path_join(d)] = true
@@ -62,9 +63,13 @@ func _initialize() -> void:
 	var was_cancelled: bool = seen["cancelled"]
 	var scanned: bool = started and not double_start and found == 9 and not was_cancelled \
 		and model.paths.size() == 9 and model.index.size() == 9
-	ok = ok and scanned
-	print("2. worker scan found %d tracks (want 9, cover.jpg ignored), %d progress ticks, refused a second start: %s" % [
-		found, ticks, scanned])
+	# the ids the WORKER sized are the ones id_for would have stat'ed its way to on this thread
+	var sized := model.engine.track_ids.size() == 9
+	for p: String in model.all_paths:
+		sized = sized and model.engine.track_ids.get(p) == LibraryModel.track_id(p, FileAccess.get_file_as_bytes(p).size())
+	ok = ok and scanned and sized
+	print("2. worker scan found %d tracks (want 9, cover.jpg ignored), %d progress ticks, refused a second start: %s; ids sized on the worker: %s" % [
+		found, ticks, scanned, sized])
 
 	# a folder switched off leaves the disk alone and only shortens the visible list
 	model.enabled_folders.erase(base.path_join("jazz"))
@@ -105,6 +110,7 @@ func _initialize() -> void:
 	ok = ok and cancel_ok
 	print("5. scan cancelled mid-walk, library left at %d tracks: %s" % [model.all_paths.size(), cancel_ok])
 
+	model.engine.free()
 	model.free()
 	_rm(moved_base)
 	print("RESULT ", "PASS" if ok else "FAIL")

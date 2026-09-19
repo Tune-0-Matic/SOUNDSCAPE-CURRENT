@@ -73,6 +73,7 @@ var _scan_stop := false
 var _scan_done := 0
 var _scan_where := ""
 var _scan_out: Array[String] = []
+var _scan_sizes := {}   # path -> byte size, for the tracks the walk found with no id yet
 var _scan_live := false
 
 func _exit_tree() -> void:
@@ -230,11 +231,14 @@ func scan() -> bool:
 	_scan_done = 0
 	_scan_where = ""
 	_scan_out = []
+	_scan_sizes = {}
 	_scan_lock.unlock()
 	var roots := folders.duplicate()
 	var video := video_test
+	# a snapshot, so the worker never reads the live map while this thread writes it
+	var known: Variant = engine.track_ids.duplicate() if engine else null
 	_thread = Thread.new()
-	_thread.start(func() -> void: _scan_worker(roots, video))
+	_thread.start(func() -> void: _scan_worker(roots, video, known))
 	set_process(true)
 	return true
 
@@ -255,13 +259,28 @@ func stop_scan() -> void:
 func scanning() -> bool:
 	return _scan_live
 
-func _scan_worker(roots: Array[String], video: bool) -> void:
+func _scan_worker(roots: Array[String], video: bool, known: Variant) -> void:
 	var out: Array[String] = []
 	for root in roots:
 		if not _walk(root, out, video):
 			break
+	# The byte size every NEW track's id needs, stat'ed here: id_for() would otherwise open each
+	# file on the main thread during the reindex (20k new tracks, ~13 s measured).
+	var sizes := {}
+	if known is Dictionary:
+		for p in out:
+			if known.has(p):
+				continue
+			_scan_lock.lock()
+			var stop := _scan_stop
+			_scan_lock.unlock()
+			if stop:
+				break
+			var st := AudioEngine.file_stamp(p)
+			sizes[p] = st[1] if st.size() == 2 else 0
 	_scan_lock.lock()
 	_scan_out = out
+	_scan_sizes = sizes
 	_scan_lock.unlock()
 
 ## The walk itself. Returns false when it was asked to stop, so every caller above it unwinds
@@ -302,8 +321,13 @@ func _process(_dt: float) -> void:
 	set_process(false)
 	_scan_lock.lock()
 	var found := _scan_out
+	var sizes := _scan_sizes
 	_scan_lock.unlock()
 	if not cancelled:
+		if engine:
+			for p in sizes:
+				if not engine.track_ids.has(p):
+					engine.track_ids[p] = track_id(p, sizes[p])
 		all_paths = found
 		apply_folder_filter()
 	scan_finished.emit(all_paths.size(), cancelled)
@@ -348,7 +372,7 @@ func sorted(mode: String) -> Array[String]:
 	_sortkey.clear()
 	if mode in META_SORTS and engine != null:
 		for p in paths:
-			var m := engine.cached_meta(p)
+			var m := engine.peek_meta(p)   # memory only: this runs on the main thread, per track
 			if mode == "KEY" and int((m.get("key", {}) as Dictionary).get("pc", -1)) < 0:
 				var est := engine.spectral_key_for(p)   # an untagged track sorts by its estimate
 				if not est.is_empty():
@@ -356,23 +380,29 @@ func sorted(mode: String) -> Array[String]:
 					m["key"] = {"pc": est["pc"], "minor": est["minor"]}
 			_sortkey[p] = meta_sort_key(mode, m, p)
 	var out: Array[String] = paths.duplicate()
-	out.sort_custom(func(a: String, b: String) -> bool: return cmp_by(mode, a, b))
+	out.sort_custom(_cmp(mode))
 	return out
 
-func cmp_by(mode: String, a: String, b: String) -> bool:
+## The comparator for `mode`, picked once per sort: matching the mode inside every comparison
+## made a 20k-track PATH sort 4x slower (301 ms against 70 ms).
+func _cmp(mode: String) -> Callable:
 	match mode:
 		"ARTIST", "ALBUM", "KEY":
-			return str(_sortkey.get(a, a)).naturalnocasecmp_to(str(_sortkey.get(b, b))) < 0
+			return func(a: String, b: String) -> bool:
+				return str(_sortkey.get(a, a)).naturalnocasecmp_to(str(_sortkey.get(b, b))) < 0
 		"NAME":
-			return a.get_file().naturalcasecmp_to(b.get_file()) < 0
+			return func(a: String, b: String) -> bool: return a.get_file().naturalcasecmp_to(b.get_file()) < 0
 		"TYPE":
-			var d := a.get_extension().nocasecmp_to(b.get_extension())
-			return d < 0 if d != 0 else a.naturalcasecmp_to(b) < 0
+			return func(a: String, b: String) -> bool:
+				var d := a.get_extension().nocasecmp_to(b.get_extension())
+				return d < 0 if d != 0 else a.naturalcasecmp_to(b) < 0
 		"DATE":
-			var ta: int = _mtime.get(a, 0)
-			var tb: int = _mtime.get(b, 0)
-			return ta > tb if ta != tb else a.naturalcasecmp_to(b) < 0  # newest first
-	return a.naturalcasecmp_to(b) < 0  # PATH and FOLDER: keeps directories contiguous
+			return func(a: String, b: String) -> bool:
+				var ta: int = _mtime.get(a, 0)
+				var tb: int = _mtime.get(b, 0)
+				return ta > tb if ta != tb else a.naturalcasecmp_to(b) < 0  # newest first
+	# PATH and FOLDER: keeps directories contiguous
+	return func(a: String, b: String) -> bool: return a.naturalcasecmp_to(b) < 0
 
 ## The string a metadata sort orders by. Unknown values sort LAST ("~" is past every letter
 ## and digit), and the path breaks ties, so the order is total and stable across refills.

@@ -154,8 +154,12 @@ const PALETTE_STEPS := 64
 ## built while one of them is actually on screen.
 func _sync_field_material() -> void:
 	var field: bool = mode == Mode.WATERFALL or mode == Mode.FIRE
-	if material != _field_mat:
-		material = _field_mat if field else null
+	# compared against what the mode WANTS: testing `material != _field_mat` never took the shader
+	# off again, so after FIRE or WATERFALL every other mode drew through it -- CRUISE's lines
+	# and SEGMENTS' bars recoloured as fire (white) or as the palette strip, whatever COL said
+	var want: Material = _field_mat if field else null
+	if material != want:
+		material = want
 	if not field:
 		return
 	for i in PALETTE_STEPS:

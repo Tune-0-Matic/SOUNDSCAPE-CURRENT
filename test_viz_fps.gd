@@ -10,6 +10,7 @@ extends SceneTree
 ## playing AudioStreamPlayer is what makes is_live() true.
 ##   4. nobody can see it: inside a SubViewport switched to UPDATE_DISABLED -- what its container
 ##      does while a Video TEST picture hides the cell -- _process does no work, and wakes when on
+##   5. the field shader is on for WATERFALL and FIRE only, and comes off when either is left
 ##   godot --headless --path . --script res://test_viz_fps.gd
 
 const RATES := [60.0, 144.0, 240.0]
@@ -154,6 +155,19 @@ func _initialize() -> void:
 	print("inside a disabled SubViewport: bars held at 0 and the hue still %s; viewport back on, bars rose %s: %s" % [
 		idle, wakes, skipped])
 	sub.queue_free()
+
+	# 5. the field shader is on for WATERFALL and FIRE only: leaving FIRE takes it off again, or
+	# every later mode draws through it and loses its colours
+	var shader_viz := _viz(director)
+	var mats := []
+	for mode in [Visualizer.Mode.FIRE, Visualizer.Mode.CRUISE, Visualizer.Mode.WATERFALL, Visualizer.Mode.SEGMENTS]:
+		shader_viz.mode = mode
+		shader_viz._sync_field_material()
+		mats.append(shader_viz.material != null)
+	var field_only: bool = mats == [true, false, true, false]
+	ok = ok and field_only
+	print("field shader on for FIRE / CRUISE / WATERFALL / SEGMENTS in turn: %s: %s" % [mats, field_only])
+	shader_viz.free()
 
 	player.stop()
 	print("RESULT ", "PASS" if ok else "FAIL")

@@ -1,6 +1,7 @@
 extends SceneTree
 ## Runnable check for the persistent library index (AudioEngine.load_index / save_index):
-##   1. two probed tracks survive into a FRESH engine, readable with zero ffprobe runs
+##   1. two probed tracks survive into a FRESH engine, readable with zero ffprobe runs; peek_meta
+##      stays empty until validate_index confirms them, still with no probe
 ##   2. editing a file (new size and mtime) invalidates its entry; the next read re-probes it
 ##      and sees the new duration
 ##   3. saving with a smaller library drops the entries that are no longer in it
@@ -60,6 +61,18 @@ func _initialize() -> void:
 	ok = ok and instant
 	print("1. index of %d reloaded; durations %.3f / %.3f read with %d ffprobe runs: %s" % [
 		loaded, float(hit.get("duration", -1.0)), float(again.get("duration", -1.0)), b.probes, instant])
+
+	# 1b. the whole-library loops read peek_meta, which never touches the disk; validate_index is
+	# what fills it (on a worker in the app), with no probe for an unchanged indexed file
+	var v := AudioEngine.new()
+	v.load_index(idx)
+	var cold_peek := v.peek_meta(t1).is_empty()
+	var landed := v.validate_index(both)
+	var peeked: bool = cold_peek and landed == 2 and not v.peek_meta(t1).is_empty() and v.probes == 0
+	ok = ok and peeked
+	print("1b. peek_meta empty until validate_index confirms the index (%d landed, %d probes): %s" % [
+		landed, v.probes, peeked])
+	v.free()
 
 	# 2. an edited file is not trusted
 	var c := AudioEngine.new()

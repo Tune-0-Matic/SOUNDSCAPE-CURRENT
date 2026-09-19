@@ -723,9 +723,21 @@ func _on_scan_finished(_found: int, cancelled: bool) -> void:
 	_refresh_scan_btn()
 	if cancelled:
 		return
+	# LibraryModel already filtered with the enabled set it had; only a tree that switched new
+	# folders on needs a second pass (3 s of reindex at 20k tracks, for nothing, on every boot)
+	var was := _library.enabled_folders.duplicate()
 	_build_folder_tree()
-	_library.apply_folder_filter()
+	if _library.enabled_folders != was:
+		_library.apply_folder_filter()
 	_after_reindex()
+	# the list is up; the index's durations, tags and keys are confirmed off this thread, then
+	# the readout (or a metadata sort) catches up in one repaint
+	var paths := _library.all_paths.duplicate()
+	_engine.run_task(func() -> void:
+		if _engine.validate_index(paths) > 0:   # a fresh import has no index: nothing to repaint
+			(func() -> void:
+				if not _engine.is_shut_down():
+					_meta_arrived()).call_deferred())
 	# Offline spectral key estimation: one background worker task per track, gated
 	# inside queue_spectral_key by the persistent cache AND by whether the file even
 	# has a tag (checked on the worker, not here) -- so a rescan of an already-processed
@@ -786,10 +798,14 @@ func _refill(crate := -1) -> void:
 		_engine.set_queue(_library.shown[_engine.deck], _current)
 	# both crates' unprobed tracks in one sweep: a sweep supersedes the last, so sweeping only
 	# the crate that changed would cancel the other one's
+	# a Dictionary for the seen-check: `path in todo` on an Array was O(n^2), and with 20k
+	# unprobed tracks it froze the program for 44 s every time the list filled
 	var todo: Array[String] = []
+	var seen := {}
 	for c in 2:
 		for path: String in _unknown[c]:
-			if not path in todo:
+			if not seen.has(path):
+				seen[path] = true
 				todo.append(path)
 	if todo.size() <= SWEEP_MAX:
 		_sweep_durations(todo)
@@ -826,7 +842,6 @@ func _fill(crate: int) -> void:
 	var header := theme.get_color("font_color", "Green")
 	var last_dir := ""
 	var shown: Array[String] = []
-	var secs := 0.0
 	var unknown: Array[String] = []
 	var pl_num := 0
 	for path in order:
@@ -861,24 +876,37 @@ func _fill(crate: int) -> void:
 			path_row[i] = list.item_count - 1
 		row_path.append(i)
 		shown.append(_library.paths[i])
-		# cached only -- an unprobed track is counted as unknown here and swept below,
-		# never probed inline: one ffprobe per row would stall the keystroke that asked
-		var m := _engine.cached_meta(_library.paths[i])
-		if m.is_empty():
+		# memory only -- an unprobed track is counted as unknown here and swept below, never
+		# probed inline, and an indexed one is not even stat'ed: that was 20k file opens on
+		# this thread (14 s measured). _on_scan_finished validates the index on a worker.
+		if _engine.peek_meta(_library.paths[i]).is_empty():
 			unknown.append(_library.paths[i])
-		else:
-			secs += float(m.get("duration", 0.0))
 	# assigned back whole: a packed array read out of an Array is a copy
 	_row_paths[crate] = row_path
 	_path_rows[crate] = path_row
 	_library.shown[crate] = shown
 	_unknown[crate] = unknown
 	if crate == 0:   # the count line lives under TRK A
-		# the playlist name wins the readout when both are on: it is the scope you chose and
-		# stays chosen, where a search is transient
-		var scope := playlist if not playlist.is_empty() else ("FILTERED" if not needle.is_empty() else "")
-		_count.text = count_text(_library.paths.size(), shown.size(), _library.folders.size(), secs,
-			scope, not unknown.is_empty())
+		_recount()
+
+## TRK A's count line, from what its list shows. Its own function so metadata landing from a
+## worker repaints this one line rather than refilling 20k rows (a 2.9 s frame at 20k tracks).
+func _recount() -> void:
+	var secs := 0.0
+	var partial := false
+	for path: String in _library.shown[0]:
+		var m := _engine.peek_meta(path)
+		if m.is_empty():
+			partial = true
+		else:
+			secs += float(m.get("duration", 0.0))
+	# the playlist name wins the readout when both are on: it is the scope you chose and stays
+	# chosen, where a search is transient
+	var playlist: String = _library.crate_pl[0]
+	var scope := playlist if not playlist.is_empty() \
+		else ("FILTERED" if not (_library.filters[0] as String).is_empty() else "")
+	_count.text = count_text(_library.paths.size(), (_library.shown[0] as Array).size(),
+		_library.folders.size(), secs, scope, partial)
 
 ## Each list highlights ITS deck's track, not whichever deck happens to be driven. A track
 ## filtered out of that crate's view simply has no row to select.
@@ -950,13 +978,17 @@ func _sweep_durations(todo: Array[String]) -> void:
 			_engine.metadata(p)
 		(func() -> void:
 			if token == _sweep_token and not _engine.is_shut_down():
-				# what the sweep learned is kept for the next launch, and a metadata sort
-				# re-sorts now that the missing artists, albums and keys are known
+				# what the sweep learned is kept for the next launch
 				_engine.save_index(_library.all_paths)
-				if SORTS[_library.sorts[0]] in META_SORTS or SORTS[_library.sorts[1]] in META_SORTS:
-					_reindex()
-				else:
-					_refill()).call_deferred())
+				_meta_arrived()).call_deferred())
+
+## Metadata landed from a worker: a metadata sort re-sorts now that the artists, albums and keys
+## are known; anything else only needs the count line repainted -- the rows show no metadata.
+func _meta_arrived() -> void:
+	if SORTS[_library.sorts[0]] in META_SORTS or SORTS[_library.sorts[1]] in META_SORTS:
+		_reindex()
+	else:
+		_recount()
 
 ## Whether `dir` actually joined the library. What may join is LibraryModel's rule; the note
 ## about what happened belongs here, with the rest of the UI. `apply` false leaves the save and
@@ -1007,11 +1039,12 @@ func _on_files_dropped(files: PackedStringArray) -> void:
 ## expand/collapse state every time they cycled SORT.
 func _build_folder_tree() -> void:
 	_folder_tree.clear()
-	var counts := _folder_counts()
+	var own := _own_counts()
+	var counts := _folder_counts(own)
 	var root := _folder_tree.create_item()
 	for base in _library.folders:
 		var made := {base: _folder_item(root, base, counts)}
-		for d in _dirs_under(base):
+		for d in _dirs_under(base, own):
 			# _dirs_under sorts, and for path strings a parent always sorts before its
 			# own children -- so the parent item is guaranteed to exist by now
 			made[d] = _folder_item(made[d.get_base_dir()], d, counts)
@@ -1037,27 +1070,38 @@ func _folder_item(parent: TreeItem, path: String, counts: Dictionary) -> TreeIte
 ## O(tracks x depth). The obvious alternative -- begins_with() for every folder against
 ## every track -- is O(folders x tracks), which the old flat list got away with because it
 ## only ever had two rows. A tree has one row per directory.
-func _folder_counts() -> Dictionary:
+##
+## Tracks are counted into their own directory first and only the distinct directories walk up:
+## walking every TRACK to the drive root was 20k x depth string splits (1.2 s at 20k tracks).
+func _folder_counts(own: Dictionary) -> Dictionary:
 	var counts := {}
-	for path in _library.all_paths:
-		var dir := path.get_base_dir()
+	for leaf: String in own:
+		var dir := leaf
 		while true:
-			counts[dir] = counts.get(dir, 0) + 1
+			counts[dir] = counts.get(dir, 0) + own[leaf]
 			var up := dir.get_base_dir()
 			if up == dir or up.is_empty():
 				break
 			dir = up
 	return counts
 
+## directory -> how many tracks sit directly in it.
+func _own_counts() -> Dictionary:
+	var own := {}
+	for path in _library.all_paths:
+		var dir := path.get_base_dir()
+		own[dir] = own.get(dir, 0) + 1
+	return own
+
 ## Every directory under `base` that holds audio, plus the ancestors linking them back to
 ## base. Sorted, because for path strings sorting puts a parent ahead of its children.
-func _dirs_under(base: String) -> Array[String]:
+func _dirs_under(base: String, own: Dictionary) -> Array[String]:
 	var seen := {}
 	var prefix := base + "/"
-	for path in _library.all_paths:
-		if not path.begins_with(prefix):
+	for leaf: String in own:
+		if not leaf.begins_with(prefix):
 			continue
-		var dir := path.get_base_dir()
+		var dir := leaf
 		while dir != base and dir.length() > base.length():
 			seen[dir] = true
 			dir = dir.get_base_dir()
