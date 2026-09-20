@@ -205,6 +205,12 @@ func gradient_index() -> int:
 const SKIN_INDEX := -1
 var skin_gradient: Gradient
 
+## CUSTOM: one colour the user picked, and nothing else -- no gradient, no rainbow drift, no skin.
+## Another negative slot for the same reason SKIN is one: the saved numbering above zero is a
+## position in the swatch row and must not move.
+const CUSTOM_INDEX := -2
+var custom_color := Color(0.18, 0.8, 0.443)
+
 ## The Gradient the current selection draws from -- a user gradient or the skin's -- else null.
 func _gradient() -> Gradient:
 	if color_index == SKIN_INDEX:
@@ -261,6 +267,8 @@ const SPREAD_RAINBOW := 0.6
 ## Colour for a bar at t in 0..1 across the spectrum. The fixed presets are deliberately
 ## one flat colour; everything else varies across the bands.
 func color_at(t: float) -> Color:
+	if color_index == CUSTOM_INDEX:
+		return custom_color   # flat across the spectrum, the way a fixed preset is
 	var grad := _gradient()
 	if grad == null:
 		if color_index >= PRESETS.size():
@@ -277,6 +285,8 @@ func color_at(t: float) -> Color:
 			return grad.sample(clampf(t, 0.0, 1.0))
 
 func color() -> Color:
+	if color_index == CUSTOM_INDEX:
+		return custom_color   # picked outright: it beats the gradients, the rainbow and the skin
 	var grad := _gradient()
 	if grad:
 		# a mode that wants ONE colour per frame still animates unless STATIC, walking

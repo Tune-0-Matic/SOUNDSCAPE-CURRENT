@@ -450,6 +450,8 @@ func _ready() -> void:
 		_mono = _cfg_bool(cfg, "audio", "mono", false)
 		_crt_on = _cfg_bool(cfg, "visual", "crt", true)
 		_bg_throttle = _cfg_bool(cfg, "visual", "bg_throttle", false)
+		_playbar_offset = int(_cfg_num(cfg, "visual", "playbar_split", 0.0))
+		_now_playing = _cfg_bool(cfg, "visual", "now_playing", false)
 		_video_test = _cfg_bool(cfg, "visual", "video_test", false)
 		_video_color = clampi(int(_cfg_num(cfg, "visual", "video_color", 1.0)), 0, 1) as VideoTest.ColorMode
 		_listening_mode = clampi(int(_cfg_num(cfg, "visual", "listening_mode", 0.0)), 0,
@@ -542,6 +544,7 @@ func _ready() -> void:
 	_setup_boost()
 	_setup_layout()
 	_setup_beat()
+	_setup_playbar_split()
 	_setup_tbs()
 	_setup_tbs_window()
 	_setup_tear_off()
@@ -556,6 +559,8 @@ func _ready() -> void:
 	_engine.set_listening_mode(_listening_mode)
 	if _visual_windowed:
 		_toggle_visual_window(true)
+	if _now_playing:
+		_toggle_now_playing(true)
 	%Sort.text = "SORT: %s" % SORTS[_library.sorts[0]]
 	%SortB.text = "SORT: %s" % SORTS[_library.sorts[1]]
 	_dialog.dir_selected.connect(func(d: String) -> void: _add_folder(d))
@@ -641,6 +646,7 @@ func _ready() -> void:
 	_setup_rack_tab(0)    # FX A and FX B: boot blank, modules added at runtime
 	_setup_rack_tab(1)
 	_setup_record_tab()   # the RECORD SET tab, added before the capture below
+	_setup_tools_tab()
 	_capture_tab_order()
 	_shorten_tab_titles()   # 9 tabs do not fit the bar at its natural widths   # every tab now exists, including the runtime-built ones
 	_set_dual_deck(_dual_deck)   # after the capture, so every tab has a home slot to return to
@@ -1363,6 +1369,8 @@ func _save() -> void:
 	cfg.set_value("audio", "mono", _mono)
 	cfg.set_value("visual", "crt", _crt_on)
 	cfg.set_value("visual", "bg_throttle", _bg_throttle)
+	cfg.set_value("visual", "playbar_split", _playbar_offset)
+	cfg.set_value("visual", "now_playing", _now_playing)
 	cfg.set_value("visual", "video_test", _video_test)
 	cfg.set_value("visual", "listening_mode", _listening_mode)
 	cfg.set_value("visual", "video_color", int(_video_color))
@@ -1403,7 +1411,8 @@ func _save() -> void:
 	for pair in [["viz", %Viz], ["viz_b", %VizB]]:
 		var v: Visualizer = pair[1]
 		cfg.set_value("visual", pair[0], {
-			"mode": int(v.mode), "color": v.color_index, "sens": v.sensitivity,
+			"mode": int(v.mode), "color": v.color_index, "custom": v.custom_color.to_html(false),
+			"sens": v.sensitivity,
 			"tilt": v.tilt_db, "height": v.height_scale, "speed": v.speed})
 	_write_cfg_async(cfg)
 
@@ -1918,6 +1927,8 @@ func _process(delta: float) -> void:
 		_last_screen = scr
 		_refit_window_to_screen()
 	_flash = maxf(_flash - delta, 0.0)
+	_clamp_playbar()
+	_now_update()
 	_marquee_step(delta)
 	%Play.text = "PAUSE" if _state() == "PLAYING" else "PLAY"
 	# tracks the fit in wall-clock time, so the readout settles the same at any FPS
@@ -2533,6 +2544,7 @@ const VIZ_NAMES := ["SEGMENTS", "MIRROR", "WATERFALL", "GRID", "RADIAL", "MATRIX
 const COLOR_ANIM_NAMES := ["STATIC", "FADE", "LEFT-RIGHT", "WAVE"]
 var _anim_btn: Button
 var _rotate_btn: Button
+var _custom_btn: ColorPickerButton   # VIS tab: the one solid colour that beats every palette
 
 func _setup_visual() -> void:
 	# user skins are read before the saved name is resolved, so a custom palette survives a
@@ -2567,7 +2579,10 @@ func _setup_visual() -> void:
 		# PRESETS.size() is the rainbow slot, one past the last fixed colour
 		v.gradients = _gradients
 		# one slot per gradient past the rainbow, so a saved gradient selection survives
-		v.color_index = clampi(c.get("color", Visualizer.SKIN_INDEX), Visualizer.SKIN_INDEX, v.PRESETS.size() + _gradients.size())
+		v.color_index = clampi(c.get("color", Visualizer.SKIN_INDEX), Visualizer.CUSTOM_INDEX, v.PRESETS.size() + _gradients.size())
+		var picked: Variant = c.get("custom", "")
+		if picked is String and Color.html_is_valid(str(picked)):
+			v.custom_color = Color.html(str(picked))
 		v.sensitivity = c.get("sens", 0.5)
 		v.tilt_db = c.get("tilt", 20.0)
 		v.height_scale = c.get("height", 0.62)
@@ -2585,7 +2600,36 @@ func _setup_visual() -> void:
 	_hover_note(grad_btn, func() -> String:
 		return "BUILD VISUALIZER GRADIENTS  //  COPY AND PASTE THEM AS HEX LISTS")
 
-	_anim_btn = _add_setting_row("COLOR ANIMATION", "AnimRow", grad_btn.get_parent(), visual_home)
+	# One colour, picked outright, over every palette: the swatch row is a set of choices somebody
+	# else made, and this is the one that is yours. Godot's own picker rather than a hex field --
+	# it carries the wheel, the sliders AND a hex box, all themed, for one node.
+	var custom_row := HBoxContainer.new()
+	custom_row.name = "CustomColorRow"
+	custom_row.add_theme_constant_override("separation", 6)
+	visual_home.add_child(custom_row)
+	visual_home.move_child(custom_row, %ColorRow.get_index() + 1)
+	var custom_cap := Label.new()
+	custom_cap.text = "CUSTOM COLOR"
+	custom_row.add_child(custom_cap)
+	_pin_label(custom_cap)
+	_custom_btn = ColorPickerButton.new()
+	_custom_btn.name = "CustomColor"
+	_custom_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_custom_btn.custom_minimum_size.y = 18
+	_custom_btn.edit_alpha = false
+	_custom_btn.color = _viz.custom_color
+	# color_changed fires continuously while the wheel is dragged, so the save is debounced the
+	# same way the gradient editor's pickers are
+	_custom_btn.color_changed.connect(func(c: Color) -> void:
+		_viz.custom_color = c
+		_viz.color_index = Visualizer.CUSTOM_INDEX   # picking one is choosing it
+		_rebuild_color_row()
+		_save_soon())
+	_hover_note(_custom_btn, func() -> String:
+		return "ONE SOLID COLOUR, OVER EVERY PALETTE  //  HEX IS IN THE PICKER")
+	custom_row.add_child(_custom_btn)
+
+	_anim_btn = _add_setting_row("COLOR ANIMATION", "AnimRow", custom_row, visual_home)
 	_anim_btn.pressed.connect(func() -> void:
 		_viz.color_anim = ((_viz.color_anim + 1) % COLOR_ANIM_NAMES.size()) as Visualizer.ColorAnim
 		_refresh_anim_btn()
@@ -2702,6 +2746,388 @@ func _open_deck(deck: int, path: String) -> void:
 		_open(qi)
 	else:
 		_engine.load_on(deck, path)
+
+# --- TOOLS ---------------------------------------------------------------------------------
+## Utilities that work on ONE track -- the one on the transport -- and want room of their own.
+## Each opens a real OS window rather than a tab panel, because a cutter you are reading
+## timestamps into is not something you want to lose by clicking another tab.
+##
+## Every tool writes a NEW FILE beside the original and never touches it. That is the whole
+## safety story here: an edit that goes wrong costs a file you can delete, not the master.
+const TOOLS := [
+	["AUDIO CUTTER", "cutter", "TRIM THE TRANSPORT'S TRACK INTO A NEW FILE BESIDE IT"],
+	["METADATA", "meta", "TITLE, ARTIST AND ALBUM, WRITTEN INTO A TAGGED COPY"],
+	["FILE INFO", "info", "WHAT THE FILE IS: CODEC, RATE, DEPTH, TAGS, SIZE AND PATH"],
+]
+var _tool_windows := {}   # kind -> Window
+
+func _setup_tools_tab() -> void:
+	var tab := VBoxContainer.new()
+	tab.name = "TOOLS"
+	tab.add_theme_constant_override("separation", 4)
+	_tabs.add_child(tab)
+	var note := Label.new()
+	note.text = "EACH OPENS IN ITS OWN WINDOW\nAND WORKS ON THE PLAYING TRACK"
+	note.theme_type_variation = &"Green"
+	tab.add_child(note)
+	for spec in TOOLS:
+		var b := Button.new()
+		b.text = "[ %s ]" % spec[0]
+		var kind: String = spec[1]
+		b.pressed.connect(func() -> void: _open_tool(kind))
+		_hover_note(b, func() -> String: return str(spec[2]))
+		tab.add_child(b)
+
+## One window per tool, raised rather than duplicated. Returns the column to fill, or null when
+## the tool was already open.
+func _tool_window(kind: String, title: String, size: Vector2i) -> VBoxContainer:
+	var open: Window = _tool_windows.get(kind)
+	if is_instance_valid(open):
+		open.grab_focus()
+		return null
+	var win := Window.new()
+	win.name = "Tool%s" % kind.capitalize()
+	win.title = "SOUNDSCAPE // %s" % title
+	win.size = size
+	win.unresizable = false
+	win.transient = false
+	win.exclusive = false
+	win.theme = theme
+	add_child(win)
+	_enable_window_fullscreen_toggle(win)
+	var chassis := PanelContainer.new()
+	chassis.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var root_sb: StyleBox = get("theme_override_styles/panel")
+	if root_sb:
+		chassis.add_theme_stylebox_override("panel", root_sb)
+	win.add_child(chassis)
+	var pad := MarginContainer.new()
+	for side in ["left", "top", "right", "bottom"]:
+		pad.add_theme_constant_override("margin_" + side, 8)
+	chassis.add_child(pad)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 6)
+	pad.add_child(col)
+	win.close_requested.connect(func() -> void:
+		_tool_windows.erase(kind)
+		win.queue_free())
+	_tool_windows[kind] = win
+	_centre_on_primary(win)
+	win.show()
+	return col
+
+## A captioned field, the shape every tool's inputs take.
+func _tool_field(col: Control, caption: String, value: String, chars := 16) -> LineEdit:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+	col.add_child(row)
+	var cap := Label.new()
+	cap.text = caption
+	row.add_child(cap)
+	_pin_label(cap)
+	var field := LineEdit.new()
+	field.text = value
+	field.max_length = chars
+	field.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(field)
+	return field
+
+func _open_tool(kind: String) -> void:
+	match kind:
+		"cutter": _open_cutter()
+		"meta": _open_metadata_tool()
+		"info": _open_file_info()
+
+## FILE INFO: what the file actually is, read from the file. The same probe TRACK INFO uses,
+## laid out where it can be read and left open while other tracks play.
+func _open_file_info() -> void:
+	var col := _tool_window("info", "FILE INFO", Vector2i(560, 420))
+	if col == null:
+		return
+	var body := Label.new()
+	body.autowrap_mode = TextServer.AUTOWRAP_OFF
+	col.add_child(body)
+	var refresh := Button.new()
+	refresh.text = "[ READ THE TRACK ON THE TRANSPORT ]"
+	var fill := func() -> void:
+		var path := _bar_path()
+		if path.is_empty():
+			body.text = "NOTHING ON THE TRANSPORT."
+			return
+		var m := _engine.metadata(path)
+		var stamp := AudioEngine.file_stamp(path)
+		var key: Dictionary = m.get("key", {})
+		var bpm := float(m.get("bpm", 0.0))
+		body.text = "\n".join([
+			"FILE......%s" % path.get_file(),
+			"WHERE.....%s" % path.get_base_dir(),
+			"SIZE......%s" % _bytes(int(stamp[1]) if stamp.size() == 2 else 0),
+			"",
+			"TITLE.....%s" % m.get("title", "-"),
+			"ARTIST....%s" % (m.get("artist", "") if str(m.get("artist", "")) != "" else "-"),
+			"ALBUM.....%s" % (m.get("album", "") if str(m.get("album", "")) != "" else "-"),
+			"KEY.......%s" % (str(key.get("text", "")) if str(key.get("text", "")) != "" else "-"),
+			"BPM.......%s" % ("%.1f" % bpm if bpm > 0.0 else "-"),
+			"",
+			"CODEC.....%s" % m.get("codec", "-"),
+			"RATE......%d HZ" % int(m.get("sample_rate", 0)),
+			"DEPTH.....%d BIT" % int(m.get("bits", 0)),
+			"CHANNELS..%d" % int(m.get("channels", 0)),
+			"LENGTH....%s" % _time_text(float(m.get("duration", 0.0))),
+			"",
+			"ENGINE....%s" % autopsy_source(_bar().stream, m, path),
+		])
+	refresh.pressed.connect(fill)
+	col.add_child(refresh)
+	fill.call()
+
+## AUDIO CUTTER: in and out, and a copy of what is between them. -c copy, so the cut is the
+## original's own bytes -- no re-encode, no generation loss -- which means the cut lands on the
+## nearest frame boundary rather than the exact sample. For a trim that is the right trade.
+func _open_cutter() -> void:
+	var col := _tool_window("cutter", "AUDIO CUTTER", Vector2i(520, 300))
+	if col == null:
+		return
+	var path := _bar_path()
+	var cues := _cues_for(path) if not path.is_empty() else []
+	var from_default := float(cues[0]["time"]) if cues.size() > 0 else 0.0
+	var to_default := float(cues[1]["time"]) if cues.size() > 1 else _len()
+	var head := Label.new()
+	head.clip_text = true
+	head.text = path.get_file() if not path.is_empty() else "NOTHING ON THE TRANSPORT"
+	col.add_child(head)
+	var from_field := _tool_field(col, "IN  (MM:SS:MS)", ts_text(from_default))
+	var to_field := _tool_field(col, "OUT (MM:SS:MS)", ts_text(maxf(to_default, from_default)))
+	var status := Label.new()
+	status.theme_type_variation = &"Green"
+	status.clip_text = true
+	col.add_child(status)
+	var cut := Button.new()
+	cut.text = "[ WRITE THE CUT ]"
+	cut.pressed.connect(func() -> void:
+		var a := ts_parse(from_field.text)
+		var b := ts_parse(to_field.text)
+		if path.is_empty() or a < 0.0 or b <= a:
+			_status_note(status, false, "IN AND OUT MUST BE TIMESTAMPS, OUT AFTER IN")
+			return
+		var out := "%s (CUT %s-%s).%s" % [path.get_basename(), _time_text(a).replace(":", "."),
+			_time_text(b).replace(":", "."), path.get_extension()]
+		_status_note(status, true, "WRITING %s" % out.get_file())
+		# on a worker: ffmpeg on a long file is seconds, and the UI has no business waiting
+		_engine.run_task(func() -> void:
+			var ok := AudioEngine.run_process("ffmpeg", ["-v", "error", "-y", "-nostdin",
+				"-ss", "%.3f" % a, "-to", "%.3f" % b, "-i", path, "-c", "copy", out],
+				_engine.is_shut_down) == 0
+			(func() -> void:
+				_status_note(status, ok and FileAccess.file_exists(out),
+					"WROTE %s" % out.get_file() if ok else "FFMPEG REFUSED THAT CUT")).call_deferred()))
+	col.add_child(cut)
+
+## METADATA: the three tags the rest of the program reads, written into a COPY. ffmpeg cannot
+## retag in place, and a tool that rewrites somebody's master to change a spelling is not a tool
+## anyone should have to trust -- so the copy is the feature, not a limitation.
+func _open_metadata_tool() -> void:
+	var col := _tool_window("meta", "METADATA", Vector2i(520, 320))
+	if col == null:
+		return
+	var path := _bar_path()
+	var m := _engine.metadata(path) if not path.is_empty() else {}
+	var head := Label.new()
+	head.clip_text = true
+	head.text = path.get_file() if not path.is_empty() else "NOTHING ON THE TRANSPORT"
+	col.add_child(head)
+	var title_field := _tool_field(col, "TITLE ", str(m.get("title", "")), 120)
+	var artist_field := _tool_field(col, "ARTIST", str(m.get("artist", "")), 120)
+	var album_field := _tool_field(col, "ALBUM ", str(m.get("album", "")), 120)
+	var status := Label.new()
+	status.theme_type_variation = &"Green"
+	status.clip_text = true
+	col.add_child(status)
+	var save := Button.new()
+	save.text = "[ WRITE A TAGGED COPY ]"
+	save.pressed.connect(func() -> void:
+		if path.is_empty():
+			_status_note(status, false, "NOTHING ON THE TRANSPORT")
+			return
+		var out := "%s (TAGGED).%s" % [path.get_basename(), path.get_extension()]
+		_status_note(status, true, "WRITING %s" % out.get_file())
+		_engine.run_task(func() -> void:
+			var ok := AudioEngine.run_process("ffmpeg", ["-v", "error", "-y", "-nostdin",
+				"-i", path, "-c", "copy",
+				"-metadata", "title=%s" % title_field.text,
+				"-metadata", "artist=%s" % artist_field.text,
+				"-metadata", "album=%s" % album_field.text, out],
+				_engine.is_shut_down) == 0
+			(func() -> void:
+				_status_note(status, ok and FileAccess.file_exists(out),
+					"WROTE %s" % out.get_file() if ok else "FFMPEG WOULD NOT TAG THAT FORMAT")).call_deferred()))
+	col.add_child(save)
+
+# --- NOW PLAYING, in a window of its own --------------------------------------------------
+## The whole player is a lot of screen for "what is this and how far in are we". This is that
+## question alone, in a BORDERLESS window you can drop in a corner over whatever you are actually
+## working in -- which is also why it is always on top and why it is dragged by its own face:
+## a borderless window has no title bar for the OS to move it by.
+const NOW_WIN_SIZE := Vector2i(460, 92)
+var _now_win: Window
+var _now_title: Label
+var _now_time: Label
+var _now_bar: ProgressBar
+var _now_playing := false     # TBS NOW PLAYING WINDOW, saved
+var _now_btn: Button
+var _now_grab := Vector2i.ZERO   # pointer offset inside the window while it is being dragged
+var _now_dragging := false
+
+func _toggle_now_playing(on: bool) -> void:
+	if on == is_instance_valid(_now_win):
+		return
+	if not on:
+		if is_instance_valid(_now_win):
+			_now_win.queue_free()
+		_now_win = null
+		return
+	var win := Window.new()
+	win.name = "NowPlayingWindow"
+	win.title = "SOUNDSCAPE // NOW PLAYING"
+	win.size = NOW_WIN_SIZE
+	win.borderless = true
+	win.always_on_top = true
+	win.transient = false
+	win.exclusive = false
+	win.theme = theme
+	add_child(win)
+	var chassis := PanelContainer.new()
+	chassis.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var root_sb: StyleBox = get("theme_override_styles/panel")
+	if root_sb:
+		chassis.add_theme_stylebox_override("panel", root_sb)
+	win.add_child(chassis)
+	var pad := MarginContainer.new()
+	for side in ["left", "top", "right", "bottom"]:
+		pad.add_theme_constant_override("margin_" + side, 6)
+	chassis.add_child(pad)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 3)
+	pad.add_child(col)
+	var top := HBoxContainer.new()
+	top.add_theme_constant_override("separation", 6)
+	col.add_child(top)
+	_now_title = Label.new()
+	_now_title.clip_text = true
+	_now_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	top.add_child(_now_title)
+	var shut := Button.new()
+	shut.text = "X"   # no title bar means no close button unless one is drawn
+	shut.pressed.connect(func() -> void:
+		_now_playing = false
+		if is_instance_valid(_now_btn):
+			_now_btn.button_pressed = false
+		_refresh_now_btn()
+		_toggle_now_playing(false)
+		_save())
+	top.add_child(shut)
+	_now_bar = ProgressBar.new()
+	_now_bar.show_percentage = false
+	_now_bar.custom_minimum_size.y = 10
+	col.add_child(_now_bar)
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+	col.add_child(row)
+	_now_time = Label.new()
+	_now_time.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(_now_time)
+	for spec in [["|<", _prev], [">||", _toggle], [">|", func() -> void: _next()]]:
+		var b := Button.new()
+		b.text = spec[0]
+		b.pressed.connect(spec[1])
+		row.add_child(b)
+	# dragged by its own face, in SCREEN coordinates: the pointer's offset inside the window is
+	# taken on the press and held to for the whole drag, so the window does not creep
+	win.window_input.connect(func(e: InputEvent) -> void:
+		var click := e as InputEventMouseButton
+		if click and click.button_index == MOUSE_BUTTON_LEFT:
+			_now_dragging = click.pressed
+			_now_grab = DisplayServer.mouse_get_position() - win.position
+		elif e is InputEventMouseMotion and _now_dragging:
+			win.position = DisplayServer.mouse_get_position() - _now_grab)
+	_now_win = win
+	_centre_on_primary(win)
+	win.show()
+	_now_update()
+
+## What the mini bar says, refreshed from the bar deck each frame it is open. Nothing here is
+## state of its own: it reads the same _bar_path(), _pos() and _len() the transport does.
+func _now_update() -> void:
+	if not is_instance_valid(_now_win):
+		return
+	var path := _bar_path()
+	if path.is_empty():
+		_now_title.text = "[ NOTHING PLAYING ]"
+		_now_time.text = "--:-- / --:--"
+		_now_bar.value = 0.0
+		return
+	var m := _engine.peek_meta(path)
+	var who := str(m.get("artist", ""))
+	var what := str(m.get("title", path.get_file().get_basename()))
+	_now_title.text = ("%s - %s" % [who, what] if not who.is_empty() else what).to_upper()
+	var length := _len()
+	_now_time.text = "%s / %s" % [_time_text(_pos()), _time_text(length)]
+	_now_bar.value = (_pos() / length * 100.0) if length > 0.0 else 0.0
+
+func _refresh_now_btn() -> void:
+	if is_instance_valid(_now_btn):
+		_now_btn.text = "[*] OPEN" if _now_playing else "[ ] CLOSED"
+
+# --- the player bar's height ------------------------------------------------------------
+## The transport sat in the main column at whatever height its controls needed, which is fine
+## until you want to actually SEE the waveform you are cueing against. Body and the bar now share
+## a VSplitContainer, so the divider between them is draggable: pull it up and the scrub bar takes
+## every pixel you give it, markers, waveform and all, because both are drawn from the overlay's
+## own height rather than a constant.
+##
+## Built here rather than in player.tscn because the nodes are already there and already wired:
+## reparenting three of them keeps every %UniqueName (each has the scene root as its owner, which
+## is what reparent() restores), where re-cutting the scene would touch every path below them.
+const PLAYBAR_MIN_H := 52     # the bar at its natural height: scrub row plus the transport
+const PLAYBAR_MAX_H := 420    # past this it is eating the library, not showing a waveform
+var _playbar_split: VSplitContainer
+var _playbar_offset := 0      # the divider's saved position, 0 = the bar at its minimum
+
+func _setup_playbar_split() -> void:
+	# Body's parent, not %Main: the main column is not a unique name in this scene
+	var main: Control = %Body.get_parent()
+	_playbar_split = VSplitContainer.new()
+	_playbar_split.name = "PlayerSplit"
+	_playbar_split.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	main.add_child(_playbar_split)
+	main.move_child(_playbar_split, %Body.get_index())
+	%Body.reparent(_playbar_split, false)
+	var bar := VBoxContainer.new()
+	bar.name = "PlayerBar"
+	bar.add_theme_constant_override("separation", 4)
+	bar.custom_minimum_size.y = PLAYBAR_MIN_H
+	_playbar_split.add_child(bar)
+	%ScrubRow.reparent(bar, false)
+	%ControlDeck.reparent(bar, false)
+	_restore_unique_names(_playbar_split)
+	# what grows when the divider moves: the scrub bar itself, and with it the cue overlay
+	# anchored to it -- the transport row keeps its own height
+	%ScrubRow.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	%Scrub.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_playbar_split.split_offset = _playbar_offset
+	_playbar_split.dragged.connect(func(offset: int) -> void:
+		_playbar_offset = offset
+		_save_soon())
+
+## The bar's height, clamped: a drag that would leave the library a sliver, or the bar shorter
+## than its own controls, is held at the edge rather than refused.
+func _clamp_playbar() -> void:
+	if not is_instance_valid(_playbar_split) or _playbar_split.get_child_count() < 2:
+		return
+	var bar: Control = _playbar_split.get_child(1)
+	if bar.size.y > PLAYBAR_MAX_H:
+		_playbar_split.split_offset += int(bar.size.y - PLAYBAR_MAX_H)
+		_playbar_offset = _playbar_split.split_offset
 
 # --- hover marquee ----------------------------------------------------------------------
 ## A title too long for the column scrolls while the pointer rests on it, and snaps back to the
@@ -3196,7 +3622,7 @@ const SETTING_GROUPS := {
 	"LIBRARY": ["ShowMsRow"],
 	"DISPLAY": ["FeedSizeRow", "FpsRow", "LayoutRow", "ClockRow", "FontRow", "FontsRow",
 		"CursorRow", "CrtRow", "PlayBarRow", "PlayBarShapeRow", "VisualWinRow", "DualDeckRow",
-		"FadeSpeedRow", "BgThrottleRow"],
+		"FadeSpeedRow", "BgThrottleRow", "NowPlayingRow"],
 	"VIDEO": ["IntroRow", "VideoTestRow", "VideoColorRow"],
 	"INPUT": ["SkipSecsRow"],
 	"ADVANCED": ["MessageLogRow", "CheatRow", "AutopsyPanel"],
@@ -3446,6 +3872,19 @@ func _add_settings_rows() -> void:
 	_tbs_home.add_child(autopsy)
 	_tbs_home.move_child(autopsy, after.get_index() + 1)
 	after = autopsy
+
+	_now_btn = _add_setting_row("NOW PLAYING WINDOW", "NowPlayingRow", after)
+	_now_btn.toggle_mode = true
+	_now_btn.button_pressed = _now_playing
+	_now_btn.pressed.connect(func() -> void:
+		_now_playing = _now_btn.button_pressed
+		_toggle_now_playing(_now_playing)
+		_refresh_now_btn()
+		_save())
+	_refresh_now_btn()
+	_hover_note(_now_btn, func() -> String:
+		return "TITLE, TIME AND TRANSPORT IN A SMALL BORDERLESS WINDOW  //  DRAG IT BY ITS FACE")
+	after = _now_btn.get_parent()
 
 	_bg_throttle_btn = _add_setting_row("LOWER USAGE IN BACKGROUND", "BgThrottleRow", after)
 	_bg_throttle_btn.toggle_mode = true
@@ -8022,14 +8461,24 @@ func _rebuild_color_row() -> void:
 		c.queue_free()
 	_viz.gradients = _gradients
 	var fixed: int = _viz.PRESETS.size()
-	for i in range(Visualizer.SKIN_INDEX, fixed + 1 + _gradients.size()):
+	for i in range(Visualizer.CUSTOM_INDEX, fixed + 1 + _gradients.size()):
 		var b := Button.new()
 		# %ColorRow is an HFlowContainer now, not a single fixed row -- a swatch needs its
 		# own width to wrap sanely, where the old HBoxContainer could rely on
 		# SIZE_EXPAND_FILL dividing one row evenly among however many there were
 		b.custom_minimum_size = Vector2(40, 18)
 		var sb: StyleBox
-		if i == Visualizer.SKIN_INDEX:
+		if i == Visualizer.CUSTOM_INDEX:
+			# the colour the picker holds, as its own swatch: the row is where every other
+			# choice lives, so the custom one belongs in it rather than only in the picker
+			var flat := StyleBoxFlat.new()
+			flat.bg_color = _viz.custom_color
+			flat.border_color = Color(0, 0, 0)
+			flat.set_border_width_all(1)
+			sb = flat
+			_hover_note(b, func() -> String:
+				return "CUSTOM COLOUR  //  %s  //  PICK IT ON THE ROW BELOW" % _viz.custom_color.to_html(false).to_upper())
+		elif i == Visualizer.SKIN_INDEX:
 			sb = _gradient_swatch(Skins.accent_ramp(_skin))
 			# labelled, because a mono skin's swatch is one flat colour -- on WIN98 the very
 			# green of the first preset -- and in the screen colour, which reads on every accent
