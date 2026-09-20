@@ -76,36 +76,80 @@ var _scan_stop := false
 var _scan_done := 0
 var _scan_where := ""
 var _scan_out: Array[String] = []
-var _scan_sizes := {}   # path -> byte size, for the tracks the walk found with no id yet
+var _scan_ids := {}   # path -> [fingerprint, byte size], for the tracks the walk found with no id
+## The last completed scan's _scan_ids, for migrate_ids(). Public because the owner is the one
+## that knows whether this library has been through the fingerprint migration yet.
+var scan_ids := {}
 var _scan_live := false
 
 func _exit_tree() -> void:
 	stop_scan()
 
 # --- track identity -------------------------------------------------------------
-## A track's identity, independent of where it sits on disk. Name and size: a folder move, a
-## drive re-letter and a whole library relocation all keep both, so the cues, the labels and
-## the playlists survive them. Re-encoding a file changes its size and so its id, which is
-## correct -- that is a different render of the track, and its old cue times need not fit.
+## A track's identity, independent of where it sits on disk and of what it is called: FINGERPRINT
+## BYTES read from the middle of the file, hashed. What that buys, against the name-and-size id it
+## replaced (track_id below, kept for the migration):
 ##
-## ponytail: two files with the SAME name and the SAME byte count share an id and so share
-## their cues. That is a real collision, and for identical copies of one track it is the
-## behaviour you want. Add a content hash if a library ever shows up where it is not.
+##   a folder move, a drive re-letter, a whole library relocation  -> same id, as before
+##   a RENAMED file                                                -> same id; the old id moved
+##   two different tracks sharing a name and a byte count          -> different ids; they collided
+##
+## The middle, not the head or the tail, because that is where the tags are not: ID3v2 and Vorbis
+## comments sit at the front, ID3v1 and APEv2 at the back. A tagger that rewrites in place, keeping
+## the file length, therefore leaves the id alone. One that changes the length does not: the slice
+## is taken at length/2, so it moves with the file. That is no worse than the size-based id it
+## replaces, and it is the honest limit of a cheap fingerprint -- the alternative is hashing the
+## decoded audio, which is a full decode per track.
+##
+## Re-encoding a file changes its id, which is correct: that is a different render of the track,
+## and its old cue times need not fit.
+const FINGERPRINT_BYTES := 65536
+
+## [id, byte size], in one open. "" and 0 when the file cannot be read, so a caller can tell a
+## fingerprint apart from a file that was not there.
+static func fingerprint_and_size(path: String) -> Array:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if not f:
+		return ["", 0]
+	var size := f.get_length()
+	f.seek(maxi(0, int(size / 2) - FINGERPRINT_BYTES / 2))
+	var slice := f.get_buffer(FINGERPRINT_BYTES)
+	f.close()
+	if slice.is_empty():
+		return ["", size]
+	var ctx := HashingContext.new()
+	ctx.start(HashingContext.HASH_SHA1)
+	ctx.update(slice)
+	return [ctx.finish().hex_encode().left(16), size]
+
+static func fingerprint(path: String) -> String:
+	return str(fingerprint_and_size(path)[0])
+
+## The PRE-FINGERPRINT id: the filename and the byte size. Only migrate_ids() still mints these,
+## to work out which stored key belongs to which track before re-keying it.
 static func track_id(path: String, size: int) -> String:
 	return ("%s:%d" % [path.get_file().to_lower(), size]).sha1_text().left(16)
 
-## The id for a path, assigning one if this is the first time the track has been seen.
-## Costs one stat per NEW track and nothing at all for a track already in the index.
+## The id for a path, assigning one if this is the first time the track has been seen. Costs one
+## 64 KB read per NEW track -- the scan worker does that for everything it finds, so this only
+## reads for a track that arrived some other way -- and nothing at all for one already indexed.
+## A file that will not open falls back to the old name-and-size id rather than an empty key.
 func id_for(path: String) -> String:
 	if engine == null:
-		return track_id(path, 0)
+		return id_of(path)
 	var known: String = engine.track_ids.get(path, "")
 	if not known.is_empty():
 		return known
-	var stamp := AudioEngine.file_stamp(path)
-	var id := track_id(path, stamp[1] if stamp.size() == 2 else 0)
+	var id := id_of(path)
 	engine.track_ids[path] = id
 	return id
+
+## The id a path earns from the file itself: its fingerprint, or -- for a file that will not open,
+## which is every track on an unplugged drive -- the old name-and-size id, so the key is still
+## stable rather than empty.
+static func id_of(path: String) -> String:
+	var got := fingerprint_and_size(path)
+	return str(got[0]) if not str(got[0]).is_empty() else track_id(path, int(got[1]))
 
 ## Where a track with this id sits today, or "" if the library does not hold it. Built from
 ## the scanned paths, so it answers for the library as it is now, not as it was saved.
@@ -234,7 +278,7 @@ func scan() -> bool:
 	_scan_done = 0
 	_scan_where = ""
 	_scan_out = []
-	_scan_sizes = {}
+	_scan_ids = {}
 	_scan_lock.unlock()
 	var roots := folders.duplicate()
 	var video := video_test
@@ -267,9 +311,10 @@ func _scan_worker(roots: Array[String], video: bool, known: Variant) -> void:
 	for root in roots:
 		if not _walk(root, out, video):
 			break
-	# The byte size every NEW track's id needs, stat'ed here: id_for() would otherwise open each
-	# file on the main thread during the reindex (20k new tracks, ~13 s measured).
-	var sizes := {}
+	# Every NEW track's fingerprint, read here: id_for() would otherwise open each file on the main
+	# thread during the reindex. The byte size rides along because migrate_ids() needs it to work
+	# out what the old name-and-size id for this track would have been.
+	var ids := {}
 	if known is Dictionary:
 		for p in out:
 			if known.has(p):
@@ -279,11 +324,10 @@ func _scan_worker(roots: Array[String], video: bool, known: Variant) -> void:
 			_scan_lock.unlock()
 			if stop:
 				break
-			var st := AudioEngine.file_stamp(p)
-			sizes[p] = st[1] if st.size() == 2 else 0
+			ids[p] = fingerprint_and_size(p)
 	_scan_lock.lock()
 	_scan_out = out
-	_scan_sizes = sizes
+	_scan_ids = ids
 	_scan_lock.unlock()
 
 ## The walk itself. Returns false when it was asked to stop, so every caller above it unwinds
@@ -324,13 +368,15 @@ func _process(_dt: float) -> void:
 	set_process(false)
 	_scan_lock.lock()
 	var found := _scan_out
-	var sizes := _scan_sizes
+	var ids := _scan_ids
 	_scan_lock.unlock()
 	if not cancelled:
 		if engine:
-			for p in sizes:
-				if not engine.track_ids.has(p):
-					engine.track_ids[p] = track_id(p, sizes[p])
+			for p in ids:
+				var id := str((ids[p] as Array)[0])
+				if not engine.track_ids.has(p) and not id.is_empty():
+					engine.track_ids[p] = id
+		scan_ids = ids
 		all_paths = found
 		apply_folder_filter()
 	scan_finished.emit(all_paths.size(), cancelled)
@@ -465,6 +511,47 @@ func migrate_keys(store: Dictionary) -> Dictionary:
 		var key := str(k)
 		out[id_for(key) if key.contains("/") or key.contains("\\") else key] = store[k]
 	return out
+
+## ONE-TIME: re-keys everything the user made from the name-and-size ids to fingerprints. `ids` is
+## a scan's {path: [fingerprint, size]}, which is exactly what is needed to mint the old key for a
+## track and hand its cues, its label and its playlist places to the new one. Returns how many
+## stored keys moved.
+##
+## A key nothing in the library claims is LEFT ALONE, the same courtesy migrate_keys shows: an
+## unplugged drive must not eat the cues of the tracks that live on it. Running twice is a no-op,
+## because after the first pass no old key is in any store.
+const ID_SCHEME := 2   # 1 = name and size, 2 = fingerprint
+
+func migrate_ids(ids: Dictionary) -> int:
+	var map := {}
+	for p in ids:
+		var pair: Array = ids[p]
+		var new_id := str(pair[0])
+		var old_id := track_id(str(p), int(pair[1]))
+		if not new_id.is_empty() and new_id != old_id:
+			map[old_id] = new_id
+	if map.is_empty():
+		return 0
+	var moved := _rekey(cues, map) + _rekey(labels, map)
+	for name in pl_cues:
+		moved += _rekey(pl_cues[name], map)
+	for name in playlists:
+		var out: Array = []
+		for id in (playlists[name] as Array):
+			out.append(map.get(id, id))
+		playlists[name] = out
+	return moved
+
+## Moves every key of `store` that `map` renames. The destination is never overwritten: if both
+## ids are already in there, the new one is the live track's and wins.
+static func _rekey(store: Dictionary, map: Dictionary) -> int:
+	var moved := 0
+	for old in map:
+		if store.has(old) and not store.has(map[old]):
+			store[map[old]] = store[old]
+			store.erase(old)
+			moved += 1
+	return moved
 
 static func migrate_test() -> bool:
 	var m := LibraryModel.new()

@@ -670,13 +670,22 @@ static func ffmpeg_render(path: String, ext: String, args: Array, dir: String, p
 ## so the bar shows where the quiet intro ends and the drop lands instead of being a bare
 ## progress rail with markers floating on it.
 ##
-## Built by ffmpeg on a worker, from mono at WAVE_RATE. That rate is the deliberate part: a peak
-## meter would need the full rate to catch inter-sample peaks, and this is not a meter -- it is a
-## few hundred pixels wide, and 8 kHz already carries far more detail than one bucket can show.
-## The whole overview is 512 pairs, so the cache file is 4 KB per track however long the track is.
+## Built by ffmpeg on a worker, in STEREO at WAVE_RATE through soxr, and folded to a min/max pair
+## per channel per bucket. It was mono at 8 kHz into 512 buckets, which is all a scrub bar a few
+## hundred pixels wide can show; the rate and the channels are what a beat grid needs, because at
+## 8 kHz every transient has been through a 4 kHz brick wall before anything measures it, and a
+## DJ display shows the two channels rather than their average.
+##
+## What that costs is disk, and the fix for that is to stop keeping the wrong thing: ffmpeg's raw
+## f32 PCM is ~35 MB for five minutes at this rate (it was 9.6 MB, kept forever, per track), so it
+## is deleted the moment it has been folded and the FOLDED overview is what gets cached -- 32 KB a
+## track, whatever its length.
 const WAVE_DIR := "user://waveforms"
-const WAVE_BUCKETS := 512
-const WAVE_RATE := 8000
+const WAVE_BUCKETS := 2048
+const WAVE_RATE := 44100
+const WAVE_CHANNELS := 2
+## Floats per bucket: a min and a max for each channel, left pair first.
+const WAVE_STRIDE := WAVE_CHANNELS * 2
 
 signal waveform_ready(path: String)
 
@@ -705,40 +714,60 @@ func _deliver_waveform(path: String, wave: PackedFloat32Array) -> void:
 	_waves[path] = wave
 	waveform_ready.emit(path)
 
-## WORKER THREAD. Decodes to mono f32 at WAVE_RATE and folds it into WAVE_BUCKETS min/max pairs.
-## Returns an empty array if ffmpeg is missing or the file will not decode -- a track with no
-## overview draws the plain bar, which is what it did before any of this existed.
+## WORKER THREAD. The overview for a track, from the cache if it has been built before. Returns an
+## empty array if ffmpeg is missing or the file will not decode -- a track with no overview draws
+## the plain bar, which is what it did before any of this existed.
 static func read_waveform(path: String, dir := WAVE_DIR) -> PackedFloat32Array:
-	var raw := ffmpeg_render(path, "f32", ["-map", "0:a:0", "-ac", "1", "-ar", str(WAVE_RATE),
-		"-f", "f32le", "-c:a", "pcm_f32le"], dir, "wave_")
+	var cached := wave_cache_path(path, dir)
+	if FileAccess.file_exists(cached):
+		return FileAccess.get_file_as_bytes(cached).to_float32_array()
+	# soxr rather than swr: this is the one place a resample decides what a peak LOOKS like, and
+	# it costs nothing here -- the decode is the expensive half and it happens either way.
+	var raw := ffmpeg_render(path, "f32", ["-map", "0:a:0", "-ac", str(WAVE_CHANNELS),
+		"-af", "aresample=resampler=soxr", "-ar", str(WAVE_RATE),
+		"-f", "f32le", "-c:a", "pcm_f32le"], dir, "rawwave_")
 	if raw.is_empty():
 		return PackedFloat32Array()
-	var samples := FileAccess.get_file_as_bytes(raw).to_float32_array()
-	return fold_waveform(samples, WAVE_BUCKETS)
+	var folded := fold_waveform(FileAccess.get_file_as_bytes(raw).to_float32_array(),
+		WAVE_BUCKETS, WAVE_CHANNELS)
+	DirAccess.remove_absolute(raw)   # tens of MB of PCM, for 32 KB of overview
+	var f := FileAccess.open(cached, FileAccess.WRITE)
+	if f:
+		f.store_buffer(folded.to_byte_array())
+		f.close()
+	return folded
 
-## The pure half: n samples into `buckets` min/max pairs. Separate so the folding can be checked
-## without ffmpeg, a file or a thread.
-static func fold_waveform(samples: PackedFloat32Array, buckets: int) -> PackedFloat32Array:
+## Where a track's folded overview lives. Keyed like every other render -- path, mtime and size --
+## so an edited or replaced file builds a new one instead of showing the old shape.
+static func wave_cache_path(path: String, dir := WAVE_DIR) -> String:
+	var base := ProjectSettings.globalize_path(dir)
+	DirAccess.make_dir_recursive_absolute(base)
+	return base.path_join("wave%d_%s.f32" % [WAVE_BUCKETS, (path + str(file_stamp(path))).md5_text()])
+
+## The pure half: interleaved `channels`-channel samples into `buckets` min/max pairs per channel.
+## Separate so the folding can be checked without ffmpeg, a file or a thread.
+static func fold_waveform(samples: PackedFloat32Array, buckets: int, channels := 1) -> PackedFloat32Array:
 	var out := PackedFloat32Array()
-	if samples.is_empty() or buckets <= 0:
+	if samples.is_empty() or buckets <= 0 or channels <= 0:
 		return out
-	out.resize(buckets * 2)
-	var n := samples.size()
+	out.resize(buckets * channels * 2)
+	var frames := samples.size() / channels
 	for b in buckets:
 		# span computed from the ends rather than by accumulating a step, so the last bucket
-		# always finishes exactly at the last sample however the division falls
-		var from := int(float(b) * float(n) / float(buckets))
-		var to := int(float(b + 1) * float(n) / float(buckets))
+		# always finishes exactly at the last frame however the division falls
+		var from := int(float(b) * float(frames) / float(buckets))
+		var to := int(float(b + 1) * float(frames) / float(buckets))
 		if to <= from:
-			to = mini(from + 1, n)
-		var lo := 1.0
-		var hi := -1.0
-		for i in range(from, to):
-			var v := samples[i]
-			lo = minf(lo, v)
-			hi = maxf(hi, v)
-		out[b * 2] = clampf(lo, -1.0, 1.0)
-		out[b * 2 + 1] = clampf(hi, -1.0, 1.0)
+			to = mini(from + 1, frames)
+		for c in channels:
+			var lo := 1.0
+			var hi := -1.0
+			for i in range(from, to):
+				var v := samples[i * channels + c]
+				lo = minf(lo, v)
+				hi = maxf(hi, v)
+			out[(b * channels + c) * 2] = clampf(lo, -1.0, 1.0)
+			out[(b * channels + c) * 2 + 1] = clampf(hi, -1.0, 1.0)
 	return out
 
 static func waveform_test() -> bool:
@@ -753,8 +782,23 @@ static func waveform_test() -> bool:
 		shaped = shaped and folded[b * 2] < -0.9 and folded[b * 2 + 1] > 0.9
 	# a bucket count past the sample count must still produce one pair each, not divide by zero
 	var sparse := fold_waveform(PackedFloat32Array([0.5, -0.25]), 8)
-	return shaped and sparse.size() == 16 and fold_waveform(PackedFloat32Array(), 4).is_empty() \
-		and fold_waveform(samples, 0).is_empty()
+	# stereo: the channels are folded apart, so a quiet right channel stays quiet rather than
+	# being averaged into the left one. Left rides +/-1, right +/-0.25, interleaved.
+	var pair := PackedFloat32Array()
+	pair.resize(2000)
+	for i in 1000:
+		var v := sin(TAU * float(i) / 100.0)
+		pair[i * 2] = v
+		pair[i * 2 + 1] = v * 0.25
+	var split := fold_waveform(pair, 10, 2)
+	var apart: bool = split.size() == 10 * 4
+	for b in 10:
+		apart = apart and split[b * 4] < -0.9 and split[b * 4 + 1] > 0.9 \
+			and split[b * 4 + 2] > -0.3 and split[b * 4 + 2] < -0.2 \
+			and split[b * 4 + 3] > 0.2 and split[b * 4 + 3] < 0.3
+	return shaped and apart and sparse.size() == 16 \
+		and fold_waveform(PackedFloat32Array(), 4).is_empty() \
+		and fold_waveform(samples, 0).is_empty() and fold_waveform(samples, 4, 0).is_empty()
 
 ## Everything a Video TEST render wrote. Run when the toggle goes off, and at launch while it is off,
 ## which catches a render that was still finishing when the toggle flipped.
@@ -943,11 +987,15 @@ func metadata(path: String) -> Dictionary:
 ## keys for everything else are dictionary reads, which is what lets TRACKS sort by ARTIST,
 ## ALBUM and KEY the moment the library appears.
 const INDEX_PATH := "user://library_index.dat"
-## 2 added the id map. A version-1 file is still read: it simply carries no ids, and every
-## track in it is assigned one on the next scan. Refusing it would throw away a whole
-## library's cached durations, tags and keys to gain nothing.
-const INDEX_VERSION := 2
-const INDEX_VERSIONS_READ := [1, 2]
+## 2 added the id map; 3 is the same file with FINGERPRINT ids in it. An older file is still read
+## for its durations, tags and keys -- refusing it would throw a whole library's probing away to
+## gain nothing -- but its ids are dropped on the way in, because a name-and-size id is not a
+## fingerprint and nothing downstream could tell them apart. The next scan mints the new ones and
+## LibraryModel.migrate_ids moves the cues, labels and playlists over to them.
+const INDEX_VERSION := 3
+const INDEX_VERSIONS_READ := [1, 2, 3]
+## The oldest version whose ids mean what they say.
+const INDEX_IDS_FROM := 3
 
 var probes := 0      # ffprobe runs this session, under _meta_lock; test_library_index.gd reads it
 var _stamps := {}    # path -> [mtime, size] for each _meta entry probed or validated this session
@@ -990,7 +1038,7 @@ func load_index(path := INDEX_PATH) -> int:
 	if not (blob is Dictionary and blob.get("version") in INDEX_VERSIONS_READ and blob.get("entries") is Dictionary):
 		return 0
 	track_ids.clear()
-	var ids: Variant = blob.get("ids")
+	var ids: Variant = blob.get("ids") if int(blob.get("version", 0)) >= INDEX_IDS_FROM else null
 	if ids is Dictionary:
 		for p in ids:
 			if p is String and ids[p] is String:

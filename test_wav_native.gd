@@ -18,6 +18,8 @@ extends SceneTree
 ##      rate / depth and channels; the resampler with its exact phase step (passthrough at the mix
 ##      rate); Godot's cubic for a stream Godot decodes; a render named as a render; and the master
 ##      line's LISTENING MODE and TPDF dither for every recording format
+##   8. the scrub bar's overview is built in stereo and folded per channel, the raw PCM it came
+##      from is deleted, and the folded result is what gets cached and re-read
 ## Files live in user://wav_test; the rev_ renders this test made are removed.
 ##   godot --headless --path . --script res://test_wav_native.gd
 
@@ -228,6 +230,38 @@ func _initialize() -> void:
 		autopsy = autopsy and good
 		print("7. %s: %s%s" % [pair[0], good, "" if good else "  (want %s)" % pair[1]])
 	ok = ok and autopsy
+
+	# 8. the scrub bar's overview: stereo, folded per channel, with the raw PCM cleaned up and the
+	# 32 KB result cached. The 16-bit case carries 441 Hz at 0.5 on the left and 660 Hz at 0.3 on
+	# the right, so a fold that averaged the channels -- or downmixed to mono, as this used to --
+	# could not report two different peaks.
+	var wav48 := base.path_join("tone_pcm_s16le_48000.wav")
+	var wave := AudioEngine.read_waveform(wav48, DIR)
+	var shaped: bool = wave.size() == AudioEngine.WAVE_BUCKETS * AudioEngine.WAVE_STRIDE
+	var peaks := [1.0, -1.0, 1.0, -1.0]   # left min, left max, right min, right max
+	if shaped:
+		for b in AudioEngine.WAVE_BUCKETS:
+			var at := b * AudioEngine.WAVE_STRIDE
+			peaks[0] = minf(peaks[0], wave[at])
+			peaks[1] = maxf(peaks[1], wave[at + 1])
+			peaks[2] = minf(peaks[2], wave[at + 2])
+			peaks[3] = maxf(peaks[3], wave[at + 3])
+	var split: bool = shaped and absf(float(peaks[0]) + 0.5) < 0.02 and absf(float(peaks[1]) - 0.5) < 0.02 \
+		and absf(float(peaks[2]) + 0.3) < 0.02 and absf(float(peaks[3]) - 0.3) < 0.02
+	var cached := ""
+	var raw_left := false
+	for f in DirAccess.get_files_at(DIR):
+		if f.begins_with("wave%d_" % AudioEngine.WAVE_BUCKETS):
+			cached = f
+		raw_left = raw_left or f.begins_with("rawwave_")
+	var kept: bool = not cached.is_empty() and not raw_left \
+		and FileAccess.get_file_as_bytes(base.path_join(cached)).size() == wave.size() * 4
+	var again := AudioEngine.read_waveform(wav48, DIR)   # served from that file, not rebuilt
+	var cache_hit: bool = again == wave
+	ok = ok and split and kept and cache_hit
+	print("8. overview %d buckets x %d: left %.2f..%.2f, right %.2f..%.2f (want +/-0.50 and +/-0.30) %s; cached as %s with no raw PCM left %s; second read is a cache hit %s" % [
+		wave.size() / AudioEngine.WAVE_STRIDE, AudioEngine.WAVE_STRIDE, peaks[0], peaks[1], peaks[2], peaks[3],
+		split, cached, kept, cache_hit])
 
 	engine.shutdown()
 	engine.free()

@@ -357,6 +357,9 @@ func _ready() -> void:
 		_total_secs = _cfg_num(cfg, "stats", "total_seconds", 0.0)
 		_user_name = _cfg_str(cfg, "stats", "user_name")
 		_tbs.assign(_cfg_arr(cfg, "library", "tbs"))
+		# Which id scheme the stores below are keyed by. Absent means 1, the name-and-size id:
+		# the first scan on this build re-keys them to fingerprints and writes 2 back.
+		_id_scheme = int(_cfg_num(cfg, "library", "id_scheme", 1.0))
 		# All four are keyed by TRACK ID. A config written before ids existed keyed them by
 		# absolute path, so it is converted on the way in -- once, here -- and saved back in
 		# the new shape. A path that is no longer in the library keeps its own key rather
@@ -668,6 +671,10 @@ func _ready() -> void:
 	_engine.load_index()   # before the first scan: known tracks cost a stat, not an ffprobe
 	var reclaimed := AudioEngine.purge_cache("pcm_")
 	AudioEngine.purge_cache("rev_")   # reverse renders last one session: REV re-renders on demand
+	# the raw PCM the old overview builder kept, ~9.6 MB a track. Nothing reads it now: what is
+	# cached is the folded overview itself, and the decode it comes from cleans up after itself.
+	reclaimed += AudioEngine.purge_cache("wave_", AudioEngine.WAVE_DIR)
+	reclaimed += AudioEngine.purge_cache("rawwave_", AudioEngine.WAVE_DIR)   # a killed render's leftovers
 	if not _video_test:
 		AudioEngine.purge_video_cache()
 	_rescan()
@@ -725,13 +732,24 @@ func _on_scan_finished(_found: int, cancelled: bool) -> void:
 	_refresh_scan_btn()
 	if cancelled:
 		return
+	# Once per library: the cues, labels and playlists of a library keyed by the old name-and-size
+	# ids move to the fingerprints this scan just read. Before the reindex, because the row a
+	# track shows is its label, which has just changed key.
+	var moved := 0
+	if _id_scheme < LibraryModel.ID_SCHEME:
+		moved = _library.migrate_ids(_library.scan_ids)
+		_id_scheme = LibraryModel.ID_SCHEME
 	# LibraryModel already filtered with the enabled set it had; only a tree that switched new
 	# folders on needs a second pass (3 s of reindex at 20k tracks, for nothing, on every boot)
 	var was := _library.enabled_folders.duplicate()
 	_build_folder_tree()
 	if _library.enabled_folders != was:
 		_library.apply_folder_filter()
+	elif moved > 0:
+		_library.reindex()   # the labels are under different keys now
 	_after_reindex()
+	if moved > 0:
+		_save()   # the re-keyed stores and the scheme they are now in, together
 	# the list is up; the index's durations, tags and keys are confirmed off this thread, then
 	# the readout (or a metadata sort) catches up in one repaint
 	var paths := _library.all_paths.duplicate()
@@ -766,10 +784,14 @@ func _on_scan_finished(_found: int, cancelled: bool) -> void:
 			if path.begins_with(_scan_watch):
 				n += 1
 		_note = "  //  %s: %d TRACKS" % [_scan_watch.get_file().to_upper(), n]
+	if moved > 0:
+		_note += "  //  %d CUES AND LABELS RE-KEYED" % moved
 	_clear_note_later()
 
 var _scan_watch := ""
 var _scan_btn: Button
+## Which id scheme the saved cues, labels and playlists are keyed by; see LibraryModel.ID_SCHEME.
+var _id_scheme := LibraryModel.ID_SCHEME   # a library with no config at all starts current
 
 func _refresh_scan_btn() -> void:
 	if is_instance_valid(_scan_btn):
@@ -1270,6 +1292,7 @@ func _save() -> void:
 	cfg.set_value("library", "sort_b", _library.sorts[1])
 	cfg.set_value("library", "tbs", _tbs)
 	cfg.set_value("library", "track_labels", _library.labels)
+	cfg.set_value("library", "id_scheme", _id_scheme)
 	cfg.set_value("library", "playlist", _library.crate_pl[0])
 	cfg.set_value("library", "playlist_b", _library.crate_pl[1])
 	cfg.set_value("playlists", "list", _library.playlists)
@@ -6345,7 +6368,7 @@ func _draw_waveform(w: float, top: float) -> void:
 	var wave := _engine.waveform_for(_bar_path())
 	if wave.is_empty() or w <= 0.0:
 		return
-	var buckets := wave.size() / 2
+	var buckets := wave.size() / AudioEngine.WAVE_STRIDE
 	var h := _cue_overlay.size.y - top
 	if h <= 0.0:
 		return
@@ -6353,10 +6376,14 @@ func _draw_waveform(w: float, top: float) -> void:
 	var col := Color(theme.get_color("font_color", "Green"), WAVE_ALPHA)
 	var step := w / float(buckets)
 	for b in buckets:
-		var lo: float = wave[b * 2]
-		var hi: float = wave[b * 2 + 1]
-		var y0 := mid - hi * h * 0.5
-		var y1 := mid - lo * h * 0.5
+		# LEFT above the centre line, RIGHT below it, each drawn from its own peak -- the two
+		# channels rather than their average, which is what a stereo overview is for. A mono
+		# track has the same peaks on both sides and draws exactly as it did when this folded
+		# one channel and mirrored it.
+		var left: float = maxf(absf(wave[b * AudioEngine.WAVE_STRIDE]), wave[b * AudioEngine.WAVE_STRIDE + 1])
+		var right: float = maxf(absf(wave[b * AudioEngine.WAVE_STRIDE + 2]), wave[b * AudioEngine.WAVE_STRIDE + 3])
+		var y0 := mid - left * h * 0.5
+		var y1 := mid + right * h * 0.5
 		# at least a pixel, so silence is a centre line rather than a gap in the drawing
 		_cue_overlay.draw_rect(Rect2(float(b) * step, y0, maxf(step, 1.0), maxf(y1 - y0, 1.0)), col)
 

@@ -8,6 +8,8 @@ extends SceneTree
 ##   5. .ape and .tak index like any other track and decode to a playable stream through the
 ##      ffmpeg render, with a length the cached metadata agrees with
 ##   6. sorting by BPM orders on the tag, with untagged tracks last
+##   7. the fingerprint id: content, not name and size, and the one-time migration that moves a
+##      library's cues, labels and playlist places onto it
 ## Touches only a scratch directory it makes and removes. No audio device, no user://.
 ##   godot --headless --path . --script res://test_library_model.gd
 
@@ -46,6 +48,11 @@ func _wav(path: String, secs: float) -> void:
 	f.store_string("data")
 	f.store_32(data.size())
 	f.store_buffer(data)
+	f.close()
+
+func _bytes(path: String, body: String) -> void:
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(body)
 	f.close()
 
 func _rm(dir: String) -> void:
@@ -97,10 +104,10 @@ func _initialize() -> void:
 	var was_cancelled: bool = seen["cancelled"]
 	var scanned: bool = started and not double_start and found == 11 and not was_cancelled \
 		and model.paths.size() == 11 and model.index.size() == 11
-	# the ids the WORKER sized are the ones id_for would have stat'ed its way to on this thread
+	# the ids the WORKER read are the fingerprints id_for would have opened each file for
 	var sized := model.engine.track_ids.size() == 11
 	for p: String in model.all_paths:
-		sized = sized and model.engine.track_ids.get(p) == LibraryModel.track_id(p, FileAccess.get_file_as_bytes(p).size())
+		sized = sized and model.engine.track_ids.get(p) == LibraryModel.fingerprint(p)
 	ok = ok and scanned and sized
 	print("2. worker scan found %d tracks (want 11: 9 mp3 plus an .ape and a .tak, cover.jpg ignored), %d progress ticks, refused a second start: %s; ids sized on the worker: %s" % [
 		found, ticks, scanned, sized])
@@ -192,6 +199,36 @@ func _initialize() -> void:
 	var bpm_sorted: bool = order == ["slow", "mid", "fast", "untagged"]
 	ok = ok and bpm_sorted
 	print("7. sorted by BPM (90, 128, 129, untagged last): %s: %s" % [order, bpm_sorted])
+
+	# 8. the fingerprint is the CONTENT, and the migration carries a library's cues onto it. The
+	# collision this replaces: two different tracks that happen to share a name and a byte count.
+	var twin_a := moved_base.path_join("jazz").path_join("twin.mp3")
+	var twin_b := moved_base.path_join("rock").path_join("twin.mp3")
+	_bytes(twin_a, "aaaabbbbcccc")
+	_bytes(twin_b, "ddddeeeeffff")   # same name, same size, different music
+	var renamed := moved_base.path_join("rock").path_join("renamed_copy.mp3")
+	_bytes(renamed, "aaaabbbbcccc")  # twin_a's content under another name
+	var old_id := LibraryModel.track_id(twin_a, 12)
+	var content: bool = LibraryModel.fingerprint(twin_a) != LibraryModel.fingerprint(twin_b) \
+		and LibraryModel.fingerprint(twin_a) == LibraryModel.fingerprint(renamed) \
+		and LibraryModel.track_id(twin_a, 12) == LibraryModel.track_id(twin_b, 12) \
+		and LibraryModel.fingerprint(moved_base.path_join("nothing_here.mp3")).is_empty()
+	# a library keyed the old way: its cue, its label and its playlist place all move
+	model.cues[old_id] = [{"time": 1.0}]
+	model.labels[old_id] = "OLD KEY"
+	model.playlists["SET"] = [old_id, "an id no track claims"]
+	model.pl_cues["SET"] = {old_id: [{"time": 2.0}]}
+	var scanned_ids := {twin_a: [LibraryModel.fingerprint(twin_a), 12]}
+	var moved := model.migrate_ids(scanned_ids)
+	var new_id := LibraryModel.fingerprint(twin_a)
+	var carried: bool = moved == 3 and model.cues.has(new_id) and not model.cues.has(old_id) \
+		and model.labels.get(new_id) == "OLD KEY" and model.playlists["SET"][0] == new_id \
+		and model.playlists["SET"][1] == "an id no track claims" \
+		and (model.pl_cues["SET"] as Dictionary).has(new_id) \
+		and model.migrate_ids(scanned_ids) == 0   # running it twice moves nothing
+	ok = ok and content and carried
+	print("8. fingerprint tells same-name-same-size tracks apart and follows a rename: %s; the old ids' cues, labels and playlist places carried over (%d moved, re-run 0): %s" % [
+		content, moved, carried])
 
 	model.engine.free()
 	model.free()
