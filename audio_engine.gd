@@ -817,18 +817,31 @@ func needs_bpm(path: String) -> bool:
 	_meta_lock.unlock()
 	return yes
 
-## One re-probe per track indexed before BPM was read, so a library tagged in Picard or Mp3tag
-## fills its tempos in without the user asking. A worker only: this is an ffprobe per track, and
-## the entries stay readable throughout, so nothing on screen waits for it. Returns how many were
-## refreshed; the caller saves the index once at the end rather than per track.
-func backfill_bpm(paths: Array[String]) -> int:
+## Everything the index is still missing, filled in on a worker: tracks nothing has ever probed,
+## and tracks indexed before BPM was read. One ffprobe each, behind the scan, once per library --
+## whatever is already cached stays readable throughout, so nothing on screen waits for this.
+##
+## Both cases used to go unanswered for a big library. player.gd's own sweep gives up past
+## SWEEP_MAX unprobed tracks, so past that the TOTAL TIME readout kept its "+" for good; and a
+## pre-BPM entry is valid in every other respect, so nothing would have gone back to the file for
+## its tempo. Returns how many were probed; the caller saves the index once at the end rather
+## than per track.
+##
+## `on_progress` is called (deferred, so it lands on the main thread) every PROGRESS_EVERY
+## tracks, which is what makes a long fill read as the total climbing rather than one late jump.
+const PROGRESS_EVERY := 250
+
+func refresh_meta(paths: Array[String], on_progress := Callable()) -> int:
 	var done := 0
 	for p in paths:
 		if _shutdown:
 			break
-		if needs_bpm(p):
-			metadata(p)
-			done += 1
+		if not (peek_meta(p).is_empty() or needs_bpm(p)):
+			continue   # cached and complete
+		metadata(p)
+		done += 1
+		if on_progress.is_valid() and done % PROGRESS_EVERY == 0:
+			on_progress.call_deferred()
 	return done
 
 func metadata(path: String) -> Dictionary:

@@ -24,9 +24,10 @@ extends Node
 ## APE and TAK are lossless formats nothing here decodes natively; AudioEngine renders them once
 ## through ffmpeg and plays the render, so they are ordinary library tracks from here on.
 const EXTS := ["mp3", "wav", "ogg", "flac", "dsf", "dff", "ape", "tak"]
-const SORTS := ["PATH", "NAME", "TYPE", "DATE", "FOLDER", "ARTIST", "ALBUM", "KEY"]
+## Appended, never inserted: the sort is persisted as an index into this list.
+const SORTS := ["PATH", "NAME", "TYPE", "DATE", "FOLDER", "ARTIST", "ALBUM", "KEY", "BPM"]
 ## The sorts that need metadata, and so need a key gathered per track before the sort runs.
-const META_SORTS := ["ARTIST", "ALBUM", "KEY"]
+const META_SORTS := ["ARTIST", "ALBUM", "KEY", "BPM"]
 
 ## done/total tracks, and the directory being walked. Emitted from the main thread.
 signal scan_progress(done: int, total: int, where: String)
@@ -388,10 +389,12 @@ func sorted(mode: String) -> Array[String]:
 ## The comparator for `mode`, picked once per sort: matching the mode inside every comparison
 ## made a 20k-track PATH sort 4x slower (301 ms against 70 ms).
 func _cmp(mode: String) -> Callable:
+	# every metadata sort compares the keys gathered above, by membership rather than by a second
+	# list of names: BPM was added to META_SORTS and not here, and silently sorted by path
+	if mode in META_SORTS:
+		return func(a: String, b: String) -> bool:
+			return str(_sortkey.get(a, a)).naturalnocasecmp_to(str(_sortkey.get(b, b))) < 0
 	match mode:
-		"ARTIST", "ALBUM", "KEY":
-			return func(a: String, b: String) -> bool:
-				return str(_sortkey.get(a, a)).naturalnocasecmp_to(str(_sortkey.get(b, b))) < 0
 		"NAME":
 			return func(a: String, b: String) -> bool: return a.get_file().naturalcasecmp_to(b.get_file()) < 0
 		"TYPE":
@@ -423,6 +426,11 @@ static func meta_sort_key(mode: String, meta: Dictionary, path: String) -> Strin
 			if pc < 0:
 				return "~\t" + path
 			return "%s\t%s" % [AudioEngine.camelot(pc, bool(k.get("minor", false))).lpad(3, "0"), path]
+		"BPM":
+			# zero-padded so it sorts as a number in a string compare: 090.00 before 128.00. An
+			# untagged track has no tempo to place, and sorts last like an untagged key.
+			var beats := float(meta.get("bpm", 0.0))
+			return "%06.2f\t%s" % [beats, path] if beats > 0.0 else "~\t" + path
 	return path
 
 static func sort_key_test() -> bool:
@@ -431,6 +439,9 @@ static func sort_key_test() -> bool:
 	return before.call(k.call("KEY", {"key": {"pc": 2, "minor": true}}), k.call("KEY", {"key": {"pc": 9, "minor": true}})) \
 		and before.call(k.call("KEY", {"key": {"pc": 9, "minor": true}}), k.call("KEY", {"key": {"pc": 0, "minor": false}})) \
 		and before.call(k.call("KEY", {"key": {"pc": 0, "minor": false}}), k.call("KEY", {})) \
+		and before.call(k.call("BPM", {"bpm": 90.0}), k.call("BPM", {"bpm": 128.0})) \
+		and before.call(k.call("BPM", {"bpm": 128.0}), k.call("BPM", {"bpm": 128.5})) \
+		and before.call(k.call("BPM", {"bpm": 128.5}), k.call("BPM", {})) \
 		and before.call(k.call("ARTIST", {"artist": "abba"}), k.call("ARTIST", {"artist": "Zed"})) \
 		and before.call(k.call("ARTIST", {"artist": "Zed"}), k.call("ARTIST", {})) \
 		and before.call(k.call("ALBUM", {"album": "A"}), k.call("ALBUM", {}))

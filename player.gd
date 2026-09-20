@@ -55,9 +55,10 @@ const FADE_ON_DEFAULT := true
 const FADE_MS_DEFAULT := 1000
 const DELAY_MS_DEFAULT := 250
 const SPLIT_FRAC_DEFAULT := 0.5
-## Appended, never inserted: the sort is persisted as an index into this list.
-const SORTS := ["PATH", "NAME", "TYPE", "DATE", "FOLDER", "ARTIST", "ALBUM", "KEY"]
-const META_SORTS := ["ARTIST", "ALBUM", "KEY"]
+## The library's own lists, named here because this file reads them constantly. Appended to,
+## never inserted into: the sort is persisted as an index into SORTS.
+const SORTS := LibraryModel.SORTS
+const META_SORTS := LibraryModel.META_SORTS
 
 @export_file("*.ogv") var video_path := ""
 
@@ -734,15 +735,19 @@ func _on_scan_finished(_found: int, cancelled: bool) -> void:
 	# the list is up; the index's durations, tags and keys are confirmed off this thread, then
 	# the readout (or a metadata sort) catches up in one repaint
 	var paths := _library.all_paths.duplicate()
+	# the count line, cheap enough to run every few hundred tracks while the fill below works
+	var climbing := func() -> void:
+		if not _engine.is_shut_down():
+			_recount()
 	_engine.run_task(func() -> void:
 		if _engine.validate_index(paths) > 0:   # a fresh import has no index: nothing to repaint
 			(func() -> void:
 				if not _engine.is_shut_down():
 					_meta_arrived()).call_deferred()
-		# ...then the tempos. Entries written before BPM was read cost one ffprobe each to fill
-		# in, so a library tagged in Picard or Mp3tag before this build shows its BPMs without
-		# anyone asking -- on this worker, behind everything above, and once per library.
-		if _engine.backfill_bpm(paths) > 0:
+		# ...then whatever the index is still missing: durations for tracks nothing has probed
+		# (which is what leaves TOTAL TIME reading "+"), and tempos for anything indexed before
+		# BPM was read. One ffprobe each, on this worker, behind everything above.
+		if _engine.refresh_meta(paths, climbing) > 0:
 			(func() -> void:
 				if not _engine.is_shut_down():
 					_engine.save_index(_library.all_paths)   # so the next launch re-probes nothing

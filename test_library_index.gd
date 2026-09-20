@@ -99,9 +99,10 @@ func _initialize() -> void:
 	print("3. saved with one track left in the library: %d entry reloaded: %s" % [kept, pruned])
 	d.free()
 
-	# 5. BPM: the tag parser, a tagged file read on its first probe, and the upgrade path -- an
-	# entry written before BPM existed keeps serving its duration and tags, and one re-probe
-	# (backfill_bpm, a worker in the app) fills the tempo in without the user asking.
+	# 5. BPM: the tag parser, a tagged file read on its first probe, and what refresh_meta (a
+	# worker in the app) finishes off -- an entry written before BPM existed keeps serving its
+	# duration and tags while one re-probe fills the tempo in, and a track nothing has ever
+	# probed gets its duration, which is what clears the TOTAL TIME "+" on a big library.
 	var parsers: bool = AudioEngine.bpm_tag_test() and AudioEngine.key_tag_test()
 	var tagged := base.path_join("tagged.flac")
 	OS.execute("ffmpeg", ["-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.5",
@@ -118,18 +119,23 @@ func _initialize() -> void:
 	var w := FileAccess.open(idx2, FileAccess.WRITE)
 	w.store_var(blob)
 	w.close()
+	# never probed, never indexed: the case player.gd's own sweep abandons past SWEEP_MAX
+	var unprobed := base.path_join("unprobed.wav")
+	_wav(unprobed, 0.7)
 	var h := AudioEngine.new()
 	h.load_index(idx2)
 	var flagged := h.needs_bpm(tagged)
 	var still_readable: bool = str(h.cached_meta(tagged).get("artist", "")) == "Picard" and h.probes == 0
-	var filled := h.backfill_bpm([tagged])
+	var filled := h.refresh_meta([tagged, unprobed])
 	var after := float(h.metadata(tagged).get("bpm", 0.0))
+	var swept := float(h.peek_meta(unprobed).get("duration", 0.0))
 	var backfilled: bool = parsers and absf(fresh_bpm - 128.0) < 0.01 and flagged and still_readable \
-		and filled == 1 and absf(after - 128.0) < 0.01 and not h.needs_bpm(tagged) and h.probes == 1
+		and filled == 2 and absf(after - 128.0) < 0.01 and not h.needs_bpm(tagged) \
+		and absf(swept - 0.7) < 0.02 and h.probes == 2
 	h.free()
 	ok = ok and backfilled
-	print("5. BPM parsed %s on the first probe; a pre-BPM entry still read its tags (%s) and one re-probe filled %s: %s" % [
-		fresh_bpm, still_readable, after, backfilled])
+	print("5. BPM parsed %s on the first probe; a pre-BPM entry still read its tags (%s), one re-probe filled %s, and an unprobed track got its %.3f s duration: %s" % [
+		fresh_bpm, still_readable, after, swept, backfilled])
 
 	# 4. garbage
 	var g := FileAccess.open(idx, FileAccess.WRITE)

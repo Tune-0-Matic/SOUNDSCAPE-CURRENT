@@ -7,6 +7,7 @@ extends SceneTree
 ##   4. cues and labels survive the library MOVING, which is the whole point of keying by id
 ##   5. .ape and .tak index like any other track and decode to a playable stream through the
 ##      ffmpeg render, with a length the cached metadata agrees with
+##   6. sorting by BPM orders on the tag, with untagged tracks last
 ## Touches only a scratch directory it makes and removes. No audio device, no user://.
 ##   godot --headless --path . --script res://test_library_model.gd
 
@@ -169,6 +170,28 @@ func _initialize() -> void:
 		print("   (libsoundscape_dsp absent: the render still runs, but nothing can play a FLAC)")
 	print("6. .ape and .tak decode through an ffmpeg render [ext, stream, length, meta duration]: %s, %d renders cached: %s" % [
 		decoded, renders, plays])
+
+	# 7. sorting BY BPM orders on the tag, not on the filename. The keys being right is not
+	# enough: the comparator has to reach for them, and BPM once sat in META_SORTS while the
+	# comparator listed the metadata sorts by name, so it sorted by path and looked plausible.
+	var tempos: Array[String] = []
+	for spec in [["slow", "90"], ["mid", "128"], ["fast", "129"], ["untagged", ""]]:
+		var made := moved_base.path_join("%s.flac" % spec[0])
+		var args := ["-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2"]
+		if not str(spec[1]).is_empty():
+			args.append_array(["-metadata", "BPM=%s" % spec[1]])
+		args.append(made)
+		OS.execute("ffmpeg", args, [], true)
+		engine.metadata(made)   # the sort reads what is cached, so probe them first
+		tempos.append(made)
+	model.paths = tempos
+	var by_bpm := model.sorted("BPM")
+	var order: Array[String] = []
+	for path: String in by_bpm:
+		order.append(path.get_file().get_basename())
+	var bpm_sorted: bool = order == ["slow", "mid", "fast", "untagged"]
+	ok = ok and bpm_sorted
+	print("7. sorted by BPM (90, 128, 129, untagged last): %s: %s" % [order, bpm_sorted])
 
 	model.engine.free()
 	model.free()
