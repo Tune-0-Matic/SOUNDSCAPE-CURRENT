@@ -810,15 +810,40 @@ func validate_index(paths: Array[String]) -> int:
 			landed += 1
 	return landed
 
+## True while `path`'s cached entry predates BPM, so its tempo is unknown rather than absent.
+func needs_bpm(path: String) -> bool:
+	_meta_lock.lock()
+	var yes := _needs_bpm.has(path)
+	_meta_lock.unlock()
+	return yes
+
+## One re-probe per track indexed before BPM was read, so a library tagged in Picard or Mp3tag
+## fills its tempos in without the user asking. A worker only: this is an ffprobe per track, and
+## the entries stay readable throughout, so nothing on screen waits for it. Returns how many were
+## refreshed; the caller saves the index once at the end rather than per track.
+func backfill_bpm(paths: Array[String]) -> int:
+	var done := 0
+	for p in paths:
+		if _shutdown:
+			break
+		if needs_bpm(p):
+			metadata(p)
+			done += 1
+	return done
+
 func metadata(path: String) -> Dictionary:
 	_meta_lock.lock()
 	var cached: Variant = _meta.get(path)
+	# a pre-BPM entry is the one case where a cache hit is not the answer: it is missing a field
+	# that only the file can supply, so this probes THROUGH the cache and replaces it below
+	var stale_bpm: bool = _needs_bpm.has(path)
 	_meta_lock.unlock()
-	if cached != null:
+	if cached != null and not stale_bpm:
 		return cached
-	var indexed: Variant = _from_disk(path)
-	if indexed != null:
-		return indexed   # probed in an earlier session and unchanged since: no ffprobe
+	if not stale_bpm:
+		var indexed: Variant = _from_disk(path)
+		if indexed != null:
+			return indexed   # probed in an earlier session and unchanged since: no ffprobe
 	var stamp := file_stamp(path)
 	var d := default_meta(path)
 	# ffprobe emits UTF-8, but OS.execute decodes its output with the system ANSI codepage,
@@ -867,6 +892,14 @@ func metadata(path: String) -> Dictionary:
 					if not str(parsed["text"]).is_empty():
 						d["key"] = parsed
 						break
+			# Whatever the tagger called it: Vorbis comments and APEv2 write BPM, ID3 writes TBPM
+			# (which is what Picard and Mp3tag put in an MP3), MP4 writes tmpo.
+			for k in tags:
+				if str(k).to_lower() in ["bpm", "tbpm", "tmpo"]:
+					var beats := format_bpm_tag(str(tags[k]))
+					if beats > 0.0:
+						d["bpm"] = beats
+						break
 			for k in ["title", "artist", "album"]:
 				for variant in [k, k.capitalize(), k.to_upper()]:
 					if tags.has(variant) and str(tags[variant]) != "":
@@ -880,9 +913,11 @@ func metadata(path: String) -> Dictionary:
 	_meta_lock.lock()
 	probes += 1
 	var winner: Variant = _meta.get(path)
-	if winner == null:
+	# a BPM backfill REPLACES what is cached -- that entry is the stale one it went to the file for
+	if winner == null or _needs_bpm.has(path):
 		_meta[path] = d
 		_stamps[path] = stamp
+		_needs_bpm.erase(path)
 		winner = d
 	_meta_lock.unlock()
 	return winner
@@ -904,6 +939,9 @@ const INDEX_VERSIONS_READ := [1, 2]
 var probes := 0      # ffprobe runs this session, under _meta_lock; test_library_index.gd reads it
 var _stamps := {}    # path -> [mtime, size] for each _meta entry probed or validated this session
 var _disk := {}      # path -> [mtime, size, meta] loaded from the index, not yet re-validated
+## Paths whose index entry predates BPM. They keep serving their cached duration and tags; one
+## re-probe each fills the tempo in, and backfill_bpm() does that on a worker.
+var _needs_bpm := {}
 ## path -> track id (LibraryModel.track_id). Lives here because it is saved with the index and
 ## for the same reason: it is derived from the file, and re-deriving it costs a stat per track.
 var track_ids := {}
@@ -912,7 +950,7 @@ static func default_meta(path: String) -> Dictionary:
 	return {
 		"title": path.get_file().get_basename(), "artist": "", "album": "",
 		"sample_rate": 44100, "channels": 2, "bits": 16, "codec": path.get_extension().to_upper(),
-		"key": {"text": "", "pc": -1, "minor": false}, "duration": 0.0,
+		"key": {"text": "", "pc": -1, "minor": false}, "duration": 0.0, "bpm": 0.0,
 	}
 
 ## [mtime, size], or [] when the file cannot be opened. Opening a handle reads no audio, so
@@ -957,6 +995,11 @@ func load_index(path := INDEX_PATH) -> int:
 		var key: Dictionary = clean["key"]
 		if not (key.get("pc") is int and key.get("minor") is bool and key.get("text") is String):
 			clean["key"] = default_meta(p)["key"]
+		# An entry written before BPM was read carries no bpm key at all -- which is not the same
+		# as a track with no BPM tag, and the difference is why it is recorded rather than left to
+		# read as 0. Everything else in the entry stays usable while backfill_bpm() re-probes it.
+		if not got.has("bpm"):
+			_needs_bpm[p] = true
 		_disk[p] = [e[0], e[1], clean]
 	return _disk.size()
 
@@ -1025,6 +1068,28 @@ func save_index(keep: Array[String], path := INDEX_PATH) -> Error:
 ##
 ## Returns {"text": String, "pc": int, "minor": bool}. pc is -1 when the tag did not
 ## parse, which is the flag the UI reads to mean "show it, but do not transpose it".
+## A BPM tag as a number, or 0.0 for "not tagged". Taggers write "128", "128.5", "128,5" (a
+## comma decimal in some locales) and "128 BPM"; String.to_float reads the leading number out of
+## all four and answers 0.0 for anything else, so the only judgement left is the range. Outside
+## it the tag is not a tempo -- 0 means unset, and a "1998" that was really a year would otherwise
+## show up as a BPM.
+const BPM_MIN := 20.0
+const BPM_MAX := 300.0
+
+static func format_bpm_tag(raw: String) -> float:
+	var beats := raw.strip_edges().replace(",", ".").to_float()
+	return beats if beats >= BPM_MIN and beats <= BPM_MAX else 0.0
+
+## Self-check for the BPM parser. The rejections are the half worth pinning: a year, a bar count
+## or a word must read as "not tagged" rather than as a tempo nobody can explain later.
+static func bpm_tag_test() -> bool:
+	for probe in [["128", 128.0], [" 128.5 ", 128.5], ["128,5", 128.5], ["128 BPM", 128.0],
+			["90.00", 90.0], ["", 0.0], ["NONE", 0.0], ["0", 0.0], ["1998", 0.0], ["19", 0.0],
+			["301", 0.0], ["20", 20.0], ["300", 300.0]]:
+		if not is_equal_approx(format_bpm_tag(probe[0]), probe[1]):
+			return false
+	return true
+
 static func format_key_tag(raw: String) -> Dictionary:
 	var s := raw.strip_edges()
 	if s.is_empty():
@@ -1330,6 +1395,11 @@ func ticker_line(path: String) -> String:
 	# on the first frame of the track -- there is nothing to wait for and nothing to poll
 	var k: Dictionary = m.get("key", {})
 	var key_txt: String = "" if str(k.get("text", "")).is_empty() else "KEY %s // " % k["text"]
+	# the file's own BPM tag, where it has one. Whole numbers read as whole numbers: "128", not
+	# "128.0", because that is how every tagger writes the common case
+	var beats := float(m.get("bpm", 0.0))
+	if beats > 0.0:
+		key_txt = "BPM %s // %s" % [("%.1f" % beats).trim_suffix(".0"), key_txt]
 	# The tail used to end at "MIX n HZ", which said what rate the mixer runs at but nothing
 	# about what is carrying it or what is in the way. The driver, the listening curve and
 	# whether the native path is even loaded are the three things worth knowing while a track

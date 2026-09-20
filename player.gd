@@ -293,6 +293,7 @@ func _ready() -> void:
 	assert(Visualizer.snake_test())    # snake wall and self-collision rules
 	assert(AudioDirector.tempo_test())  # the sweep, now that it runs on a worker
 	assert(AudioEngine.key_tag_test())  # key tag parsing and the Camelot wheel
+	assert(AudioEngine.bpm_tag_test())  # BPM tag parsing, and what it refuses
 	assert(SpectralKey.spectral_key_test())  # FFT peak, chroma fold, K-S profile match
 	assert(FxRack.rack_test())
 	assert(Recorder.recorder_test())    # the take's option tables match ffmpeg          # rack boots blank, params clamp, MODULATE is exact
@@ -737,6 +738,14 @@ func _on_scan_finished(_found: int, cancelled: bool) -> void:
 		if _engine.validate_index(paths) > 0:   # a fresh import has no index: nothing to repaint
 			(func() -> void:
 				if not _engine.is_shut_down():
+					_meta_arrived()).call_deferred()
+		# ...then the tempos. Entries written before BPM was read cost one ffprobe each to fill
+		# in, so a library tagged in Picard or Mp3tag before this build shows its BPMs without
+		# anyone asking -- on this worker, behind everything above, and once per library.
+		if _engine.backfill_bpm(paths) > 0:
+			(func() -> void:
+				if not _engine.is_shut_down():
+					_engine.save_index(_library.all_paths)   # so the next launch re-probes nothing
 					_meta_arrived()).call_deferred())
 	# Offline spectral key estimation: one background worker task per track, gated
 	# inside queue_spectral_key by the persistent cache AND by whether the file even
