@@ -432,6 +432,10 @@ func _deliver(d: int, token: int, path: String, s: AudioStream, m: Dictionary = 
 				why = "decode failed" if native_flac_available() else "FLAC needs libsoundscape_dsp"
 			"dsf", "dff":
 				why = "decode failed" if ClassDB.class_exists("SsDsdStream") else "DSD needs libsoundscape_dsp"
+			"ape", "tak":
+				# the render plays as FLAC, so it needs the extension as much as a FLAC does
+				why = "decode failed" if native_flac_available() \
+					else "%s needs libsoundscape_dsp" % path.get_extension().to_upper()
 			"mp4":
 				why = "decode failed" if video_test else "Video TEST is off"
 		track_failed.emit(path, why, d)
@@ -478,6 +482,7 @@ func decode(path: String) -> AudioStream:
 		"wav": return native_wav(path)
 		"flac": return native_flac(path)
 		"dsf", "dff": return native_dsd(path)
+		"ape", "tak": return ffmpeg_lossless(path)
 		"mp4": return mp4_sound(path) if video_test else null   # the Video TEST gate, below
 	return null
 
@@ -512,6 +517,30 @@ static func native_wav(path: String) -> AudioStream:
 		return AudioStreamWAV.load_from_file(path)
 	var s: AudioStream = ClassDB.instantiate("SsWavStream")
 	return s if int(s.call("load", path)) == OK else null
+
+## APE (Monkey's Audio) and TAK, rendered once to 24-bit FLAC and played from there.
+##
+## There is no native decoder for either: dr_flac and dr_wav do not read them, and the extension
+## links no libav, so AV_CODEC_ID_APE / AV_CODEC_ID_TAK are not something that can be switched on
+## in C++ here -- adding them would mean linking libavcodec into libsoundscape_dsp, on Windows and
+## through the Linux CI, for two formats. ffmpeg already ships with this program and decodes both,
+## and rendering to FLAC is the same path an MP4's sound already takes.
+##
+## Lossless in, lossless out: both formats are integer PCM, so the render carries the samples
+## exactly (24-bit holds any 8, 16 or 24-bit source) and is NOT dithered -- dithering an integer
+## source changes samples that were already exact. Playback is then SsFlacStream, so seeking is
+## sample-exact and the file decodes block by block inside the mix like any other FLAC.
+##
+## ponytail: the renders are kept, because re-rendering a whole set on every launch is what the
+## cache is avoiding; nothing prunes them. A size cap or an LRU sweep is the upgrade if a big APE
+## library ever fills the disk.
+const LOSSLESS_DIR := "user://lossless"
+var lossless_dir := LOSSLESS_DIR   # tests point this away from a real cache
+
+func ffmpeg_lossless(path: String) -> AudioStream:
+	var flac := ffmpeg_render(path, "flac", ["-map", "0:a:0", "-c:a", "flac",
+		"-sample_fmt", "s32", "-bits_per_raw_sample", "24"], lossless_dir, "", is_shut_down)
+	return native_flac(flac) if not flac.is_empty() else null
 
 ## Deletes every file in `dir` whose name starts with `prefix`; returns the bytes reclaimed.
 ##   "pcm_" -- every build before native FLAC cached an ffmpeg transcode of each FLAC here as

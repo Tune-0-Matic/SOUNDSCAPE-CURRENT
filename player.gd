@@ -45,7 +45,7 @@ static func _cfg_bool(cfg: ConfigFile, sect: String, key: String, fallback: bool
 static func _cfg_vec2(cfg: ConfigFile, sect: String, key: String, fallback: Vector2) -> Vector2:
 	var v: Variant = cfg.get_value(sect, key, fallback)
 	return v if v is Vector2 else fallback
-const EXTS := ["mp3", "wav", "ogg", "flac", "dsf", "dff"]
+
 ## Shipped defaults, named rather than spelled out at each use. Every one of these was
 ## previously written twice -- once as a config fallback, once (or not at all) in the
 ## factory reset -- and "or not at all" is exactly how REBOOT came to leave six settings

@@ -21,7 +21,9 @@ extends Node
 ##     by the name you gave it.
 
 ## What the library takes. An .mp4 joins only while Video TEST is on -- see `video_test`.
-const EXTS := ["mp3", "wav", "ogg", "flac", "dsf", "dff"]
+## APE and TAK are lossless formats nothing here decodes natively; AudioEngine renders them once
+## through ffmpeg and plays the render, so they are ordinary library tracks from here on.
+const EXTS := ["mp3", "wav", "ogg", "flac", "dsf", "dff", "ape", "tak"]
 const SORTS := ["PATH", "NAME", "TYPE", "DATE", "FOLDER", "ARTIST", "ALBUM", "KEY"]
 ## The sorts that need metadata, and so need a key gathered per track before the sort runs.
 const META_SORTS := ["ARTIST", "ALBUM", "KEY"]
@@ -463,6 +465,7 @@ static func migrate_test() -> bool:
 static func model_test() -> bool:
 	return roots_test() and sort_key_test() and relocate_test() and migrate_test() \
 		and is_track("A.MP3") and is_track("b.flac") and is_track("c.DSF") and not is_track("cover.jpg") \
+		and is_track("d.ape") and is_track("e.TAK") and not is_track("notes.taken") \
 		and not is_track("clip.MP4") and is_track("clip.MP4", true) and not is_track("clip.mp4.jpg", true) \
 		and track_id("C:/a/Song.MP3", 12) == track_id("D:/b/song.mp3", 12) \
 		and track_id("C:/a/Song.mp3", 12) != track_id("C:/a/Song.mp3", 13)

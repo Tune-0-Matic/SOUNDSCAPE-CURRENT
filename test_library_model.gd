@@ -5,6 +5,8 @@ extends SceneTree
 ##      new track's id is sized on the worker, and the folder filter drops what is switched off
 ##   3. a scan can be cancelled mid-walk and leaves the library it was replacing untouched
 ##   4. cues and labels survive the library MOVING, which is the whole point of keying by id
+##   5. .ape and .tak index like any other track and decode to a playable stream through the
+##      ffmpeg render, with a length the cached metadata agrees with
 ## Touches only a scratch directory it makes and removes. No audio device, no user://.
 ##   godot --headless --path . --script res://test_library_model.gd
 
@@ -19,6 +21,31 @@ func _make_tree(base: String, dirs: Array, per_dir: int) -> void:
 		var cover := FileAccess.open(dir.path_join("cover.jpg"), FileAccess.WRITE)
 		cover.store_8(0)
 		cover.close()
+
+## A real 22.05 kHz mono WAV. Written under an .ape/.tak name in section 6: ffmpeg chooses its
+## demuxer by content, so this exercises the render route without an encoder nothing here has.
+func _wav(path: String, secs: float) -> void:
+	var sr := 22050
+	var n := int(sr * secs)
+	var data := PackedByteArray()
+	data.resize(n * 2)
+	for i in n:
+		data.encode_s16(i * 2, int(sin(TAU * 440.0 * float(i) / sr) * 0.3 * 32767.0))
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string("RIFF")
+	f.store_32(36 + data.size())
+	f.store_string("WAVEfmt ")
+	f.store_32(16)
+	f.store_16(1)
+	f.store_16(1)
+	f.store_32(sr)
+	f.store_32(sr * 2)
+	f.store_16(2)
+	f.store_16(16)
+	f.store_string("data")
+	f.store_32(data.size())
+	f.store_buffer(data)
+	f.close()
 
 func _rm(dir: String) -> void:
 	for f in DirAccess.get_files_at(dir):
@@ -36,6 +63,12 @@ func _initialize() -> void:
 
 	var base := OS.get_temp_dir().path_join("ss_libmodel_%d" % Time.get_ticks_usec())
 	_make_tree(base, ["rock", "rock/live", "jazz"], 3)
+	# lossless formats with no native decoder are ordinary library tracks: the walk takes them by
+	# name, and AudioEngine renders them when one is actually played (section 6)
+	for name in ["extra.ape", "extra.tak"]:
+		var f := FileAccess.open(base.path_join("jazz").path_join(name), FileAccess.WRITE)
+		f.store_buffer(name.to_utf8_buffer())
+		f.close()
 
 	var model := LibraryModel.new()
 	root.add_child(model)
@@ -61,20 +94,20 @@ func _initialize() -> void:
 	var found: int = seen["found"]
 	var ticks: int = seen["ticks"]
 	var was_cancelled: bool = seen["cancelled"]
-	var scanned: bool = started and not double_start and found == 9 and not was_cancelled \
-		and model.paths.size() == 9 and model.index.size() == 9
+	var scanned: bool = started and not double_start and found == 11 and not was_cancelled \
+		and model.paths.size() == 11 and model.index.size() == 11
 	# the ids the WORKER sized are the ones id_for would have stat'ed its way to on this thread
-	var sized := model.engine.track_ids.size() == 9
+	var sized := model.engine.track_ids.size() == 11
 	for p: String in model.all_paths:
 		sized = sized and model.engine.track_ids.get(p) == LibraryModel.track_id(p, FileAccess.get_file_as_bytes(p).size())
 	ok = ok and scanned and sized
-	print("2. worker scan found %d tracks (want 9, cover.jpg ignored), %d progress ticks, refused a second start: %s; ids sized on the worker: %s" % [
+	print("2. worker scan found %d tracks (want 11: 9 mp3 plus an .ape and a .tak, cover.jpg ignored), %d progress ticks, refused a second start: %s; ids sized on the worker: %s" % [
 		found, ticks, scanned, sized])
 
 	# a folder switched off leaves the disk alone and only shortens the visible list
 	model.enabled_folders.erase(base.path_join("jazz"))
 	model.apply_folder_filter()
-	var filtered: bool = model.paths.size() == 6 and model.all_paths.size() == 9
+	var filtered: bool = model.paths.size() == 6 and model.all_paths.size() == 11
 	ok = ok and filtered
 	print("3. unchecking a folder: %d of %d showing: %s" % [model.paths.size(), model.all_paths.size(), filtered])
 
@@ -95,7 +128,7 @@ func _initialize() -> void:
 		guard += 1
 	found = seen["found"]
 	var same_id := model.id_for(some.replace(base, moved_base))
-	var kept: bool = roots_moved == 1 and found == 9 and same_id == id \
+	var kept: bool = roots_moved == 1 and found == 11 and same_id == id \
 		and model.cues_for(some.replace(base, moved_base)).size() == 1 \
 		and model.index[model.path_pos[some.replace(base, moved_base)]]["file"] == "RENAMED"
 	ok = ok and kept
@@ -109,6 +142,33 @@ func _initialize() -> void:
 	var cancel_ok: bool = not model.scanning() and model.all_paths.size() == before
 	ok = ok and cancel_ok
 	print("5. scan cancelled mid-walk, library left at %d tracks: %s" % [model.all_paths.size(), cancel_ok])
+
+	# 6 (listed as 5 above, after the cancellation check). APE and TAK reach a playable stream. Nothing on this machine ENCODES either format (ffmpeg
+	# decodes both but encodes neither, and there is no Monkey's Audio or TAK tool here), so the
+	# fixtures carry real WAV bytes under those names: ffmpeg picks its demuxer by CONTENT, so this
+	# drives the whole route -- decode() routing, the ffmpeg render, the FLAC that comes back, its
+	# length and its cached metadata -- and only ffmpeg's own APE/TAK decoders are left untested.
+	var engine: AudioEngine = model.engine
+	engine.lossless_dir = moved_base.path_join("renders")
+	var decoded := []
+	for ext in ["ape", "tak"]:
+		var src := moved_base.path_join("tone.%s" % ext)
+		_wav(src, 0.5)
+		var stream := engine.decode(src)
+		var meta := engine.metadata(src)
+		decoded.append([ext, stream != null, 0.0 if stream == null else stream.get_length(),
+			float(meta.get("duration", -1.0))])
+	var renders := DirAccess.get_files_at(engine.lossless_dir).size()
+	var plays: bool = AudioEngine.native_flac_available()
+	if plays:
+		for d in decoded:
+			plays = plays and bool(d[1]) and absf(float(d[2]) - 0.5) < 0.02 and absf(float(d[3]) - 0.5) < 0.02
+		plays = plays and renders == 2   # one render per source, cached by path + mtime + size
+		ok = ok and plays
+	else:
+		print("   (libsoundscape_dsp absent: the render still runs, but nothing can play a FLAC)")
+	print("6. .ape and .tak decode through an ffmpeg render [ext, stream, length, meta duration]: %s, %d renders cached: %s" % [
+		decoded, renders, plays])
 
 	model.engine.free()
 	model.free()
