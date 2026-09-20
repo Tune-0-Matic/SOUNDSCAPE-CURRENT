@@ -3,6 +3,7 @@
 /**************************************************************************/
 
 #include "ss_dsd.h"
+#include "file_map.h"
 
 #include <godot_cpp/classes/audio_server.hpp>
 #include <godot_cpp/classes/file_access.hpp>
@@ -171,19 +172,19 @@ Ref<SsDsdStream> SsDsdStream::load_from_file(const String &p_path) {
 }
 
 int SsDsdStream::load(const String &p_path) {
-	_data = FileAccess::get_file_as_bytes(p_path);
-	if (_data.size() < 16) {
-		_data = PackedByteArray();
+	// MAPPED, not read: the bytes arrive as the decoder walks them. See file_map.h.
+	if (!_map.open(p_path) || _map.size() < 16) {
+		_map.close();
 		return ERR_FILE_CANT_OPEN;
 	}
 	int err = ERR_FILE_UNRECOGNIZED;
-	if (id_is(_data.ptr(), "DSD ")) {
+	if (id_is(_map.data(), "DSD ")) {
 		err = _parse_dsf();
-	} else if (id_is(_data.ptr(), "FRM8")) {
+	} else if (id_is(_map.data(), "FRM8")) {
 		err = _parse_dff();
 	}
 	if (err != OK) {
-		_data = PackedByteArray();
+		_map.close();
 		_layout = soundscape::DsdLayout();
 		return err;
 	}
@@ -207,8 +208,8 @@ int bytes_per_out_for(int64_t p_rate) {
 
 int SsDsdStream::_parse_dsf() {
 	// "DSD " chunk, "fmt " chunk, "data" chunk -- all little-endian, 64-bit chunk sizes
-	const uint8_t *p = _data.ptr();
-	const int64_t n = _data.size();
+	const uint8_t *p = _map.data();
+	const int64_t n = _map.size();
 	if (n < 28 || le64(p + 4) < 28 || int64_t(le64(p + 4)) > n) {
 		return ERR_FILE_CORRUPT;
 	}
@@ -271,8 +272,8 @@ int SsDsdStream::_parse_dsf() {
 
 int SsDsdStream::_parse_dff() {
 	// DSDIFF: big-endian IFF with 64-bit sizes, chunks padded to an even length
-	const uint8_t *p = _data.ptr();
-	const int64_t n = _data.size();
+	const uint8_t *p = _map.data();
+	const int64_t n = _map.size();
 	if (n < 16 || !id_is(p + 12, "DSD ")) {
 		return ERR_FILE_UNRECOGNIZED;
 	}
@@ -348,7 +349,7 @@ int SsDsdStream::_parse_dff() {
 
 PackedFloat32Array SsDsdStream::decode_frames(int64_t p_from_frame, int64_t p_frame_count) const {
 	PackedFloat32Array out;
-	if (_data.is_empty() || p_frame_count <= 0) {
+	if (_map.size() <= 0 || p_frame_count <= 0) {
 		return out;
 	}
 	soundscape::DsdDecimator dec;
@@ -421,6 +422,8 @@ void SsDsdStream::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_bits_per_sample"), &SsDsdStream::get_bits_per_sample);
 	ClassDB::bind_method(D_METHOD("get_frame_count"), &SsDsdStream::get_frame_count);
 	ClassDB::bind_method(D_METHOD("get_container"), &SsDsdStream::get_container);
+	ClassDB::bind_method(D_METHOD("is_mapped"), &SsDsdStream::is_mapped);
+	ClassDB::bind_method(D_METHOD("file_size"), &SsDsdStream::file_size);
 	ClassDB::bind_method(D_METHOD("decode_frames", "from_frame", "frame_count"), &SsDsdStream::decode_frames);
 	ClassDB::bind_method(D_METHOD("render", "out_rate", "from_seconds", "frames"), &SsDsdStream::render);
 }

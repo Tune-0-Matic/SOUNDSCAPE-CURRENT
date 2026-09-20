@@ -16,8 +16,14 @@
 // Levels are the bitstream's own: all ones is +1.0, so the SACD 0 dB reference (50 % modulation)
 // plays at -6 dBFS, the way DSD is mastered. No makeup gain: DSD routinely modulates past 50 %.
 //
-// ponytail: the whole file stays in RAM, like SsWavStream -- about 42 MB a minute for stereo
-// DSD64, 85 MB for DSD128. A reader streaming from disk is the upgrade for long DSD128 albums.
+// The file is MAPPED, not read: about 42 MB a minute of stereo DSD64 and 85 MB for DSD128 used to
+// land in a PackedByteArray before the first sample played. Now the decoder indexes the mapping
+// and the pages arrive as it walks them -- see file_map.h, which also carries the fallback for a
+// filesystem that will not map. Nothing about the decode changed, so gapless hand-off and
+// sample-accurate seeking are exactly what they were: the bytes are in the same order at the same
+// offsets, and the only difference is who paged them in.
+//
+// ponytail: SsWavStream still reads whole files, which is the same problem waiting for a big WAV.
 // ponytail: DST-compressed DFF is refused rather than decoded; no free DST decoder is vendored.
 
 #ifndef SOUNDSCAPE_SS_DSD_H
@@ -30,6 +36,7 @@
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/packed_float32_array.hpp>
 
+#include "file_map.h"
 #include "resampler.h"
 
 #include <cstdint>
@@ -80,8 +87,12 @@ class SsDsdStream : public AudioStream {
 public:
 	static Ref<SsDsdStream> load_from_file(const String &p_path);
 
-	/// OK (0), or a Godot Error code as an int. Reads the whole file and parses DSF or DFF.
+	/// OK (0), or a Godot Error code as an int. Maps the file and parses DSF or DFF.
 	int load(const String &p_path);
+	/// Whether the bytes are a mapping rather than the whole-file fallback. For the test that
+	/// pins the RAM this class is not using.
+	bool is_mapped() const { return _map.mapped(); }
+	int64_t file_size() const { return _map.size(); }
 
 	/// The 1-bit rate: 2822400 for DSD64, 5644800 for DSD128.
 	int get_sample_rate() const { return _dsd_rate; }
@@ -112,7 +123,7 @@ private:
 	int _parse_dsf();
 	int _parse_dff();
 
-	PackedByteArray _data;
+	soundscape::FileMap _map;
 	String _path;
 	String _container;
 	int _dsd_rate = 0;

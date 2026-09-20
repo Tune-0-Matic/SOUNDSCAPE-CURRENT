@@ -15,6 +15,8 @@ extends SceneTree
 ##      real AudioStreamPlayer
 ##   6. hostile input: a chunk size of 2^63, a DST-compressed DFF and a non-DSD rate are refused
 ##      with an error, not a hang or a crash
+##   7. a 64 MB file is MAPPED rather than read: loading it barely moves Godot's static memory,
+##      and the frames at the very end of it -- pages nothing has touched -- still decode
 ## Files live in user://dsd_test and are removed.
 ##   godot --headless --path . --script res://test_dsd_native.gd
 
@@ -158,6 +160,33 @@ func _initialize() -> void:
 	ok = ok and refused
 	print("6. a 2^63 chunk size, DST compression and a 2.0 MHz rate are all refused: %s" % refused)
 
+	# 7. a BIG file costs no RAM. 64 MB is a short DSD64 track; a real album side is 170 MB+, and
+	# every byte of it used to land in a PackedByteArray before the first sample played. Mapped,
+	# what the engine allocates is the object -- the pages come and go behind it -- so the static
+	# memory Godot itself is holding barely moves, and the far end of the file still decodes.
+	var big := base.path_join("big.dsf")
+	var per_channel := 32 * 1024 * 1024
+	_write_big_dsf(big, per_channel)
+	var file_bytes := FileAccess.open(big, FileAccess.READ).get_length()
+	var before_mem := OS.get_static_memory_usage()
+	var huge_stream: AudioStream = _load(big)
+	var after_mem := OS.get_static_memory_usage()
+	var grew := after_mem - before_mem
+	# the last block of the file: pages nothing has touched, which is the half a mapping could
+	# get wrong. A DSD byte is 8 bits, so this is the final 512 PCM frames of the stream.
+	var frames_total: int = int(huge_stream.call("get_frame_count")) / 8 if huge_stream else 0
+	var tail: PackedFloat32Array = huge_stream.call("decode_frames", frames_total - 512, 512) if huge_stream else PackedFloat32Array()
+	var tail_live := false
+	for v in tail:
+		tail_live = tail_live or absf(v) > 0.0001
+	var mapped: bool = huge_stream != null and bool(huge_stream.call("is_mapped")) \
+		and int(huge_stream.call("file_size")) == file_bytes
+	var lean: bool = mapped and grew < 8 * 1024 * 1024 and tail.size() == 1024 and tail_live
+	ok = ok and lean
+	print("7. a %.0f MB DSF: mapped %s, static memory +%.2f MB (was the whole file), last 512 frames decode %s: %s" % [
+		file_bytes / 1048576.0, mapped, grew / 1048576.0, tail_live, lean])
+	huge_stream = null
+
 	for f in DirAccess.get_files_at(DIR):
 		DirAccess.remove_absolute(base.path_join(f))
 	DirAccess.remove_absolute(base)
@@ -211,6 +240,35 @@ func _write_dsf(path: String, chans: Array[PackedByteArray], bits: int) -> void:
 	for v in [1, 0, 2, chans.size(), DSD_RATE, 1]:
 		f.append_array(_le32(v))
 	f.append_array(_le64(bits))
+	f.append_array(_le32(BLOCK))
+	f.append_array(_le32(0))
+	f.append_array("data".to_ascii_buffer())
+	f.append_array(_le64(12 + data.size()))
+	f.append_array(data)
+	_save(path, f)
+
+## A BIG DSF, cheaply: one pattern block doubled up to size, wrapped in the same header
+## _write_dsf writes. The bytes are not a modulated tone -- section 7 is about where they live,
+## not what they sound like -- and doubling keeps a 64 MB fixture under a second, where the
+## per-byte interleave loop above would be 64 million GDScript iterations.
+func _write_big_dsf(path: String, per_channel: int, channels := 2) -> void:
+	var data := PackedByteArray()
+	data.resize(BLOCK)
+	for i in BLOCK:
+		data[i] = (i * 37 + 11) & 0xFF   # varied: an all-one-byte file compresses on some filesystems
+	while data.size() < per_channel * channels:
+		data.append_array(data)
+	data.resize(per_channel * channels)
+	var f := PackedByteArray()
+	f.append_array("DSD ".to_ascii_buffer())
+	f.append_array(_le64(28))
+	f.append_array(_le64(28 + 52 + 12 + data.size()))
+	f.append_array(_le64(0))
+	f.append_array("fmt ".to_ascii_buffer())
+	f.append_array(_le64(52))
+	for v in [1, 0, 2, channels, DSD_RATE, 1]:
+		f.append_array(_le32(v))
+	f.append_array(_le64(per_channel * 8))
 	f.append_array(_le32(BLOCK))
 	f.append_array(_le32(0))
 	f.append_array("data".to_ascii_buffer())
