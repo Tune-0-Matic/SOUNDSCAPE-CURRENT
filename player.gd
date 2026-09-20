@@ -3146,6 +3146,8 @@ var _marquee_t := 0.0
 var _marquee_at := -1   # the character index last written, so a frame that moves nothing writes nothing
 ## The row a left-drag started on, for the selection run; -1 when no button is down.
 var _drag_anchor := -1
+## What was selected when the right button went down, before ItemList collapsed it.
+var _rmb_bundle: Array[String] = []
 
 func _marquee_hover(crate: int, row: int) -> void:
 	if crate == _marquee_crate and row == _marquee_row:
@@ -3229,7 +3231,24 @@ static func marquee_test() -> bool:
 ## twenty tracks into the queue should not mean shift-clicking the far end of them.
 func _on_list_pointer(e: InputEvent, crate: int) -> void:
 	var list: ItemList = [_tracks, _tracks_b][crate]
+	# A FOCUSED ItemList eats the arrow keys, and in KEYBOARD NAVIGATION mode the track lists can
+	# hold focus -- so SEEK BACK and SEEK FORWARD (LEFT and RIGHT by default) simply stopped
+	# working while a list was focused. UP and DOWN stay with the list, because walking rows is
+	# what they are for in a one-column list and what kb_nav exists to do; every other key the
+	# transport has a binding for belongs to the transport, focus or no focus.
+	var key := e as InputEventKey
+	if key and key.pressed and not key.is_echo():
+		if key.keycode != KEY_UP and key.keycode != KEY_DOWN and not _action_for_key(key.keycode).is_empty():
+			# the same handler the key would have reached had the list not been focused
+			_unhandled_input(key)
+			list.accept_event()
+		return
 	var click := e as InputEventMouseButton
+	if click and click.pressed and click.button_index == MOUSE_BUTTON_RIGHT:
+		# BEFORE ItemList sees it: this signal runs ahead of the control's own handler, which is
+		# the only moment the multi-selection still exists to be read
+		_rmb_bundle = _selected_paths(crate)
+		return
 	if click and click.button_index == MOUSE_BUTTON_LEFT:
 		# the anchor is where the button went DOWN; ItemList has already selected that row
 		_drag_anchor = list.get_item_at_position(click.position, true) if click.pressed else -1
@@ -6746,11 +6765,33 @@ func _on_item_clicked(row: int, _at: Vector2, button: int, crate: int) -> void:
 	if row < 0 or row >= row_path.size() or row_path[row] < 0:
 		return   # a FOLDER-mode header row is not a track
 	_menu_crate = crate   # REMOVE FROM / MOVE UP act on THIS list's playlist
-	# RMB on a row that is part of the current selection means the whole selection; on any other
-	# row it means that row, which is also what the right-click has just selected
+	# RMB on a row that is part of the selection means the whole selection; on any other row it
+	# means that row alone.
+	#
+	# The bundle comes from the SNAPSHOT _on_list_pointer took on the press, not from the list:
+	# ItemList collapses its selection to the row under the pointer before item_clicked fires, so
+	# reading it here always answered "one track". And the target is built explicitly rather than
+	# with a ternary, because `[path] as Array[String]` is NOT a typed array at runtime -- the
+	# call was failing the argument's type check and the menu never opened at all.
 	var path: String = _library.paths[row_path[row]]
-	var picked := _selected_paths(crate)
-	_popup_track_menu(path, picked if picked.size() > 1 and path in picked else [path] as Array[String])
+	var target: Array[String] = []
+	if _rmb_bundle.size() > 1 and path in _rmb_bundle:
+		target = _rmb_bundle
+		_reselect(crate, target)   # put the highlight back on the rows the menu is about
+	else:
+		target.append(path)
+	_rmb_bundle = []
+	_popup_track_menu(path, target)
+
+## Selects every row holding one of `paths`, for putting a bundle back after ItemList has
+## collapsed it. Rows that are filtered out of this crate's view simply have none.
+func _reselect(crate: int, paths: Array[String]) -> void:
+	var list: ItemList = [_tracks, _tracks_b][crate]
+	var path_row: PackedInt32Array = _path_rows[crate]
+	for path in paths:
+		var i: int = _library.path_pos.get(path, -1)
+		if i >= 0 and i < path_row.size() and path_row[i] >= 0 and path_row[i] < list.item_count:
+			list.select(path_row[i], false)
 
 func _popup_track_menu(path: String, picked: Array[String] = []) -> void:
 	if picked.is_empty():
