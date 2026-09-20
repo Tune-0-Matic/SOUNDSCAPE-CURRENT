@@ -250,9 +250,18 @@ constexpr uint8_t kDsdSilence = 0x69; // four ones, four zeros: a zero-DC byte, 
 In a 1-bit stream, a zero byte is not silence — it is eight consecutive −1 samples, i.e. full-scale
 DC. `0x69` alternates to give zero DC.
 
-**ponytail (known limitations):** the whole DSD file stays in RAM — about 42 MB/minute for stereo
-DSD64, 85 MB for DSD128; a streaming reader is the upgrade for long DSD128 albums. DST-compressed
-DFF is refused rather than decoded, because no free DST decoder is vendored.
+The file is **mapped**, not read (`extension/src/file_map.h`). It used to land in a
+`PackedByteArray` whole — about 42 MB/minute for stereo DSD64, 85 MB for DSD128, so an album side
+was 170 MB+ before the first sample played. Now the pages arrive as the decoder touches them and
+are reclaimable, because nothing writes to them: **measured on a 64 MB DSF, Godot's static memory
+went from +64.0 MB to +0.00 MB.** Nothing about the decode moved, so gapless hand-off and
+sample-accurate seeking are unchanged.
+
+**ponytail (known limitations):** the audio thread can still wait on a cold page — sequential
+readahead is what keeps that off the critical path, and a DSD64 stereo walk is ~706 KB/s (about
+172 pages a second); a feeder thread with a ring buffer is the upgrade if a network share ever
+stutters. `SsWavStream` still reads whole files. DST-compressed DFF is refused rather than
+decoded, because no free DST decoder is vendored.
 
 ### 1.4 The windowed-sinc resampler
 
@@ -1710,13 +1719,14 @@ advances 320 phases per 147 source frames with no drift. A file already at the m
 
 | Area | Limitation | Upgrade path |
 |---|---|---|
-| DSD | Whole file in RAM (~42 MB/min DSD64) | Streaming reader |
+| DSD | Mapped, so the audio thread can wait on a cold page | Feeder thread + ring buffer |
 | DSD | DST-compressed DFF refused | Vendor a DST decoder |
+| WAV | Whole file in RAM, like DSD used to be | Map it the same way |
 | `SsParallel` | No latency compensation for delaying modules | Report module latency to BLEND |
 | `SsParallel` | One shared dry block per pair | Per-channel-pair buffers for surround |
-| Resampler | `pitch_scale` path untested (nothing sets it) | Row interpolation is implemented but unexercised |
-| FIRE | Cellular automaton on CPU | SubViewport with feedback |
-| Track IDs | Same name + same size share cues | Content hash |
+| Resampler | `pitch_scale` still unused by the app | Covered by `test_pitch_scale.gd`: frequency, gaps, clicks, mid-play changes |
+| FIRE | Cellular automaton on CPU, measured 0.335 ms/frame for 2,240 cells | SubViewport with feedback, once the grid is big enough to pay for it |
+| Track IDs | A retag that changes the file's LENGTH changes the id | Hash the decoded audio (a full decode per track) |
 | Waveform | 8 kHz mono; misses inter-sample peaks | Full-rate pass if it ever matters |
 | Linux | Never smoke-tested on real hardware | Run on a Linux box |
 
