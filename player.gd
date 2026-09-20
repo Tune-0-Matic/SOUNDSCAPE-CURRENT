@@ -386,7 +386,10 @@ func _ready() -> void:
 			var pl := _cfg_str(cfg, "library", ["playlist", "playlist_b"][c])
 			_library.crate_pl[c] = pl if _library.playlists.has(pl) else ""
 		# @onready, so _engine is already bound by the time the _ready body runs
+		# the mode if this config has one, else the old bool: shuffle on meant TRUE random
 		_engine.shuffle = _cfg_bool(cfg, "library", "shuffle", false)
+		_engine.shuffle_mode = clampi(int(_cfg_num(cfg, "library", "shuffle_mode",
+			float(_engine.shuffle_mode))), 0, 2) as AudioEngine.Shuffle
 		_engine.repeat = clampi(int(_cfg_num(cfg, "library", "repeat", float(AudioEngine.Repeat.ALL))),
 			0, 2) as AudioEngine.Repeat
 		_volume = clampf(_cfg_num(cfg, "audio", "volume", VOLUME_DEFAULT), 0.0, 100.0)
@@ -613,9 +616,16 @@ func _ready() -> void:
 	%Prev.pressed.connect(_prev)
 	%Next.pressed.connect(_next)
 	%Shuffle.pressed.connect(func() -> void:
-		_engine.shuffle = not _engine.shuffle
+		# OFF -> TRUE -> JAM -> OFF: one button, because it is one decision (how the next
+		# track gets chosen) and the transport has no room for two
+		_engine.shuffle_mode = ((_engine.shuffle_mode + 1) % 3) as AudioEngine.Shuffle
 		_refresh_transport()
 		_save())
+	_hover_note(%Shuffle, func() -> String:
+		return ["SHUFFLE OFF: THE LIST IN ITS OWN ORDER",
+			"TRUE SHUFFLE: RANDOM, NOTHING TWICE UNTIL EVERYTHING HAS PLAYED",
+			"JAM SHUFFLE: RANDOM, WEIGHTED TOWARD TRACKS THAT MIX WITH THIS ONE (KEY AND BPM)",
+		][_engine.shuffle_mode])
 	%Repeat.pressed.connect(func() -> void:
 		_engine.repeat = ((_engine.repeat + 1) % 3) as AudioEngine.Repeat
 		_refresh_transport()
@@ -1318,6 +1328,7 @@ func _save() -> void:
 	cfg.set_value("playlists", "cues", _library.pl_cues)
 	cfg.set_value("cues", "tracks", _library.cues)
 	cfg.set_value("library", "shuffle", _engine.shuffle)
+	cfg.set_value("library", "shuffle_mode", int(_engine.shuffle_mode))
 	cfg.set_value("library", "repeat", int(_engine.repeat))
 	cfg.set_value("audio", "volume", _volume)
 	cfg.set_value("audio", "boost", _boost)
@@ -5157,7 +5168,7 @@ func _update_orientation() -> void:
 ## SHUF and RPT are persisted now, so their captions have to be derived from the engine
 ## rather than toggled in place -- the .tscn defaults would otherwise lie after a reload.
 func _refresh_transport() -> void:
-	%Shuffle.text = "SHUF:%s" % ("ON" if _engine.shuffle else "OFF")
+	%Shuffle.text = "SHUF:%s" % ["OFF", "TRUE", "JAM"][_engine.shuffle_mode]
 	%Repeat.text = "RPT:%s" % ["OFF", "ALL", "ONE"][_engine.repeat]
 
 
@@ -5798,13 +5809,41 @@ func _rack_module_box(deck: int, type: String) -> void:
 	var rack := _rack_decks[deck]
 	var body := _fx_module(_rack_boxes[deck], "[ %s ]" % FxRack.module_name(type))
 	var head: Control = body.get_child(0)
+	# ON/BYP before REMOVE, and that order is the point: the one you want mid-set takes the
+	# module out of the signal path and keeps every value it holds, where REMOVE throws them away
+	var bypass_btn := Button.new()
+	bypass_btn.toggle_mode = true
+	bypass_btn.button_pressed = not bool(rack.bypass.get(type, false))
+	_refresh_bypass_btn(bypass_btn)
+	bypass_btn.pressed.connect(func() -> void:
+		rack.set_bypass(type, not bypass_btn.button_pressed)
+		_refresh_bypass_btn(bypass_btn)
+		_save())
+	head.add_child(bypass_btn)
+	var vis := Button.new()
+	vis.text = "VIS"
+	vis.pressed.connect(func() -> void: _open_fx_window(deck, type))
+	_hover_note(vis, func() -> String:
+		return "%s ON ITS OWN, IN A WINDOW YOU CAN PUT ANYWHERE" % FxRack.module_name(type))
+	head.add_child(vis)
 	var kill := Button.new()
 	kill.text = "REMOVE"
 	kill.pressed.connect(func() -> void:
 		rack.remove_module(type)
+		_close_fx_window(deck, type)   # its window is about a module that is no longer here
 		_refresh_rack(deck)
 		_save())
 	head.add_child(kill)
+	_rack_controls(deck, body, type)
+
+func _refresh_bypass_btn(btn: Button) -> void:
+	btn.text = "[*] ON" if btn.button_pressed else "[ ] BYP"
+
+## Every control a module has: its choices, its switches and its faders, built into `body`.
+## The rack box and the detached VIS window are the same controls in two places, so they are
+## built by the same function rather than drifting apart.
+func _rack_controls(deck: int, body: Control, type: String) -> void:
+	var rack := _rack_decks[deck]
 	for key in FxRack._choices(type):
 		var spec: Array = FxRack._choices(type)[key]
 		var r := HBoxContainer.new()
@@ -5839,6 +5878,77 @@ func _rack_module_box(deck: int, type: String) -> void:
 			_save())
 	for key in FxRack._params(type):
 		_rack_row(deck, body, type, key)
+
+# --- one module, in its own window ------------------------------------------------------
+## VIS pulls a single effect out into an OS window: the same controls as the rack box, with the
+## width to actually use them, and nothing else on screen competing for the space. A module you
+## are riding through a mix is a thing you want under the pointer, not three tabs deep.
+##
+## ponytail: the controls are the program's own faders and switches, not drawn knobs. A knob is
+## new art and a new drag law for the one place it would appear; if the rotary look matters more
+## than the consistency, that is the upgrade.
+const FX_WIN_SIZE := Vector2i(420, 520)
+var _fx_windows := {}   # "deck:type" -> Window
+
+static func _fx_window_key(deck: int, type: String) -> String:
+	return "%d:%s" % [deck, type]
+
+func _open_fx_window(deck: int, type: String) -> void:
+	var key := _fx_window_key(deck, type)
+	var open: Window = _fx_windows.get(key)
+	if is_instance_valid(open):
+		open.grab_focus()   # already out there: bring it forward rather than opening a second
+		return
+	var win := Window.new()
+	win.name = "Fx%s%d" % [type.capitalize(), deck]
+	win.title = "SOUNDSCAPE // %s  (%s)" % [FxRack.module_name(type), AudioEngine.DECK_NAMES[deck]]
+	win.size = FX_WIN_SIZE
+	win.unresizable = false
+	win.transient = false
+	win.exclusive = false
+	win.theme = theme
+	add_child(win)
+	_enable_window_fullscreen_toggle(win)
+	var chassis := PanelContainer.new()
+	chassis.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var root_sb: StyleBox = get("theme_override_styles/panel")
+	if root_sb:
+		chassis.add_theme_stylebox_override("panel", root_sb)
+	win.add_child(chassis)
+	var pad := MarginContainer.new()
+	for side in ["left", "top", "right", "bottom"]:
+		pad.add_theme_constant_override("margin_" + side, 8)
+	chassis.add_child(pad)
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 6)
+	pad.add_child(col)
+	var title := Label.new()
+	title.text = "[ %s ]" % FxRack.module_name(type)
+	title.theme_type_variation = &"Green"
+	col.add_child(title)
+	var rack := _rack_decks[deck]
+	var bypass_btn := Button.new()
+	bypass_btn.toggle_mode = true
+	bypass_btn.button_pressed = not bool(rack.bypass.get(type, false))
+	_refresh_bypass_btn(bypass_btn)
+	bypass_btn.pressed.connect(func() -> void:
+		rack.set_bypass(type, not bypass_btn.button_pressed)
+		_refresh_bypass_btn(bypass_btn)
+		_refresh_rack(deck)   # the rack box's own toggle says the same thing
+		_save())
+	col.add_child(bypass_btn)
+	_rack_controls(deck, col, type)
+	win.close_requested.connect(func() -> void: _close_fx_window(deck, type))
+	_fx_windows[key] = win
+	_centre_on_primary(win)
+	win.show()
+
+func _close_fx_window(deck: int, type: String) -> void:
+	var key := _fx_window_key(deck, type)
+	var win: Window = _fx_windows.get(key)
+	_fx_windows.erase(key)
+	if is_instance_valid(win):
+		win.queue_free()
 
 ## No caption Label: the button already says the word, and having both rendered as
 ## "MODULAT      [ ] MODULATE OFF" -- the label clipped, the word duplicated, and the
@@ -7083,9 +7193,17 @@ func _setup_deck_ui() -> void:
 	_xfade.custom_minimum_size = Vector2(90, 14)
 	_xfade.show_percentage = false
 	_xfade.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	# RMB runs the fader across on its own; connected before the drag handler because
+	# _bar_drag only answers for the left button and would swallow the event first
+	_xfade.gui_input.connect(func(e: InputEvent) -> void:
+		var click := e as InputEventMouseButton
+		if click and click.pressed and click.button_index == MOUSE_BUTTON_RIGHT:
+			_auto_fade()
+			_xfade.accept_event())
 	_xfade.gui_input.connect(func(e: InputEvent) -> void:
 		if not _bar_drag(e, _xfade):
 			return
+		_kill_auto_fade()   # a fade you have taken hold of is one you are doing yourself
 		# the press that GRABS the fader is the moment to line the grids up -- once, while the
 		# incoming deck is still quiet, never on each motion event of the drag
 		if _beat_sync and e is InputEventMouseButton:
@@ -7121,11 +7239,38 @@ func _setup_deck_ui() -> void:
 	_hover_note(_split_btn, func() -> String:
 		return "DUAL DECK MODE %s  //  DECK A TRACKS | FEED | DECK B" % ("ON" if _dual_deck else "OFF"))
 	_hover_note(_xfade, func() -> String:
-		return "CROSSFADER: %s  //  %s %+.1f DB  //  %s %+.1f DB" % [
+		return "RIGHT-CLICK: AUTO FADE OVER %.1f S  //  CROSSFADER: %s  //  %s %+.1f DB  //  %s %+.1f DB" % [
+			float(_decks.fade_ms) / 1000.0,
 			("A" if _decks.crossfader < 0.02 else ("B" if _decks.crossfader > 0.98 else "%d%%" % int(_decks.crossfader * 100.0))),
 			AudioEngine.DECK_NAMES[0], AudioEngine.deck_gain_db(1.0 - _decks.crossfader),
 			AudioEngine.DECK_NAMES[1], AudioEngine.deck_gain_db(_decks.crossfader)])
 	_refresh_deck_ui()
+
+## The crossfader, run across on its own over the TBS FADE TIME -- the same number the
+## track-to-track fade uses, so a hand fade and an auto fade take exactly as long as each other
+## and a set has one fade length rather than two. It heads for whichever end it is not at, and
+## SYNC lines the grids up first, the way grabbing the fader does.
+##
+## ponytail: linear in fader position, which is equal-power in LEVEL because set_crossfader's law
+## is. A shaped curve would need a reason a cos/sin sweep does not already give.
+var _xfade_tween: Tween
+
+func _auto_fade() -> void:
+	_kill_auto_fade()
+	if _engine.both:
+		_engine.set_both(false)   # a fade BETWEEN decks is not both decks at once
+	if _beat_sync:
+		_align_decks()
+	var to := 0.0 if _decks.crossfader > 0.5 else 1.0
+	var secs := maxf(float(_decks.fade_ms) / 1000.0, 0.05)
+	_xfade_tween = create_tween().set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+	_xfade_tween.tween_method(_set_crossfader, _decks.crossfader, to, secs)
+	_note = "  //  AUTO FADE TO %s OVER %.1f S" % [AudioEngine.DECK_NAMES[1 if to > 0.5 else 0], secs]
+	_clear_note_later()
+
+func _kill_auto_fade() -> void:
+	if _xfade_tween and _xfade_tween.is_valid():
+		_xfade_tween.kill()
 
 func _set_crossfader(x: float) -> void:
 	_decks.crossfader = clampf(x, 0.0, 1.0)

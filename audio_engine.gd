@@ -30,7 +30,7 @@ const KEY_NAMES := ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", 
 var queue: Array[String] = []
 var index := -1
 var repeat: Repeat = Repeat.ALL
-var shuffle := false
+# `shuffle` and `shuffle_mode` live further down, with the two shuffles they describe
 
 ## path -> Dictionary. ffprobe results never change for a file, so they are cached for
 ## the session -- but the cache is written from WORKER threads (both request() and
@@ -353,6 +353,7 @@ static func deck_test() -> bool:
 func set_queue(paths: Array[String], current: String = "") -> void:
 	queue = paths.duplicate()
 	index = queue.find(current) if not current.is_empty() else -1
+	_bag.clear()   # a position in the old list means nothing in the new one
 	queue_changed.emit()
 
 ## Returns the index that should play next, or -1 when the queue is exhausted.
@@ -371,8 +372,151 @@ static func peek_next(from: int, wrapped_repeat: Repeat, is_shuffle: bool, size:
 		return from + 1
 	return 0 if wrapped_repeat == Repeat.ALL else -1
 
+# --- shuffle ----------------------------------------------------------------------------
+## Two shuffles, because a DJ uses them for different things.
+##
+##   TRUE -- random WITHOUT REPLACEMENT. Every position in the queue goes into a bag, draws
+##           come out of the bag, and only an empty bag is refilled: nothing plays twice until
+##           everything has played once. Plain randi() will happily play one track twice in five
+##           and leave another for an hour, and that reads as the shuffle being broken.
+##   JAM  -- the same bag, drawn WEIGHTED by how well each candidate mixes out of what is
+##           playing: harmonic distance on the Camelot wheel, and tempo distance in percent. It
+##           is still random -- a set does not become a fixed order -- but the tracks that would
+##           beat-match and key-match come up far more often.
+enum Shuffle { OFF, TRUE_RANDOM, JAM }
+var shuffle_mode: Shuffle = Shuffle.OFF
+
+## The old name, kept because everything that only wants to know "is it shuffling" still asks
+## for it -- peek_next, the transport, and a config written before JAM existed.
+var shuffle: bool:
+	get:
+		return shuffle_mode != Shuffle.OFF
+	set(on):
+		shuffle_mode = Shuffle.TRUE_RANDOM if on else Shuffle.OFF
+
+## Queue positions not yet drawn this pass. Cleared whenever the queue itself changes, because
+## a position in the old list means nothing in the new one.
+var _bag: Array[int] = []
+
+## Camelot steps between two keys: around the wheel, plus one for changing letter. 0 is the same
+## key, 1 is a neighbour or the relative major/minor -- the moves that work -- and 6 is as far
+## away as two keys get.
+static func key_distance(pc_a: int, minor_a: bool, pc_b: int, minor_b: bool) -> int:
+	var na := int(camelot(pc_a, minor_a).left(camelot(pc_a, minor_a).length() - 1))
+	var nb := int(camelot(pc_b, minor_b).left(camelot(pc_b, minor_b).length() - 1))
+	var round_trip: int = absi(na - nb)
+	var steps: int = mini(round_trip, 12 - round_trip)
+	return steps + (0 if minor_a == minor_b else 1)
+
+## How well `b` mixes out of `a`, as a weight for a JAM draw. An unknown key or tempo neither
+## helps nor hurts: an untagged library would otherwise weight to nothing and stop being random.
+const JAM_KEY_WEIGHT := [4.0, 2.0, 1.0, 0.6]      # by key_distance, last entry for everything further
+const JAM_BPM_WEIGHT := [3.0, 1.5, 0.6, 0.25]     # within 3 %, 6 %, 12 %, beyond
+static func jam_weight(a: Dictionary, b: Dictionary) -> float:
+	var weight := 1.0
+	var ka: Dictionary = a.get("key", {})
+	var kb: Dictionary = b.get("key", {})
+	var pa := int(ka.get("pc", -1))
+	var pb := int(kb.get("pc", -1))
+	if pa >= 0 and pb >= 0:
+		var d := key_distance(pa, bool(ka.get("minor", false)), pb, bool(kb.get("minor", false)))
+		weight *= JAM_KEY_WEIGHT[mini(d, JAM_KEY_WEIGHT.size() - 1)]
+	var bpm_a := float(a.get("bpm", 0.0))
+	var bpm_b := float(b.get("bpm", 0.0))
+	if bpm_a > 0.0 and bpm_b > 0.0:
+		var drift := absf(bpm_b - bpm_a) / bpm_a
+		var band := 0
+		for edge in [0.03, 0.06, 0.12]:
+			if drift <= edge:
+				break
+			band += 1
+		weight *= JAM_BPM_WEIGHT[band]
+	return weight
+
+## The next position, or -1 when the running order is exhausted. REPEAT ONE and the plain
+## forward walk are peek_next's, unchanged; the two shuffles draw from the bag.
 func next_index() -> int:
-	return peek_next(index, repeat, shuffle, queue.size(), randi() % maxi(queue.size(), 1))
+	if queue.is_empty():
+		return -1
+	if repeat == Repeat.ONE or shuffle_mode == Shuffle.OFF:
+		return peek_next(index, repeat, false, queue.size(), 0)
+	if _bag.is_empty():
+		_refill_bag()
+	if _bag.is_empty():
+		return index   # a one-track queue: the bag is empty because the only track is playing
+	var at := randi() % _bag.size() if shuffle_mode == Shuffle.TRUE_RANDOM else _jam_pick()
+	var pick: int = _bag[at]
+	_bag.remove_at(at)
+	return pick
+
+func _refill_bag() -> void:
+	_bag.clear()
+	for i in queue.size():
+		if i != index:
+			_bag.append(i)
+
+## Which BAG SLOT a JAM draw lands on. Weighted by jam_weight against the playing track, over a
+## sample of the bag rather than all of it.
+##
+## ponytail: the sample is the whole bag up to JAM_SAMPLE. Weighting 20,000 candidates on every
+## advance is 20,000 metadata reads for one pick, and past a couple of hundred the odds barely
+## move -- there are only so many tracks in a key.
+const JAM_SAMPLE := 256
+
+func _jam_pick() -> int:
+	var playing := peek_meta(queue[index]) if index >= 0 and index < queue.size() else {}
+	if playing.is_empty():
+		return randi() % _bag.size()   # nothing to mix out of: an ordinary random draw
+	var slots: Array[int] = []
+	if _bag.size() <= JAM_SAMPLE:
+		for slot in _bag.size():
+			slots.append(slot)
+	else:
+		for _i in JAM_SAMPLE:
+			slots.append(randi() % _bag.size())
+	var weights: Array[float] = []
+	var total := 0.0
+	for slot in slots:
+		var w := jam_weight(playing, peek_meta(queue[_bag[slot]]))
+		weights.append(w)
+		total += w
+	if total <= 0.0:
+		return slots[randi() % slots.size()]
+	var roll := randf() * total
+	for i in slots.size():
+		roll -= weights[i]
+		if roll <= 0.0:
+			return slots[i]
+	return slots[slots.size() - 1]
+
+static func shuffle_test() -> bool:
+	# the wheel: 8A is A minor, 8B its relative major (one letter step), 9A a neighbour
+	var same := key_distance(9, true, 9, true) == 0
+	var relative := key_distance(9, true, 0, false) == 1      # 8A -> 8B
+	var neighbour := key_distance(9, true, 4, true) == 1      # 8A -> 9A
+	var far := key_distance(9, true, 3, false) > 2
+	var tuned := jam_weight({"key": {"pc": 9, "minor": true}, "bpm": 128.0},
+			{"key": {"pc": 9, "minor": true}, "bpm": 128.0}) \
+		> jam_weight({"key": {"pc": 9, "minor": true}, "bpm": 128.0},
+			{"key": {"pc": 3, "minor": false}, "bpm": 175.0})
+	# an untagged candidate is neither favoured nor punished
+	var untagged := is_equal_approx(jam_weight({"key": {"pc": 9, "minor": true}, "bpm": 128.0}, {}), 1.0)
+	# ...and the bag: every track once, then a refill, with the playing one held back
+	var engine := AudioEngine.new()
+	engine.queue = ["a", "b", "c", "d"]
+	engine.index = 0
+	engine.shuffle_mode = Shuffle.TRUE_RANDOM
+	var drawn := {}
+	for _i in 3:
+		var pick := engine.next_index()
+		drawn[pick] = int(drawn.get(pick, 0)) + 1
+		engine.index = pick
+	var no_repeats: bool = drawn.size() == 3 and not drawn.has(0)
+	for count in drawn.values():
+		no_repeats = no_repeats and count == 1
+	var refilled: bool = engine._bag.is_empty() and engine.next_index() >= 0
+	engine.free()
+	return same and relative and neighbour and far and tuned and untagged and no_repeats and refilled
 
 func prev_index() -> int:
 	if queue.is_empty():

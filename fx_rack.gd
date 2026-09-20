@@ -104,9 +104,19 @@ var _phase := {}        # type -> LFO phase in turns, free-running while the mod
 var _parked := {}       # type -> BLEND block count when its MIX reached 0, until it is switched out
 var _dirty := true
 
+## Modules in the rack but switched OUT: bypass keeps the module, its faders and its place, and
+## takes it out of the signal path. REMOVE throws the settings away; bypass is the one you reach
+## for mid-set to hear what the effect is doing, and the one you can put back with the same click.
+##
+## It works by feeding the BLEND a MIX of 0 rather than by disabling slots directly, so switching
+## out rides the ramp the MIX fader already has: the same three-block park in _in_circuit, and the
+## same absence of a click. The user's own MIX value is untouched underneath.
+var bypass := {}
+
 func _init() -> void:
 	for type in MODULES:
 		active[type] = false
+		bypass[type] = false
 		_phase[type] = 0.0
 		fx[type] = {}
 		sw[type] = {}
@@ -247,6 +257,16 @@ func set_switch(type: String, key: String, on: bool) -> void:
 	sw[type][key] = on
 	_dirty = true
 
+func set_bypass(type: String, on: bool) -> void:
+	if not MODULES.has(type):
+		return
+	bypass[type] = on
+	_dirty = true
+
+## The MIX the BLEND is actually given: zero while bypassed, whatever the fader says otherwise.
+func effective_mix(type: String) -> float:
+	return 0.0 if bypass.get(type, false) else float(fx[type].get("mix", 1.0))
+
 func set_choice(type: String, key: String, i: int) -> void:
 	ch[type][key] = clampi(i, 0, (_choices(type)[key][1] as Array).size() - 1)
 	_dirty = true
@@ -317,7 +337,7 @@ func _in_circuit(type: String) -> bool:
 		_parked.erase(type)
 		return false
 	var pair: Array = _pairs[type]
-	if pair.is_empty() or float(fx[type].get("mix", 1.0)) > 0.0:
+	if pair.is_empty() or effective_mix(type) > 0.0:
 		_parked.erase(type)
 		return true
 	if not AudioServer.is_bus_effect_enabled(_bus, _idx[type][0]):
@@ -353,7 +373,7 @@ func _apply(type: String) -> void:
 	var p: Dictionary = fx[type]
 	var pair: Array = _pairs[type]
 	if not pair.is_empty():
-		pair[0].call("set_mix", p.get("mix", 1.0))   # both halves share one MIX
+		pair[0].call("set_mix", effective_mix(type))   # both halves share one MIX
 	var fxs: Array = _effects[type]
 	match type:
 		"notch":
@@ -447,15 +467,21 @@ func to_dict() -> Dictionary:
 	for type in MODULES:
 		if active[type]:
 			on.append(type)
-	return {"active": on, "fx": fx.duplicate(true), "sw": sw.duplicate(true),
+	var off: Array[String] = []
+	for type in MODULES:
+		if bypass.get(type, false):
+			off.append(type)
+	return {"active": on, "bypass": off, "fx": fx.duplicate(true), "sw": sw.duplicate(true),
 		"ch": ch.duplicate(true)}
 
 ## Clamped on the way in rather than trusted: library.cfg is hand-editable, and an
 ## out-of-range cutoff or pitch_scale is an audible fault, not a caught error.
 func from_dict(d: Dictionary) -> void:
 	var on: Variant = d.get("active", [])
+	var off: Variant = d.get("bypass", [])
 	for type in MODULES:
 		active[type] = (on is Array) and (type in (on as Array))
+		bypass[type] = (off is Array) and (type in (off as Array))
 	var in_fx: Variant = d.get("fx", {})
 	var in_sw: Variant = d.get("sw", {})
 	var in_ch: Variant = d.get("ch", {})
@@ -497,6 +523,25 @@ static func rack_test() -> bool:
 			if (c[1] as Array).is_empty() or c[2] < 0 or c[2] >= (c[1] as Array).size():
 				r.free()
 				return false
+	# bypass takes a module out of the signal path WITHOUT touching what its faders say, and it
+	# survives a save: a set rebuilt from library.cfg comes back with the same modules switched out
+	r.add_module("reverb")
+	r.set_param("reverb", "mix", 0.8)
+	r.set_bypass("reverb", true)
+	var bypassed: bool = is_equal_approx(r.effective_mix("reverb"), 0.0) \
+		and is_equal_approx(float(r.fx["reverb"]["mix"]), 0.8) and r.active["reverb"]
+	var saved := r.to_dict()
+	var back := FxRack.new()
+	back.from_dict(saved)
+	bypassed = bypassed and back.bypass["reverb"] and back.active["reverb"] \
+		and is_equal_approx(float(back.fx["reverb"]["mix"]), 0.8)
+	r.set_bypass("reverb", false)
+	bypassed = bypassed and is_equal_approx(r.effective_mix("reverb"), 0.8)
+	r.remove_module("reverb")
+	back.free()
+	if not bypassed:
+		r.free()
+		return false
 	var ok := true
 	# the rack boots BLANK
 	for type in MODULES:
