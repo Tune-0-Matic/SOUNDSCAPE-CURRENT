@@ -452,6 +452,7 @@ func _ready() -> void:
 		_bg_throttle = _cfg_bool(cfg, "visual", "bg_throttle", false)
 		_playbar_offset = int(_cfg_num(cfg, "visual", "playbar_split", 0.0))
 		_now_playing = _cfg_bool(cfg, "visual", "now_playing", false)
+		_now_mode = clampi(int(_cfg_num(cfg, "visual", "now_mode", 1.0)), 0, NOW_MODES.size() - 1)
 		_video_test = _cfg_bool(cfg, "visual", "video_test", false)
 		_video_color = clampi(int(_cfg_num(cfg, "visual", "video_color", 1.0)), 0, 1) as VideoTest.ColorMode
 		_listening_mode = clampi(int(_cfg_num(cfg, "visual", "listening_mode", 0.0)), 0,
@@ -647,6 +648,7 @@ func _ready() -> void:
 	_setup_rack_tab(1)
 	_setup_record_tab()   # the RECORD SET tab, added before the capture below
 	_setup_tools_tab()
+	_setup_queue_tab()
 	_capture_tab_order()
 	_shorten_tab_titles()   # 9 tabs do not fit the bar at its natural widths   # every tab now exists, including the runtime-built ones
 	_set_dual_deck(_dual_deck)   # after the capture, so every tab has a home slot to return to
@@ -970,6 +972,7 @@ func _recount() -> void:
 		else ("FILTERED" if not (_library.filters[0] as String).is_empty() else "")
 	_count.text = count_text(_library.paths.size(), (_library.shown[0] as Array).size(),
 		_library.folders.size(), secs, scope, partial, _up_next.size())
+	_queue_refresh()   # the QUEUE tab shows the same queue this line counts
 
 ## Each list highlights ITS deck's track, not whichever deck happens to be driven. A track
 ## filtered out of that crate's view simply has no row to select.
@@ -1371,6 +1374,7 @@ func _save() -> void:
 	cfg.set_value("visual", "bg_throttle", _bg_throttle)
 	cfg.set_value("visual", "playbar_split", _playbar_offset)
 	cfg.set_value("visual", "now_playing", _now_playing)
+	cfg.set_value("visual", "now_mode", _now_mode)
 	cfg.set_value("visual", "video_test", _video_test)
 	cfg.set_value("visual", "listening_mode", _listening_mode)
 	cfg.set_value("visual", "video_color", int(_video_color))
@@ -1740,6 +1744,95 @@ func _clear_queue() -> void:
 	_recount()
 	_note = "  //  QUEUE CLEARED (%d)" % was
 	_clear_note_later()
+
+# --- the QUEUE tab: what is actually in _up_next -----------------------------------------
+## The queue was write-only. Tracks went in from the track menu and the readout counted them,
+## but there was no way to see what was in there, take one back out, or change the order --
+## which for the one list you build by hand is the wrong half of the job to have shipped.
+##
+## The list is rebuilt whole on every change rather than patched: a queue is tens of rows, and
+## _recount() already runs on every change the queue has, so there is one hook and no bookkeeping.
+var _queue_list: ItemList
+
+func _setup_queue_tab() -> void:
+	var tab := VBoxContainer.new()
+	tab.name = "QUEUE"
+	tab.add_theme_constant_override("separation", 4)
+	_tabs.add_child(tab)
+	_queue_list = ItemList.new()
+	_queue_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_queue_list.allow_reselect = true
+	tab.add_child(_queue_list)
+	# double-click plays it now rather than waiting its turn: moved to the front and handed to
+	# the same _play_queued() an auto-advance uses, so there is no second way to start a track
+	_queue_list.item_activated.connect(func(row: int) -> void:
+		if row >= 0 and row < _up_next.size():
+			_up_next.push_front(_up_next.pop_at(row))
+			if not _play_queued(false):
+				_recount())
+	var row := HFlowContainer.new()
+	tab.add_child(row)
+	for spec in [["[ UP ]", -1], ["[ DOWN ]", 1]]:
+		var delta: int = spec[1]
+		var b := Button.new()
+		b.text = spec[0]
+		b.pressed.connect(func() -> void: _queue_move(delta))
+		row.add_child(b)
+	var drop := Button.new()
+	drop.text = "[ REMOVE ]"
+	drop.pressed.connect(_queue_drop)
+	row.add_child(drop)
+	var clear := Button.new()
+	clear.text = "[ CLEAR ]"
+	clear.pressed.connect(_clear_queue)
+	row.add_child(clear)
+	var note := Label.new()
+	note.text = "PLAY NEXT GOES TO THE TOP\nADD TO QUEUE GOES TO THE BOTTOM"
+	note.theme_type_variation = &"Green"
+	tab.add_child(note)
+	_queue_refresh()
+
+## ponytail: rebuilt whole, unconditionally. It is worth saying why there is no "only when the
+## tab is showing" guard, because I wrote one and it was wrong: an ItemList holding tens of rows
+## costs nothing to refill, while `is_visible_in_tree()` is false for a tab nobody has clicked --
+## so the guard left the list permanently empty and only the first visit would have filled it.
+## The 20k-row relayout that guards like that exist for is the TRACK list's problem, not this one.
+func _queue_refresh() -> void:
+	if not is_instance_valid(_queue_list):
+		return   # _recount() runs during boot, before the tab is built
+	var keep := _queue_list.get_selected_items()
+	_queue_list.clear()
+	for i in _up_next.size():
+		var path: String = _up_next[i]
+		_queue_list.add_item("%2d. %s" % [i + 1,
+			_library.labels.get(_library.id_for(path), path.get_file())])
+	if keep.size() > 0 and keep[0] < _queue_list.item_count:
+		_queue_list.select(keep[0])
+
+## MOVE UP / MOVE DOWN, on the same pure helper the playlist reorder uses. The selection
+## follows the row it was on, because moving a track three places means clicking UP three times.
+func _queue_move(delta: int) -> void:
+	var sel := _queue_list.get_selected_items()
+	if sel.is_empty():
+		return
+	var to := setlist_move(_up_next, sel[0], delta)
+	_queue_refresh()
+	if to >= 0 and to < _queue_list.item_count:
+		_queue_list.select(to)
+
+func _queue_drop() -> void:
+	var sel := _queue_list.get_selected_items()
+	if sel.is_empty():
+		return
+	var at: int = sel[0]
+	if at >= _up_next.size():
+		return
+	_note = "  //  OUT OF THE QUEUE: %s" % (_up_next[at] as String).get_file()
+	_clear_note_later()
+	_up_next.remove_at(at)
+	_recount()   # the readout's count and this list, in that one call
+	if _queue_list.item_count > 0:
+		_queue_list.select(mini(at, _queue_list.item_count - 1))
 
 func _next(auto := false) -> void:
 	if _play_queued(auto):
@@ -2749,13 +2842,12 @@ func _open_deck(deck: int, path: String) -> void:
 
 # --- TOOLS ---------------------------------------------------------------------------------
 ## Utilities that work on ONE track -- the one on the transport -- and want room of their own.
-## Each opens a real OS window rather than a tab panel, because a cutter you are reading
-## timestamps into is not something you want to lose by clicking another tab.
+## Each opens a real OS window rather than a tab panel, because a form you are half way through
+## typing into is not something you want to lose by clicking another tab.
 ##
 ## Every tool writes a NEW FILE beside the original and never touches it. That is the whole
 ## safety story here: an edit that goes wrong costs a file you can delete, not the master.
 const TOOLS := [
-	["AUDIO CUTTER", "cutter", "TRIM THE TRANSPORT'S TRACK INTO A NEW FILE BESIDE IT"],
 	["METADATA", "meta", "TITLE, ARTIST AND ALBUM, WRITTEN INTO A TAGGED COPY"],
 	["FILE INFO", "info", "WHAT THE FILE IS: CODEC, RATE, DEPTH, TAGS, SIZE AND PATH"],
 ]
@@ -2834,7 +2926,6 @@ func _tool_field(col: Control, caption: String, value: String, chars := 16) -> L
 
 func _open_tool(kind: String) -> void:
 	match kind:
-		"cutter": _open_cutter()
 		"meta": _open_metadata_tool()
 		"info": _open_file_info()
 
@@ -2881,48 +2972,6 @@ func _open_file_info() -> void:
 	col.add_child(refresh)
 	fill.call()
 
-## AUDIO CUTTER: in and out, and a copy of what is between them. -c copy, so the cut is the
-## original's own bytes -- no re-encode, no generation loss -- which means the cut lands on the
-## nearest frame boundary rather than the exact sample. For a trim that is the right trade.
-func _open_cutter() -> void:
-	var col := _tool_window("cutter", "AUDIO CUTTER", Vector2i(520, 300))
-	if col == null:
-		return
-	var path := _bar_path()
-	var cues := _cues_for(path) if not path.is_empty() else []
-	var from_default := float(cues[0]["time"]) if cues.size() > 0 else 0.0
-	var to_default := float(cues[1]["time"]) if cues.size() > 1 else _len()
-	var head := Label.new()
-	head.clip_text = true
-	head.text = path.get_file() if not path.is_empty() else "NOTHING ON THE TRANSPORT"
-	col.add_child(head)
-	var from_field := _tool_field(col, "IN  (MM:SS:MS)", ts_text(from_default))
-	var to_field := _tool_field(col, "OUT (MM:SS:MS)", ts_text(maxf(to_default, from_default)))
-	var status := Label.new()
-	status.theme_type_variation = &"Green"
-	status.clip_text = true
-	col.add_child(status)
-	var cut := Button.new()
-	cut.text = "[ WRITE THE CUT ]"
-	cut.pressed.connect(func() -> void:
-		var a := ts_parse(from_field.text)
-		var b := ts_parse(to_field.text)
-		if path.is_empty() or a < 0.0 or b <= a:
-			_status_note(status, false, "IN AND OUT MUST BE TIMESTAMPS, OUT AFTER IN")
-			return
-		var out := "%s (CUT %s-%s).%s" % [path.get_basename(), _time_text(a).replace(":", "."),
-			_time_text(b).replace(":", "."), path.get_extension()]
-		_status_note(status, true, "WRITING %s" % out.get_file())
-		# on a worker: ffmpeg on a long file is seconds, and the UI has no business waiting
-		_engine.run_task(func() -> void:
-			var ok := AudioEngine.run_process("ffmpeg", ["-v", "error", "-y", "-nostdin",
-				"-ss", "%.3f" % a, "-to", "%.3f" % b, "-i", path, "-c", "copy", out],
-				_engine.is_shut_down) == 0
-			(func() -> void:
-				_status_note(status, ok and FileAccess.file_exists(out),
-					"WROTE %s" % out.get_file() if ok else "FFMPEG REFUSED THAT CUT")).call_deferred()))
-	col.add_child(cut)
-
 ## METADATA: the three tags the rest of the program reads, written into a COPY. ffmpeg cannot
 ## retag in place, and a tool that rewrites somebody's master to change a spelling is not a tool
 ## anyone should have to trust -- so the copy is the feature, not a limitation.
@@ -2968,28 +3017,47 @@ func _open_metadata_tool() -> void:
 ## question alone, in a BORDERLESS window you can drop in a corner over whatever you are actually
 ## working in -- which is also why it is always on top and why it is dragged by its own face:
 ## a borderless window has no title bar for the OS to move it by.
-const NOW_WIN_SIZE := Vector2i(460, 92)
+##
+## Three shapes for the same question, because how much of it you want depends on what the
+## window is sitting next to. DISPLAY is the VFD readout -- what is playing and who by, nothing
+## else. CASUAL is the whole answer: a bar, the times, and enough transport to work it without
+## going back to the player. COMPACT is a title and a hairline of progress.
+const NOW_MODES := ["DISPLAY", "CASUAL", "COMPACT"]
+## Opening size per mode. A FLOOR, not a rule: the fit below grows the window to whatever the
+## contents actually measure in the font the user picked, and the corner drags it bigger.
+const NOW_MODE_SIZES := [Vector2i(420, 64), Vector2i(500, 116), Vector2i(380, 52)]
+## The padding strip round the contents. No control reaches into it, so a press there is
+## unambiguously the window's own: the right and bottom strips resize, a press anywhere else drags.
+const NOW_EDGE := 8
 var _now_win: Window
 var _now_title: Label
-var _now_time: Label
-var _now_bar: ProgressBar
+var _now_artist: Label        # DISPLAY mode only; the other two fold the artist into the title
+var _now_time: Label          # CASUAL only
+var _now_bar: ProgressBar     # not in DISPLAY
 var _now_playing := false     # TBS NOW PLAYING WINDOW, saved
+var _now_mode := 1            # CASUAL, saved
 var _now_btn: Button
 var _now_grab := Vector2i.ZERO   # pointer offset inside the window while it is being dragged
 var _now_dragging := false
+var _now_resizing := false
+var _now_pos := Vector2i(-1, -1)   # where it was last, so switching mode does not move it
 
 func _toggle_now_playing(on: bool) -> void:
 	if on == is_instance_valid(_now_win):
 		return
 	if not on:
 		if is_instance_valid(_now_win):
+			_now_pos = _now_win.position
 			_now_win.queue_free()
 		_now_win = null
+		_now_artist = null
+		_now_time = null
+		_now_bar = null
 		return
 	var win := Window.new()
 	win.name = "NowPlayingWindow"
 	win.title = "SOUNDSCAPE // NOW PLAYING"
-	win.size = NOW_WIN_SIZE
+	win.size = NOW_MODE_SIZES[_now_mode]
 	win.borderless = true
 	win.always_on_top = true
 	win.transient = false
@@ -3003,19 +3071,28 @@ func _toggle_now_playing(on: bool) -> void:
 		chassis.add_theme_stylebox_override("panel", root_sb)
 	win.add_child(chassis)
 	var pad := MarginContainer.new()
+	pad.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	pad.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	for side in ["left", "top", "right", "bottom"]:
-		pad.add_theme_constant_override("margin_" + side, 6)
+		pad.add_theme_constant_override("margin_" + side, NOW_EDGE)
 	chassis.add_child(pad)
 	var col := VBoxContainer.new()
+	col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	col.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	col.add_theme_constant_override("separation", 3)
 	pad.add_child(col)
 	var top := HBoxContainer.new()
+	top.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	top.add_theme_constant_override("separation", 6)
 	col.add_child(top)
 	_now_title = Label.new()
 	_now_title.clip_text = true
 	_now_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	top.add_child(_now_title)
+	var mode := Button.new()
+	mode.text = NOW_MODES[_now_mode]
+	mode.pressed.connect(func() -> void: _set_now_mode(_now_mode + 1))
+	top.add_child(mode)
 	var shut := Button.new()
 	shut.text = "X"   # no title bar means no close button unless one is drawn
 	shut.pressed.connect(func() -> void:
@@ -3026,53 +3103,105 @@ func _toggle_now_playing(on: bool) -> void:
 		_toggle_now_playing(false)
 		_save())
 	top.add_child(shut)
-	_now_bar = ProgressBar.new()
-	_now_bar.show_percentage = false
-	_now_bar.custom_minimum_size.y = 10
-	col.add_child(_now_bar)
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 6)
-	col.add_child(row)
-	_now_time = Label.new()
-	_now_time.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(_now_time)
-	for spec in [["|<", _prev], [">||", _toggle], [">|", func() -> void: _next()]]:
-		var b := Button.new()
-		b.text = spec[0]
-		b.pressed.connect(spec[1])
-		row.add_child(b)
-	# dragged by its own face, in SCREEN coordinates: the pointer's offset inside the window is
-	# taken on the press and held to for the whole drag, so the window does not creep
+	if _now_mode == 0:   # DISPLAY: the second line is the artist, and that is the whole window
+		_now_artist = Label.new()
+		_now_artist.clip_text = true
+		_now_artist.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		_now_artist.theme_type_variation = &"Green"
+		col.add_child(_now_artist)
+	else:
+		_now_bar = ProgressBar.new()
+		_now_bar.show_percentage = false
+		_now_bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		_now_bar.custom_minimum_size.y = 4 if _now_mode == 2 else 10
+		col.add_child(_now_bar)
+	if _now_mode == 1:   # CASUAL: times, and enough transport to work the deck from here
+		var row := HBoxContainer.new()
+		row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row.add_theme_constant_override("separation", 6)
+		col.add_child(row)
+		_now_time = Label.new()
+		_now_time.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row.add_child(_now_time)
+		for spec in [["|<", _prev], [">||", _toggle], [">|", func() -> void: _next()],
+				["[]", func() -> void: _stop(_bar_deck())]]:
+			var b := Button.new()
+			b.text = spec[0]
+			b.pressed.connect(spec[1])
+			row.add_child(b)
+	# Dragged by its own face, in SCREEN coordinates: the pointer's offset inside the window is
+	# taken on the press and held to for the whole drag, so the window does not creep. A press in
+	# the RIGHT or BOTTOM padding strip resizes instead -- a borderless window has no frame to
+	# grab, and a fixed size clipped the time and the buttons off the right edge the moment the
+	# font got wider than the 460 px this was built at.
 	win.window_input.connect(func(e: InputEvent) -> void:
 		var click := e as InputEventMouseButton
 		if click and click.button_index == MOUSE_BUTTON_LEFT:
-			_now_dragging = click.pressed
-			_now_grab = DisplayServer.mouse_get_position() - win.position
-		elif e is InputEventMouseMotion and _now_dragging:
-			win.position = DisplayServer.mouse_get_position() - _now_grab)
+			var local := DisplayServer.mouse_get_position() - win.position
+			_now_resizing = click.pressed and (local.x >= win.size.x - NOW_EDGE \
+				or local.y >= win.size.y - NOW_EDGE)
+			_now_dragging = click.pressed and not _now_resizing
+			_now_grab = DisplayServer.mouse_get_position() - (win.size if _now_resizing else win.position)
+		elif e is InputEventMouseMotion and (_now_dragging or _now_resizing):
+			var at := DisplayServer.mouse_get_position() - _now_grab
+			if _now_resizing:
+				win.size = Vector2i(maxi(at.x, win.min_size.x), maxi(at.y, win.min_size.y))
+			else:
+				win.position = at)
 	_now_win = win
-	_centre_on_primary(win)
+	if _now_pos.x >= 0:
+		win.position = _now_pos   # a mode switch reopens the window; it must not jump to the middle
+	else:
+		_centre_on_primary(win)
 	win.show()
+	# The floor comes from what the contents MEASURE, not from a constant: this program lets the
+	# user pick the font, and a wider one used to push the transport buttons out of the window.
+	# Deferred because a minimum size is only settled after the containers have laid out once.
+	(func() -> void:
+		if not is_instance_valid(win):
+			return
+		var need := Vector2i(chassis.get_combined_minimum_size()) + Vector2i(2, 2)
+		win.min_size = need
+		win.size = Vector2i(maxi(win.size.x, need.x), maxi(win.size.y, need.y))).call_deferred()
 	_now_update()
+
+## Cycles DISPLAY -> CASUAL -> COMPACT. The window is rebuilt rather than reshuffled: three
+## layouts that share two labels is less code than one layout that has to unbuild itself, and
+## the position is carried across so it reopens exactly where it was.
+func _set_now_mode(mode: int) -> void:
+	_now_mode = posmod(mode, NOW_MODES.size())
+	if is_instance_valid(_now_win):
+		_toggle_now_playing(false)
+		_toggle_now_playing(true)
+	_note = "  //  NOW PLAYING: %s" % NOW_MODES[_now_mode]
+	_clear_note_later()
+	_save_soon()
 
 ## What the mini bar says, refreshed from the bar deck each frame it is open. Nothing here is
 ## state of its own: it reads the same _bar_path(), _pos() and _len() the transport does.
 func _now_update() -> void:
 	if not is_instance_valid(_now_win):
 		return
+	# Each of these exists only in the modes that show it, so every one is asked about rather
+	# than assumed -- DISPLAY has no bar and no clock, COMPACT has no clock.
 	var path := _bar_path()
-	if path.is_empty():
-		_now_title.text = "[ NOTHING PLAYING ]"
-		_now_time.text = "--:-- / --:--"
-		_now_bar.value = 0.0
-		return
-	var m := _engine.peek_meta(path)
-	var who := str(m.get("artist", ""))
-	var what := str(m.get("title", path.get_file().get_basename()))
-	_now_title.text = ("%s - %s" % [who, what] if not who.is_empty() else what).to_upper()
 	var length := _len()
-	_now_time.text = "%s / %s" % [_time_text(_pos()), _time_text(length)]
-	_now_bar.value = (_pos() / length * 100.0) if length > 0.0 else 0.0
+	var who := ""
+	var what := "[ NOTHING PLAYING ]"
+	if not path.is_empty():
+		var m := _engine.peek_meta(path)
+		who = str(m.get("artist", ""))
+		what = str(m.get("title", path.get_file().get_basename()))
+	if is_instance_valid(_now_artist):
+		_now_title.text = what.to_upper()
+		_now_artist.text = who.to_upper() if not who.is_empty() else "-"
+	else:
+		_now_title.text = ("%s - %s" % [who, what] if not who.is_empty() else what).to_upper()
+	if is_instance_valid(_now_time):
+		_now_time.text = "--:-- / --:--" if path.is_empty() \
+			else "%s / %s" % [_time_text(_pos()), _time_text(length)]
+	if is_instance_valid(_now_bar):
+		_now_bar.value = (_pos() / length * 100.0) if not path.is_empty() and length > 0.0 else 0.0
 
 func _refresh_now_btn() -> void:
 	if is_instance_valid(_now_btn):
@@ -6924,6 +7053,11 @@ func _popup_at_mouse() -> void:
 func _on_menu_id(id: int) -> void:
 	var path: String = _menu_ctx.get("path", "")
 	var cue: Dictionary = _menu_ctx.get("cue", {})
+	# Every track action is about the BUNDLE the menu was opened on -- [path] alone unless the
+	# RMB landed inside a multi-selection. `path` stays the one the pointer was over, for the
+	# things that only make sense singly (RENAME TAG, TRACK INFO, PLAY ON DECK A).
+	var picked: Array[String] = []
+	picked.assign(_menu_ctx.get("picked", [path]))
 	if id >= SHAPE_FIRST:
 		cue["shape"] = SHAPES[id - SHAPE_FIRST]
 		_cue_overlay.queue_redraw()
@@ -6931,10 +7065,8 @@ func _on_menu_id(id: int) -> void:
 	elif id >= COLOR_FIRST:
 		_set_cue_color(cue, (_viz.PRESETS[id - COLOR_FIRST] as Color).to_html(false))
 	elif id >= PL_FIRST:
-		_file_track(_library.playlists.keys()[id - PL_FIRST], path)
+		_file_track(_library.playlists.keys()[id - PL_FIRST], picked)
 	elif id == MENU_PLAY_NEXT or id == MENU_QUEUE:
-		var picked: Array[String] = []
-		picked.assign(_menu_ctx.get("picked", [path]))
 		_queue_tracks(picked, id == MENU_PLAY_NEXT)
 	elif id == MENU_QUEUE_CLEAR:
 		_clear_queue()
@@ -6947,7 +7079,7 @@ func _on_menu_id(id: int) -> void:
 					return
 				_library.playlists[name] = []
 				_refresh_playlists()
-				_file_track(name, path)
+				_file_track(name, picked)
 				_save())
 	elif id == MENU_RENAME:
 		_ask("RENAME TAG", _library.labels.get(_library.id_for(path), path.get_file()), func(name: String) -> void:
@@ -7041,15 +7173,24 @@ MOVES THE FILE TO THE RECYCLE BIN AND FORGETS ITS CUES, TAG AND PLAYLIST ENTRIES
 			(_library.pl_cues.get(_menu_ctx.get("playlist", ""), {}) as Dictionary).size()],
 			_delete_playlist.bind(_menu_ctx.get("playlist", "")))
 
-func _file_track(name: String, path: String) -> void:
+## Files every track in `paths` under `name`, skipping the ones already there. Takes the bundle
+## rather than one path because ADD TO PLAYLIST is offered on a multi-selection: it read only
+## _menu_ctx["path"] and quietly filed one track out of nine.
+func _file_track(name: String, paths: Array[String]) -> void:
 	var list: Array = _library.playlists.get(name, [])
-	var id := _library.id_for(path)
-	if id in list:
+	var added := 0
+	for path in paths:
+		var id := _library.id_for(path)
+		if not list.has(id):
+			list.append(id)
+			added += 1
+	_library.playlists[name] = list
+	if added == 0:
 		_note = "  //  ALREADY IN %s" % name
-	else:
-		list.append(id)
-		_library.playlists[name] = list
+	elif paths.size() == 1:
 		_note = "  //  FILED UNDER %s" % name
+	else:
+		_note = "  //  FILED %d UNDER %s" % [added, name]
 	_clear_note_later()
 	_refill()   # the track may have just entered the active scope
 	_save_soon()
