@@ -75,16 +75,27 @@ func _initialize() -> void:
 	# user cap, and the user's own cap back on return
 	var fps_was := Engine.max_fps
 	var caps := []
+	scene.set("_bg_throttle", true)
 	for user_cap in [60, 0, 24, 144]:
 		scene.set("_max_fps", user_cap)
 		scene.notification(Node.NOTIFICATION_APPLICATION_FOCUS_OUT)
 		var away := Engine.max_fps
 		scene.notification(Node.NOTIFICATION_APPLICATION_FOCUS_IN)
 		caps.append([away, Engine.max_fps])
+	# ...and with LOWER USAGE IN BACKGROUND off, which is the default, losing focus changes
+	# nothing: a feed on a second monitor is watched while another program has focus
+	scene.set("_bg_throttle", false)
+	var free_caps := []
+	for user_cap in [60, 144]:
+		scene.set("_max_fps", user_cap)
+		scene.notification(Node.NOTIFICATION_APPLICATION_FOCUS_OUT)
+		free_caps.append(Engine.max_fps)
+		scene.notification(Node.NOTIFICATION_APPLICATION_FOCUS_IN)
 	Engine.max_fps = fps_was
-	var throttle: bool = caps == [[30, 60], [30, 0], [24, 24], [30, 144]]
+	var throttle: bool = caps == [[30, 60], [30, 0], [24, 24], [30, 144]] and free_caps == [60, 144]
 	ok = ok and throttle
-	print("unfocused cap for user caps 60 / uncapped / 24 / 144, then restored [away, back]: %s: %s" % [caps, throttle])
+	print("throttle ON, unfocused cap for 60 / uncapped / 24 / 144 [away, back]: %s; throttle OFF, unfocused stays %s: %s" % [
+		caps, free_caps, throttle])
 
 	# the detached TBS window moves the Group_* SECTIONS, and reparent() gives the owner back only
 	# to nodes sharing the moved node's owner: an ownerless section lost %FadeMs and the rest

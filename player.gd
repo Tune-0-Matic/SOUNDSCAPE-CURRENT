@@ -179,6 +179,10 @@ var _mono := false        # true: Master folds to mono, post-limiter, pre-analys
 var _mono_btn: Button
 var _crt_on := true        # CRT scanline/glow pass over the visualizer feed
 var _crt_btn: Button
+## TBS LOWER USAGE IN BACKGROUND: cap the frame rate while another program has focus. Off by
+## default -- see _apply_bg_throttle.
+var _bg_throttle := false
+var _bg_throttle_btn: Button
 var _video_test := false      # TBS "Video TEST": .mp4 joins the library and plays with a low-fi picture
 var _video_test_btn: Button
 var _video_color: VideoTest.ColorMode = VideoTest.ColorMode.PALETTE   # TBS VIDEO COLOR
@@ -441,6 +445,7 @@ func _ready() -> void:
 		_max_fps = FPS_UNCAPPED if fps_cfg == FPS_UNCAPPED else clampi(fps_cfg, FPS_MIN, FPS_MAX)
 		_mono = _cfg_bool(cfg, "audio", "mono", false)
 		_crt_on = _cfg_bool(cfg, "visual", "crt", true)
+		_bg_throttle = _cfg_bool(cfg, "visual", "bg_throttle", false)
 		_video_test = _cfg_bool(cfg, "visual", "video_test", false)
 		_video_color = clampi(int(_cfg_num(cfg, "visual", "video_color", 1.0)), 0, 1) as VideoTest.ColorMode
 		_listening_mode = clampi(int(_cfg_num(cfg, "visual", "listening_mode", 0.0)), 0,
@@ -1332,6 +1337,7 @@ func _save() -> void:
 	cfg.set_value("visual", "skin", _skin)
 	cfg.set_value("audio", "mono", _mono)
 	cfg.set_value("visual", "crt", _crt_on)
+	cfg.set_value("visual", "bg_throttle", _bg_throttle)
 	cfg.set_value("visual", "video_test", _video_test)
 	cfg.set_value("visual", "listening_mode", _listening_mode)
 	cfg.set_value("visual", "video_color", int(_video_color))
@@ -1504,10 +1510,22 @@ func _notification(what: int) -> void:
 	# Application focus, not the main window's: clicking into a torn-off FX or settings
 	# window is still using the program, and throttling there would make its faders stutter.
 	elif what == NOTIFICATION_APPLICATION_FOCUS_OUT:
-		Engine.max_fps = UNFOCUSED_FPS if _max_fps == FPS_UNCAPPED or _max_fps > UNFOCUSED_FPS \
-			else _max_fps
+		_apply_bg_throttle(false)
 	elif what == NOTIFICATION_APPLICATION_FOCUS_IN:
+		_apply_bg_throttle(true)
+
+## The frame cap for the focus state, under LOWER USAGE IN BACKGROUND. Off by default, because a
+## visualizer someone put on a second monitor to WATCH while they work in another program is the
+## normal way this gets left unfocused, and 30 FPS is visible on it.
+##
+## Focus returning always restores the user's cap, throttle on or off: switching the toggle off
+## while the program sits in the background must not leave it capped for the rest of the session.
+func _apply_bg_throttle(focused: bool) -> void:
+	if focused or not _bg_throttle:
 		Engine.max_fps = _max_fps
+		return
+	Engine.max_fps = UNFOCUSED_FPS if _max_fps == FPS_UNCAPPED or _max_fps > UNFOCUSED_FPS \
+		else _max_fps
 
 # --- playback (decoding, metadata and preload live in AudioEngine) ---------
 ## `i` indexes the ENGINE QUEUE, which is the visible list -- not _library.paths. The two are the
@@ -2956,7 +2974,7 @@ const SETTING_GROUPS := {
 	"LIBRARY": ["ShowMsRow"],
 	"DISPLAY": ["FeedSizeRow", "FpsRow", "LayoutRow", "ClockRow", "FontRow", "FontsRow",
 		"CursorRow", "CrtRow", "PlayBarRow", "PlayBarShapeRow", "VisualWinRow", "DualDeckRow",
-		"FadeSpeedRow"],
+		"FadeSpeedRow", "BgThrottleRow"],
 	"VIDEO": ["IntroRow", "VideoTestRow", "VideoColorRow"],
 	"INPUT": ["SkipSecsRow"],
 	"ADVANCED": ["MessageLogRow", "CheatRow", "AutopsyPanel"],
@@ -3091,15 +3109,21 @@ func _add_setting_row(caption_text: String, row_name: String, after: Control,
 	row.name = row_name
 	var caption := Label.new()
 	caption.text = caption_text
-	var sibling := after.get_child(0) as Control
-	if sibling:
-		caption.custom_minimum_size.x = sibling.size.x
 	row.add_child(caption)
 	var btn := Button.new()
 	btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_child(btn)
 	home.add_child(row)
 	home.move_child(row, after.get_index() + 1)
+	# The caption column: the width of this caption's OWN text, floored by the sibling caption's
+	# so the controls still line up. Taking the sibling's laid-out size instead was the old rule,
+	# and it is what drew the VISUAL tab's captions two characters wide -- at build time that size
+	# is whatever the last layout pass happened to leave there, which on a tab nobody had opened
+	# yet was nothing. Pinned after the row is in the tree, where the label can read its font.
+	_pin_label(caption)
+	var sibling := after.get_child(0) as Control
+	if sibling:
+		caption.custom_minimum_size.x = maxf(caption.custom_minimum_size.x, sibling.custom_minimum_size.x)
 	return btn
 
 ## The two settings that are built in code rather than in player.tscn, added after
@@ -3200,6 +3224,19 @@ func _add_settings_rows() -> void:
 	_tbs_home.add_child(autopsy)
 	_tbs_home.move_child(autopsy, after.get_index() + 1)
 	after = autopsy
+
+	_bg_throttle_btn = _add_setting_row("LOWER USAGE IN BACKGROUND", "BgThrottleRow", after)
+	_bg_throttle_btn.toggle_mode = true
+	_bg_throttle_btn.button_pressed = _bg_throttle
+	_bg_throttle_btn.pressed.connect(func() -> void:
+		_bg_throttle = _bg_throttle_btn.button_pressed
+		_apply_bg_throttle(true)   # whatever it was capped at, the user is looking at it now
+		_refresh_bg_throttle_btn()
+		_save())
+	_refresh_bg_throttle_btn()
+	_hover_note(_bg_throttle_btn, func() -> String:
+		return "WHILE ANOTHER PROGRAM HAS FOCUS, RUN AT %d FPS  //  OFF: FULL RATE, SO A SECOND-SCREEN FEED KEEPS MOVING" % UNFOCUSED_FPS)
+	after = _bg_throttle_btn.get_parent()
 
 	_crt_btn = _add_setting_row("CRT FILTER", "CrtRow", after)
 	_crt_btn.toggle_mode = true
@@ -3311,6 +3348,12 @@ func _refresh_intro_btn() -> void:
 func _refresh_mono_btn() -> void:
 	if is_instance_valid(_mono_btn):
 		_mono_btn.text = "[*] MONO" if _mono else "[ ] STEREO"
+
+func _refresh_bg_throttle_btn() -> void:
+	if is_instance_valid(_bg_throttle_btn):
+		# short, because the caption beside it is the longest on the screen: what the two states
+		# actually do is on the hover note
+		_bg_throttle_btn.text = "[*] ON" if _bg_throttle else "[ ] OFF"
 
 func _refresh_crt_btn() -> void:
 	if is_instance_valid(_crt_btn):
@@ -3595,6 +3638,7 @@ func _open_tbs_window() -> void:
 	win.theme = theme
 	win.close_requested.connect(_close_tbs_window)
 	add_child(win)
+	_enable_window_fullscreen_toggle(win)   # every detached window answers F11 the same way
 
 	# A Window paints no background of its own -- without this the panel floats on the
 	# viewport clear colour. Reusing the ROOT's stylebox INSTANCE rather than a copy is
@@ -4179,9 +4223,14 @@ func _toggle_visual_window(on: bool) -> void:
 		win.unresizable = false
 		win.transient = false     # independent: it can live on another monitor
 		win.exclusive = false     # and must not block the player while it is open
+		# ON TOP, unlike every other window here, and the visualizer is why: it is the one panel
+		# people put on a second screen and keep WATCHING while they work in something else. A
+		# feed that disappears behind the browser it is playing under is not a feed.
+		win.always_on_top = true
 		win.theme = theme         # font + every stylebox, and Skins repaints it for free
 		win.size = VISUAL_WIN_SIZE
 		add_child(win)
+		_enable_window_fullscreen_toggle(win)   # F11 here fullscreens the FEED, not the player
 		_visual_win = win
 		var chassis := PanelContainer.new()
 		chassis.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -5151,6 +5200,45 @@ func _drop_focus(n: Node) -> void:
 	# one-shot walk would let the floor creep back up the first time a module was added.
 	if (n is Button or n is Label) and is_instance_valid(_tabs) and _tabs.is_ancestor_of(n):
 		n.set("clip_text", true)
+		if n is Label:
+			_pin_label(n as Label)
+
+## A clipped Label reports NO minimum width, so an HBoxContainer hands it nothing at all beside a
+## control that expands. That is why every caption player.tscn ships -- FADE TIME, PLAY DELAY,
+## VISUAL FEED SIZE, MAX FRAMERATE, BEAT TRACKING, VOLUME BOOST, LAYOUT -- drew as a 1 px sliver
+## with its text gone the moment clip_text was applied to everything under the tabs.
+##
+## So a clipped label is pinned to the width of the text it is carrying RIGHT NOW, and right now
+## is the whole rule: a caption is written before it is added and keeps that width for good, while
+## a readout whose text arrives later (the RAM line, the track count, the status bar) pins nothing
+## and stays clipped -- which is what still keeps a long string from putting a floor under the
+## sidebar, the thing clip_text was for.
+const LABEL_PINNED := "pinned_width"
+
+func _pin_label(l: Label) -> void:
+	if l.text.is_empty() or (l.custom_minimum_size.x > 0.0 and not l.has_meta(LABEL_PINNED)):
+		return   # empty, or a width somebody set on purpose
+	var font := l.get_theme_font("font")
+	if not font:
+		return
+	var size := l.get_theme_font_size("font_size")
+	var widest := 0.0
+	for line in l.text.split("\n"):
+		widest = maxf(widest, font.get_string_size(line, HORIZONTAL_ALIGNMENT_LEFT, -1.0, size).x)
+	l.custom_minimum_size.x = ceilf(widest)
+	l.set_meta(LABEL_PINNED, true)
+
+## Every pinned caption re-measured. The pin is a pixel width, so a new font or a new size would
+## otherwise leave every settings column measured for the old one.
+func _repin_labels() -> void:
+	var stack: Array[Node] = [self]
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		for c in n.get_children():
+			stack.append(c)
+		if n is Label and n.has_meta(LABEL_PINNED):
+			(n as Label).custom_minimum_size.x = 0.0
+			_pin_label(n as Label)
 
 # --- RECORD SET tab ----------------------------------------------------------
 ## The one colour in the program that does not come from the skin. A failed take has to read as
@@ -7090,6 +7178,7 @@ func _apply_font(file_name: String) -> void:
 			theme.default_font = f
 	_setup_pixel_font()   # re-attach the fallbacks to whatever is now in place
 	_refresh_font_btn()
+	_repin_labels()       # every caption's pinned width was measured in the old face
 
 func _refresh_font_btn() -> void:
 	if is_instance_valid(_font_btn):
@@ -7150,6 +7239,7 @@ var _asset_wins := {}                 # title -> Window, so a second press refoc
 func _apply_font_size(px: int) -> void:
 	_font_size = clampi(px, FONT_SIZE_MIN, FONT_SIZE_MAX)
 	theme.default_font_size = _font_size
+	_repin_labels()   # the pins are pixel widths, and every one of them just changed
 
 ## Long edge capped, aspect preserved. Pure, so the cap rule is checkable without a file.
 static func thumb_size(w: int, h: int, cap: int) -> Vector2i:
@@ -7372,6 +7462,11 @@ func _fill_font_list(list: Control, status: Label) -> void:
 		b.button_pressed = font_name == _font_name
 		if font_name.is_empty():
 			b.text = "PX437 (BUILT-IN)"
+			# in ITS face, like every row below it. Without this the built-in row was drawn in
+			# whatever font is currently selected, so the one row that says what you get by
+			# going back was the only one not showing it.
+			if _builtin_font:
+				b.add_theme_font_override("font", _builtin_font)
 		else:
 			b.text = font_name
 			var f := load_font_file(FONT_DIR.path_join(font_name))
@@ -7559,6 +7654,14 @@ func _rebuild_color_row() -> void:
 			# labelled, because a mono skin's swatch is one flat colour -- on WIN98 the very
 			# green of the first preset -- and in the screen colour, which reads on every accent
 			b.text = "SKIN"
+			# wide enough for the word: every other swatch is a 40 px colour chip, and this one
+			# is the only one carrying text, which clip_text was cutting to "SK"
+			# measured off the THEME, not the button: nothing is in the tree yet here, so
+			# get_theme_font() has nothing to walk up to and hands back null
+			var swatch_font: Font = theme.default_font
+			if swatch_font:
+				b.custom_minimum_size.x = maxf(b.custom_minimum_size.x, ceilf(swatch_font.get_string_size(
+					b.text, HORIZONTAL_ALIGNMENT_LEFT, -1.0, theme.default_font_size).x) + 8.0)
 			for key in ["font_color", "font_hover_color", "font_pressed_color", "font_focus_color",
 					"font_hover_pressed_color"]:
 				b.add_theme_color_override(key, Skins.scheme(_skin).screen)
