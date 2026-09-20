@@ -299,6 +299,7 @@ func _ready() -> void:
 	assert(AudioDirector.tempo_test())  # the sweep, now that it runs on a worker
 	assert(AudioEngine.key_tag_test())  # key tag parsing and the Camelot wheel
 	assert(AudioEngine.bpm_tag_test())  # BPM tag parsing, and what it refuses
+	assert(marquee_test())              # the hover scroll's wrap
 	assert(SpectralKey.spectral_key_test())  # FFT peak, chroma fold, K-S profile match
 	assert(FxRack.rack_test())
 	assert(Recorder.recorder_test())    # the take's option tables match ffmpeg          # rack boots blank, params clamp, MODULATE is exact
@@ -561,6 +562,10 @@ func _ready() -> void:
 		var list: ItemList = [_tracks, _tracks_b][deck]
 		list.item_activated.connect(_on_row_activated.bind(deck))
 		list.gui_input.connect(_on_list_scroll.bind(list))
+		# a crate is something you pull a handful of tracks out of at once
+		list.select_mode = ItemList.SELECT_MULTI
+		list.gui_input.connect(_on_list_pointer.bind(deck))
+		list.mouse_exited.connect(_marquee_stop)
 	_engine.track_ready.connect(_on_track_ready)
 	_engine.reversed_ready.connect(func(path: String, stream: AudioStream) -> void:
 		if path != _current:
@@ -827,6 +832,7 @@ func _refill(crate := -1) -> void:
 	# rows that are about to be cleared is the bug, not the fix. The write-in is TRK A's.
 	if crate != 1:
 		_write_cancel()
+	_marquee_stop()   # before the rows go: it restores text into the list it started on
 	for c in 2:
 		if crate < 0 or crate == c:
 			_fill(c)
@@ -947,7 +953,7 @@ func _recount() -> void:
 	var scope := playlist if not playlist.is_empty() \
 		else ("FILTERED" if not (_library.filters[0] as String).is_empty() else "")
 	_count.text = count_text(_library.paths.size(), (_library.shown[0] as Array).size(),
-		_library.folders.size(), secs, scope, partial)
+		_library.folders.size(), secs, scope, partial, _up_next.size())
 
 ## Each list highlights ITS deck's track, not whichever deck happens to be driven. A track
 ## filtered out of that crate's view simply has no row to select.
@@ -973,8 +979,12 @@ func _mark_decks() -> void:
 ## -- one parameter for both narrowing kinds, because the line says the same thing either
 ## way: how many of the library you are looking at, and under what name.
 static func count_text(total: int, shown: int, folders: int, secs: float,
-		scope: String, partial: bool) -> String:
+		scope: String, partial: bool, queued := 0) -> String:
 	var t := _dur_text(secs) + ("+" if partial else "")
+	# the queue rides on the TIME line rather than the count line: it is not a count OF the
+	# library, and the count line is already the longer of the two
+	if queued > 0:
+		t += "  //  QUEUE: %d" % queued
 	if not scope.is_empty():
 		return "%d TRACKS [%s: %d]\nTOTAL TIME: %s" % [total, scope, shown, t]
 	return "%d TRACKS  //  %d FOLDERS\nTOTAL TIME: %s" % [total, folders, t]
@@ -988,6 +998,10 @@ static func count_test() -> bool:
 			== "78 TRACKS  //  3 FOLDERS\nTOTAL TIME: 00:00+" \
 		and count_text(2, 2, 1, 3661.0, "", false) \
 			== "2 TRACKS  //  1 FOLDERS\nTOTAL TIME: 01:01:01" \
+		and count_text(78, 78, 3, 600.0, "", false, 4) \
+			== "78 TRACKS  //  3 FOLDERS\nTOTAL TIME: 10:00  //  QUEUE: 4" \
+		and count_text(78, 9, 3, 600.0, "LATE NIGHT", true, 2) \
+			== "78 TRACKS [LATE NIGHT: 9]\nTOTAL TIME: 10:00+  //  QUEUE: 2" \
 		and _dur_text(3725.0) == "01:02:05" and _dur_text(125.0) == "02:05"
 
 ## How many unprobed tracks one readout may probe. A search result, or a small library,
@@ -1649,7 +1663,67 @@ func _load_parked(deck: int, path: String, stream: AudioStream) -> void:
 	_note = "  //  LOADED ON %s: %s" % [AudioEngine.DECK_NAMES[deck], path.get_file()]
 	_clear_note_later()
 
+# --- UP NEXT: the hand-built queue ------------------------------------------------------
+## Tracks the user put in front of the running order, by path, in play order. PLAY NEXT pushes to
+## the FRONT (the next thing that plays), ADD TO QUEUE appends.
+##
+## This sits ON TOP of AudioEngine.queue, which is the crate's visible list and is what SHUFFLE,
+## REPEAT and auto-advance walk. While anything is in here it wins: every advance takes from this
+## first, and only when it runs dry does the running order carry on from where it was. That is
+## the whole rule, and it is why nothing here touches _engine.index -- a queued track plays and
+## the crate's place in its own list is exactly where it was.
+##
+## ponytail: session state, not saved. A queue is what you are doing in the next ten minutes, and
+## restoring one from three days ago is a list nobody asked for. Persist it if that turns out to
+## be wrong.
+var _up_next: Array[String] = []
+
+## The next queued track that still exists, played on the driven deck. Returns false when the
+## queue is empty or everything left in it has gone from disk.
+func _play_queued(auto: bool) -> bool:
+	while not _up_next.is_empty():
+		var path: String = _up_next.pop_front()
+		if not FileAccess.file_exists(path):
+			continue   # deleted or unplugged since it was queued; the queue is not a promise
+		var at := _engine.queue.find(path)
+		if at >= 0:
+			_open(at, auto)
+		else:
+			# queued from the other crate, or from under a search that has since changed: it
+			# still plays, by path, and the crate's own position stays where it is
+			_decks.auto_advancing = auto
+			_busy = true
+			_note = "  //  LOADING %s" % path.get_file()
+			_engine.load_on(_engine.deck, path)
+		_recount()   # the QUEUE count on the track readout
+		return true
+	return false
+
+## Adds `paths` to the queue and says so. `front` is PLAY NEXT: the run lands in front of whatever
+## was queued, in the order it was picked, so queueing three tracks plays them in that order.
+func _queue_tracks(paths: Array[String], front: bool) -> void:
+	if paths.is_empty():
+		return
+	if front:
+		for i in range(paths.size() - 1, -1, -1):
+			_up_next.push_front(paths[i])
+	else:
+		_up_next.append_array(paths)
+	_recount()
+	_note = "  //  %s: %s" % ["PLAYING NEXT" if front else "QUEUED",
+		paths[0].get_file() if paths.size() == 1 else "%d TRACKS" % paths.size()]
+	_clear_note_later()
+
+func _clear_queue() -> void:
+	var was := _up_next.size()
+	_up_next.clear()
+	_recount()
+	_note = "  //  QUEUE CLEARED (%d)" % was
+	_clear_note_later()
+
 func _next(auto := false) -> void:
+	if _play_queued(auto):
+		return
 	_open(_engine.next_index(), auto)
 
 func _prev() -> void:
@@ -1833,6 +1907,7 @@ func _process(delta: float) -> void:
 		_last_screen = scr
 		_refit_window_to_screen()
 	_flash = maxf(_flash - delta, 0.0)
+	_marquee_step(delta)
 	%Play.text = "PAUSE" if _state() == "PLAYING" else "PLAY"
 	# tracks the fit in wall-clock time, so the readout settles the same at any FPS
 	if _director.bpm > 0.0:
@@ -2616,6 +2691,142 @@ func _open_deck(deck: int, path: String) -> void:
 		_open(qi)
 	else:
 		_engine.load_on(deck, path)
+
+# --- hover marquee ----------------------------------------------------------------------
+## A title too long for the column scrolls while the pointer rests on it, and snaps back to the
+## clipped view the moment it leaves. One character per tick, the same idiom -- and the same
+## typeface -- as the status ticker, rather than a smooth pixel scroll that would read as a
+## different program's animation.
+##
+## The row's text is what gets rewritten, so this has to be the only thing writing it: the
+## write-in effect cancels it, and so does every refill, because both rebuild the rows underneath.
+const MARQUEE_HZ := 9.0           # characters a second
+const MARQUEE_GAP := "   //   "   # what separates the end of the title from its start again
+var _marquee_crate := -1
+var _marquee_row := -1
+var _marquee_full := ""
+var _marquee_t := 0.0
+var _marquee_at := -1   # the character index last written, so a frame that moves nothing writes nothing
+## The row a left-drag started on, for the selection run; -1 when no button is down.
+var _drag_anchor := -1
+
+func _marquee_hover(crate: int, row: int) -> void:
+	if crate == _marquee_crate and row == _marquee_row:
+		return
+	_marquee_stop()
+	if row < 0 or (_write_tween and _write_tween.is_valid()):
+		return
+	var list: ItemList = [_tracks, _tracks_b][crate]
+	if row >= list.item_count or _row_fits(list, list.get_item_text(row)):
+		return   # the row already shows all of it; scrolling would be motion for nothing
+	_marquee_crate = crate
+	_marquee_row = row
+	_marquee_full = list.get_item_text(row)
+	_marquee_t = 0.0
+	_marquee_at = -1
+
+## Whether a row's text fits the column as it stands, scrollbar and cell padding taken off.
+const MARQUEE_PADDING := 12.0
+
+func _row_fits(list: ItemList, text: String) -> bool:
+	var font := list.get_theme_font("font")
+	if not font:
+		return true
+	var width := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1.0,
+		list.get_theme_font_size("font_size")).x
+	var bar := list.get_v_scroll_bar()
+	var room := list.size.x - (bar.size.x if bar and bar.visible else 0.0) - MARQUEE_PADDING
+	return width <= room
+
+func _marquee_stop() -> void:
+	if _marquee_row < 0:
+		return
+	var list: ItemList = [_tracks, _tracks_b][_marquee_crate]
+	if _marquee_row < list.item_count:
+		list.set_item_text(_marquee_row, _marquee_full)
+	_marquee_crate = -1
+	_marquee_row = -1
+	_marquee_full = ""
+
+func _marquee_step(delta: float) -> void:
+	if _marquee_row < 0:
+		return
+	var list: ItemList = [_tracks, _tracks_b][_marquee_crate]
+	if _marquee_row >= list.item_count:
+		_marquee_stop()   # the list was rebuilt under the pointer
+		return
+	_marquee_t += delta * MARQUEE_HZ
+	var step := int(_marquee_t)
+	if step == _marquee_at:
+		return
+	# only when the CHARACTER changes, which is MARQUEE_HZ times a second rather than once a
+	# frame. set_item_text makes an ItemList re-lay out every row it holds: measured, one text
+	# change a frame costs 5.5 ms extra on a 20,000-row list and nothing at all on 5,000.
+	_marquee_at = step
+	list.set_item_text(_marquee_row, marquee_frame(_marquee_full, step))
+
+## The title at tick `step`, looping through itself with MARQUEE_GAP between the end and the
+## start. Pure, so the wrap -- the one place an off-by-one shows up as a stutter once a loop --
+## is checkable without a list or a pointer.
+static func marquee_frame(text: String, step: int) -> String:
+	if text.is_empty():
+		return text
+	var loop := text + MARQUEE_GAP
+	var at := posmod(step, loop.length())
+	return loop.substr(at) + loop.substr(0, at)
+
+static func marquee_test() -> bool:
+	var full := "ABCDEF"
+	var loop := full + MARQUEE_GAP
+	return marquee_frame(full, 0) == loop \
+		and marquee_frame(full, 1) == loop.substr(1) + loop[0] \
+		and marquee_frame(full, loop.length()) == loop \
+		and marquee_frame(full, -1) == marquee_frame(full, loop.length() - 1) \
+		and marquee_frame("", 3) == "" \
+		and marquee_frame(full, 3).length() == loop.length()
+
+## Everything the pointer does over a track list that ItemList itself does not report: the drag
+## that selects a run of rows, and the hover that scrolls a title too long for the column.
+##
+## SELECT_MULTI gives ctrl-click and shift-click for free and nothing for a drag, and pulling
+## twenty tracks into the queue should not mean shift-clicking the far end of them.
+func _on_list_pointer(e: InputEvent, crate: int) -> void:
+	var list: ItemList = [_tracks, _tracks_b][crate]
+	var click := e as InputEventMouseButton
+	if click and click.button_index == MOUSE_BUTTON_LEFT:
+		# the anchor is where the button went DOWN; ItemList has already selected that row
+		_drag_anchor = list.get_item_at_position(click.position, true) if click.pressed else -1
+		return
+	var motion := e as InputEventMouseMotion
+	if not motion:
+		return
+	var row := list.get_item_at_position(motion.position, true)
+	if _drag_anchor >= 0 and (motion.button_mask & MOUSE_BUTTON_MASK_LEFT) != 0:
+		_select_run(list, _drag_anchor, row)
+		return
+	_marquee_hover(crate, row)
+
+## The rows between the anchor and the pointer, and nothing else -- a drag REPLACES the selection
+## rather than adding to it, which is what every file manager does and what makes a mis-drag one
+## more drag to fix rather than a ctrl-click hunt.
+static func _select_run(list: ItemList, from: int, to: int) -> void:
+	if from < 0 or to < 0:
+		return
+	list.deselect_all()
+	for row in range(mini(from, to), maxi(from, to) + 1):
+		if row < list.item_count and list.is_item_selectable(row):
+			list.select(row, false)
+
+## The paths of every selected row in `crate`, in ROW order -- which is the order the user sees,
+## and so the order a queued run has to arrive in. Header rows have no path and drop out.
+func _selected_paths(crate: int) -> Array[String]:
+	var list: ItemList = [_tracks, _tracks_b][crate]
+	var row_path: PackedInt32Array = _row_paths[crate]
+	var out: Array[String] = []
+	for row in list.get_selected_items():
+		if row >= 0 and row < row_path.size() and row_path[row] >= 0:
+			out.append(_library.paths[row_path[row]])
+	return out
 
 func _on_list_scroll(e: InputEvent, list: ItemList) -> void:
 	if not (e is InputEventMouseButton and e.pressed):
@@ -5972,6 +6183,9 @@ const MENU_DECK_A := 14
 const MENU_MAKE_PLAYLIST := 17   # was 14 -- MENU_DECK_A's id, so the folder item ran PLAY ON DECK A
 const MENU_PL_UP := 15
 const MENU_PL_DOWN := 16
+const MENU_PLAY_NEXT := 18
+const MENU_QUEUE := 19
+const MENU_QUEUE_CLEAR := 20
 
 ## RMB anywhere on a row. `item_clicked` hands back the row index, so there is no
 ## hit-testing to do and no gui_input handler to write; `allow_rmb_select` in the scene is
@@ -5983,16 +6197,31 @@ func _on_item_clicked(row: int, _at: Vector2, button: int, crate: int) -> void:
 	if row < 0 or row >= row_path.size() or row_path[row] < 0:
 		return   # a FOLDER-mode header row is not a track
 	_menu_crate = crate   # REMOVE FROM / MOVE UP act on THIS list's playlist
-	_popup_track_menu(_library.paths[row_path[row]])
+	# RMB on a row that is part of the current selection means the whole selection; on any other
+	# row it means that row, which is also what the right-click has just selected
+	var path: String = _library.paths[row_path[row]]
+	var picked := _selected_paths(crate)
+	_popup_track_menu(path, picked if picked.size() > 1 and path in picked else [path] as Array[String])
 
-func _popup_track_menu(path: String) -> void:
-	_menu_ctx = {"kind": "track", "path": path}
+func _popup_track_menu(path: String, picked: Array[String] = []) -> void:
+	if picked.is_empty():
+		picked = [path] as Array[String]
+	_menu_ctx = {"kind": "track", "path": path, "picked": picked}
+	# how many tracks every item below is about, said once rather than on each line
+	var many := "" if picked.size() < 2 else "  (%d)" % picked.size()
 	%PlMenu.clear()
 	for i in _library.playlists.size():
 		%PlMenu.add_item(_library.playlists.keys()[i], PL_FIRST + i)
 	%PlMenu.add_separator()
 	%PlMenu.add_item("+ NEW PLAYLIST", MENU_NEW_PL)
 	%Menu.clear()
+	# the two queue actions lead: they are what a set is built out of, and everything below
+	# them is housekeeping
+	%Menu.add_item("PLAY NEXT%s" % many, MENU_PLAY_NEXT)
+	%Menu.add_item("ADD TO QUEUE%s" % many, MENU_QUEUE)
+	if not _up_next.is_empty():
+		%Menu.add_item("CLEAR QUEUE  (%d)" % _up_next.size(), MENU_QUEUE_CLEAR)
+	%Menu.add_separator()
 	%Menu.add_submenu_node_item("ADD TO PLAYLIST", %PlMenu)
 	%Menu.add_item("RENAME TAG", MENU_RENAME)
 	# offered only where it can do something, and it is the only way back out of a
@@ -6113,6 +6342,12 @@ func _on_menu_id(id: int) -> void:
 		_set_cue_color(cue, (_viz.PRESETS[id - COLOR_FIRST] as Color).to_html(false))
 	elif id >= PL_FIRST:
 		_file_track(_library.playlists.keys()[id - PL_FIRST], path)
+	elif id == MENU_PLAY_NEXT or id == MENU_QUEUE:
+		var picked: Array[String] = []
+		picked.assign(_menu_ctx.get("picked", [path]))
+		_queue_tracks(picked, id == MENU_PLAY_NEXT)
+	elif id == MENU_QUEUE_CLEAR:
+		_clear_queue()
 	elif id == MENU_DECK_A:
 		_play_on_deck_a(path)
 	elif id == MENU_NEW_PL:
@@ -7931,6 +8166,7 @@ var _write_rows := PackedInt32Array()
 var _write_full := PackedStringArray()
 
 func _write_in() -> void:
+	_marquee_stop()   # two things cannot own one row's text
 	if _write_tween and _write_tween.is_valid():
 		_write_tween.kill()
 		_write_restore()
