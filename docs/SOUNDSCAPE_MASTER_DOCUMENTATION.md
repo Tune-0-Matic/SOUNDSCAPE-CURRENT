@@ -1,7 +1,7 @@
 # SOUNDSCAPE (HEADLESS HORSEMAN)
 ## Technical Master Manual and Architecture Guide
 
-**Version:** V1.5 BETA · **Engine:** Godot 4.7.1 · **Native layer:** `libsoundscape_dsp` (C++ GDExtension, godot-cpp @ `6cceaf6`)
+**Version:** V1.6 BETA · **Engine:** Godot 4.7.1 · **Native layer:** `libsoundscape_dsp` (C++ GDExtension, godot-cpp @ `6cceaf6`)
 **Platforms:** Windows x86-64, Linux x86-64 · **Document revision:** 2026-09-19
 
 ---
@@ -1323,9 +1323,9 @@ development machine.
 
 | Preset | Platform | Output |
 |---|---|---|
-| `Windows Desktop` | Windows Desktop | `SOUNDSCAPE RELEASES/HEADLESS HORSEMAN/v1.5/SOUNDSCAPE BETA v1.5 WIN.zip` |
-| `Linux/X11` | Linux | `SOUNDSCAPE RELEASES/HEADLESS HORSEMAN/v1.5/linux/SOUNDSCAPE BETA v1.5 LINUX.zip` |
-| `macOS` | macOS | (v1.4 path; not part of the v1.5 release) |
+| `Windows Desktop` | Windows Desktop | `SOUNDSCAPE RELEASES/HEADLESS HORSEMAN/v1.6/SOUNDSCAPE BETA v1.6 WIN.zip` |
+| `Linux/X11` | Linux | `SOUNDSCAPE RELEASES/HEADLESS HORSEMAN/v1.6/SOUNDSCAPE LINUX v1.6.zip` |
+| `macOS` | macOS | (v1.4 path; not part of the v1.6 release) |
 
 Both presets embed the PCK into the binary and exclude `test_director.gd` and the teardown
 documents.
@@ -1339,7 +1339,8 @@ godot --headless --path . --export-release "Linux/X11"
 
 > **Trap worth knowing.** Godot does **not** create the export output directory, and does not fail
 > when it is absent. The first Linux export printed `[DONE] savepack`, exited 0, and wrote nothing
-> at all because `.../v1.5/linux/` did not exist. Always `mkdir -p` the target and `ls` the output.
+> at all because `.../v1.5/linux/` did not exist (that was the v1.5 layout). Always `mkdir -p` the
+> target and `ls` the output.
 
 ### 4.5 Release workflow, end to end
 
@@ -1361,7 +1362,7 @@ nm -D --defined-only bin/libsoundscape_dsp.linux.template_release.x86_64.so | gr
 godot --headless --path . --script res://test_<each>.gd
 
 # 5. Export both platforms
-mkdir -p "../SOUNDSCAPE RELEASES/HEADLESS HORSEMAN/v1.5/linux"
+mkdir -p "../SOUNDSCAPE RELEASES/HEADLESS HORSEMAN/v1.6"
 godot --headless --path . --export-release "Windows Desktop"
 godot --headless --path . --export-release "Linux/X11"
 ```
