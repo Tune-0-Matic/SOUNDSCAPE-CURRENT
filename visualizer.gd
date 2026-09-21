@@ -8,10 +8,10 @@ extends Control
 
 ## SNAKE is last and deliberately outside the normal cycle: player.gd's VIZ_NAMES only
 ## reaches it once the code has been typed, so an unlocked mode cannot be stumbled into.
-## COUNTACH is CRUISE's road with the LP5000 S parked on it instead of the original wedge.
+## MUSTANG is CRUISE's road with a 2004 New Edge parked on it instead of the original wedge.
 ## It goes BEFORE snake, never after: player.gd hides the LAST entry until SNAKE is unlocked.
 enum Mode { SEGMENTS, MIRROR, WATERFALL, GRID, RADIAL, MATRIX, TUNNEL, CRUISE, FIRE, KALEIDO,
-	COUNTACH, SNAKE }
+	MUSTANG, SNAKE }
 
 const PRESETS: Array[Color] = [
 	Color(0.18, 0.8, 0.443),   # green
@@ -121,7 +121,7 @@ var _fire_img: Image
 var _fire_tex: ImageTexture
 var _road_phase := 0.0
 var _car := Countach.new()
-var _car_s := CountachS.new()   # the LP5000 S, for COUNTACH mode; CRUISE keeps the original
+var _mustang := Mustang.new()   # for MUSTANG mode; CRUISE keeps the original wedge
 
 func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -149,7 +149,7 @@ func _ready() -> void:
 	_field_mat.shader = load("res://viz_field.gdshader")
 	_field_mat.set_shader_parameter("palette", _pal_tex)
 	add_child(_car)  # child so its _process drives the suspension jitter
-	add_child(_car_s)
+	add_child(_mustang)
 
 ## Wide enough that a gradient reads as a gradient across the display and narrow enough that
 ## rebuilding it every frame is nothing: 64 colours against the 2,240 the fire used to build.
@@ -476,7 +476,7 @@ func _process(delta: float) -> void:
 	elif mode == Mode.TUNNEL:
 		# flight speed rides the bass; SPEED scales the whole thing
 		_tun_phase += delta * (0.35 + bass * 2.4) * lerpf(0.5, 2.2, speed)
-	elif mode == Mode.CRUISE or mode == Mode.COUNTACH:
+	elif mode == Mode.CRUISE or mode == Mode.MUSTANG:
 		_road_phase += delta * (2.0 + bass * 9.0) * lerpf(0.5, 2.0, speed)
 	_sync_field_material()
 	queue_redraw()
@@ -508,7 +508,7 @@ func _draw() -> void:
 		Mode.CRUISE: _draw_cruise(_car)
 		Mode.FIRE: _draw_fire()
 		Mode.KALEIDO: _draw_kaleido()
-		Mode.COUNTACH: _draw_cruise(_car_s)
+		Mode.MUSTANG: _draw_cruise(_mustang)
 		Mode.SNAKE: _draw_snake()
 
 ## Classic lit-cell ladder. Every coordinate is snapped to an integer or the low-res
@@ -640,6 +640,10 @@ func _draw_tunnel() -> void:
 # than to stand up a 3D pipeline for, and it keeps the pixel snapping the other modes use.
 
 const EYE_Y := 1.30          # camera height above the road plane
+## Where the car is parked. A const rather than a local because Mustang prunes every surface
+## that faces away from this camera at BUILD time: move the car or the eye and that pruning
+## is for a view nobody is looking from. test_viz_fps checks the two still agree.
+const CAR_Z := 6.2
 const ROAD_HALF := 5.0       # half width of the tarmac
 const VERGE := 6.4           # x offset of the EQ bars
 const Z_NEAR := 0.55
@@ -680,7 +684,7 @@ func _quad(a: Vector3, b: Vector3, c: Vector3, d: Vector3, col: Color) -> void:
 func _depth_fade(z: float, c: Color) -> Color:
 	return Color(c, clampf(1.0 - (z - Z_NEAR) / Z_FAR, 0.12, 1.0))
 
-## `car` is the only thing that differs between CRUISE and COUNTACH: same road, same sun,
+## `car` is the only thing that differs between CRUISE and MUSTANG: same road, same sun,
 ## same verge bars, a different wireframe parked on it. Passing the car in rather than
 ## copying the mode wholesale means the road can never drift apart between the two.
 func _draw_cruise(car: Countach) -> void:
@@ -724,7 +728,7 @@ func _draw_cruise(car: Countach) -> void:
 			_seg(Vector3(x0, pk, bz), Vector3(sx, pk, bz), Color(c, f.a))  # peak rail
 
 	# --- the car: square to the road, wheels sitting on the road plane
-	var cz := 6.2
+	var cz := CAR_Z
 	var body := Color(c, 1.0)
 	var pts := car.edges()
 	var i := 0

@@ -11,7 +11,7 @@ extends SceneTree
 ##   4. nobody can see it: inside a SubViewport switched to UPDATE_DISABLED -- what its container
 ##      does while a Video TEST picture hides the cell -- _process does no work, and wakes when on
 ##   5. the field shader is on for WATERFALL and FIRE only, and comes off when either is left
-##   6. the COUNTACH car's silhouette holds up, and SNAKE is still the last mode in the enum
+##   6. the MUSTANG car's silhouette holds up, and SNAKE is still the last mode in the enum
 ##   godot --headless --path . --script res://test_viz_fps.gd
 
 const RATES := [60.0, 144.0, 240.0]
@@ -170,12 +170,21 @@ func _initialize() -> void:
 	print("field shader on for FIRE / CRUISE / WATERFALL / SEGMENTS in turn: %s: %s" % [mats, field_only])
 	shader_viz.free()
 
-	# 6. the LP5000 S silhouette: denser than the car it replaces, nothing under the road, and
-	# the wing, the flares and the engine louvres all still there. Pure geometry, no viewport.
-	var shape := CountachS.model_test()
+	# 6. the New Edge silhouette: the tri-bar lights, the roof as the highest point, nothing
+	# left ahead of the cabin to bleed through the trunk. Pure geometry, no viewport.
+	var shape := Mustang.model_test()
 	ok = ok and shape
-	print("countach LP5000 S silhouette (wing V, rear flare, louvres, edge budget): %s" % shape)
-	# and COUNTACH must not have landed after SNAKE, which is the slot player.gd hides
+	print("mustang rear silhouette (tri-bars, roofline, stance, nothing ahead): %s" % shape)
+	# the car hides its own back faces against a camera it holds as a constant; if the
+	# visualizer's camera moves, it is pruning itself for a view nobody is looking from
+	# to a tolerance, not exactly: a Vector3 holds float32, so EYE.y is 1.2999999523 against
+	# the const's float64 1.30 and an == here fails on a camera that has not moved at all
+	var eye_agrees: bool = absf(Mustang.EYE.y - Visualizer.EYE_Y) < 0.001 \
+		and absf(Mustang.EYE.z + Visualizer.CAR_Z) < 0.001 and absf(Mustang.EYE.x) < 0.001
+	ok = ok and eye_agrees
+	print("the car's cull camera still matches the visualizer's (%s vs %.2f up / %.2f back): %s" % [
+		Mustang.EYE, Visualizer.EYE_Y, Visualizer.CAR_Z, eye_agrees])
+	# and MUSTANG must not have landed after SNAKE, which is the slot player.gd hides
 	var last_is_snake: bool = Visualizer.Mode.keys()[Visualizer.Mode.size() - 1] == "SNAKE"
 	ok = ok and last_is_snake
 	print("SNAKE is still the last mode (the unlock gate hides the last one): %s" % last_is_snake)

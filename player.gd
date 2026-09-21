@@ -2632,7 +2632,7 @@ func _refresh_skin_ramps() -> void:
 
 ## SNAKE is last and only reachable once unlocked -- see _viz_mode_count().
 const VIZ_NAMES := ["SEGMENTS", "MIRROR", "WATERFALL", "GRID", "RADIAL", "MATRIX",
-	"TUNNEL", "CRUISE", "FIRE", "KALEIDO", "COUNTACH", "SNAKE"]
+	"TUNNEL", "CRUISE", "FIRE", "KALEIDO", "MUSTANG", "SNAKE"]
 ## Order matches Visualizer.ColorAnim exactly -- the enum is the index into this list.
 const COLOR_ANIM_NAMES := ["STATIC", "FADE", "LEFT-RIGHT", "WAVE"]
 var _anim_btn: Button
