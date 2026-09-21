@@ -1322,6 +1322,17 @@ func _save() -> void:
 	# defaults over the real file -- test scripts drive methods on a detached player.gd.
 	if _rebooting or not is_node_ready():
 		return
+	_write_cfg_async(_build_cfg())
+
+## Every setting, cue, playlist, tag and keybind as a ConfigFile, built from live state on the
+## main thread.
+##
+## Split out of _save() so EXPORT SETUP can have the same object WITHOUT going through the
+## file. _save() hands the write to a worker, so loading the config back in the line after
+## calling it races that worker and reads the PREVIOUS save -- which is precisely how the
+## first version of the export came out carrying last session's tags while the note cheerfully
+## reported the current ones.
+func _build_cfg() -> ConfigFile:
 	var cfg := ConfigFile.new()
 	cfg.set_value("library", "folders", _library.folders)
 	cfg.set_value("library", "enabled_folders", _library.enabled_folders.keys())
@@ -1418,7 +1429,7 @@ func _save() -> void:
 			"mode": int(v.mode), "color": v.color_index, "custom": v.custom_color.to_html(false),
 			"sens": v.sensitivity,
 			"tilt": v.tilt_db, "height": v.height_scale, "speed": v.speed})
-	_write_cfg_async(cfg)
+	return cfg
 
 ## The config is BUILT on the main thread -- every value above is read straight off live state,
 ## and snapshotting it anywhere else would be a data race -- but the three file operations that
@@ -2850,6 +2861,8 @@ func _open_deck(deck: int, path: String) -> void:
 const TOOLS := [
 	["METADATA", "meta", "TITLE, ARTIST AND ALBUM, WRITTEN INTO A TAGGED COPY"],
 	["FILE INFO", "info", "WHAT THE FILE IS: CODEC, RATE, DEPTH, TAGS, SIZE AND PATH"],
+	["EXPORT SETUP", "export", "CUES, PLAYLISTS, TAGS, KEYBINDS AND SETTINGS INTO ONE FILE"],
+	["IMPORT SETUP", "import", "READ THAT FILE BACK -- CUES AND PLAYLISTS LAND AT ONCE"],
 ]
 var _tool_windows := {}   # kind -> Window
 
@@ -2928,6 +2941,103 @@ func _open_tool(kind: String) -> void:
 	match kind:
 		"meta": _open_metadata_tool()
 		"info": _open_file_info()
+		"export": _pick_setup_file(true)
+		"import": _pick_setup_file(false)
+
+# --- EXPORT / IMPORT SETUP ------------------------------------------------------------------
+## Everything worth carrying to another machine already lives in ONE ConfigFile -- cues under
+## [cues], playlists and their cue sets under [playlists], RENAME tags under [library], the key
+## map under [keybinds], and every setting beside them. So the export is that file, written
+## where the user asks for it, rather than a second serialiser with its own idea of the shape.
+## A .cfg out is also a .cfg a user can open and read, which a JSON blob of the same data is
+## not, and it round-trips every Variant type the config already holds (Vector2 among them)
+## without the quoting games JSON would need.
+const SETUP_FILTER := "*.cfg ; SOUNDSCAPE SETUP"
+var _setup_dialog: FileDialog
+
+## One dialog, rebuilt per use: SAVE for the export, OPEN for the import.
+func _pick_setup_file(saving: bool) -> void:
+	if not is_instance_valid(_setup_dialog):
+		_setup_dialog = FileDialog.new()
+		_setup_dialog.access = FileDialog.ACCESS_FILESYSTEM
+		_setup_dialog.use_native_dialog = true
+		_setup_dialog.theme = theme
+		add_child(_setup_dialog)
+	for c in _setup_dialog.file_selected.get_connections():
+		_setup_dialog.file_selected.disconnect(c["callable"])
+	_setup_dialog.clear_filters()
+	_setup_dialog.add_filter(SETUP_FILTER)
+	_setup_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE if saving else FileDialog.FILE_MODE_OPEN_FILE
+	_setup_dialog.title = "EXPORT SETUP" if saving else "IMPORT SETUP"
+	_setup_dialog.current_path = "%s/soundscape_setup.cfg" % OS.get_system_dir(OS.SYSTEM_DIR_DOCUMENTS)
+	_setup_dialog.file_selected.connect(_export_setup if saving else _import_setup)
+	_setup_dialog.popup_centered(Vector2i(900, 600))
+
+func _export_setup(path: String) -> void:
+	if not is_node_ready():
+		return
+	var cfg := _build_cfg()   # live state, in memory: see _build_cfg on why not via the file
+	# a stamp, so a file found in six months says what wrote it and when
+	cfg.set_value("setup", "version", ProjectSettings.get_setting("application/config/version", ""))
+	cfg.set_value("setup", "exported", Time.get_datetime_string_from_system(false, true))
+	if cfg.save(path) != OK:
+		_note = "  //  [!] COULD NOT WRITE %s" % path.get_file()
+	else:
+		_note = "  //  EXPORTED %d CUE SETS, %d PLAYLISTS TO %s" % [
+			(_library.cues as Dictionary).size(), (_library.playlists as Dictionary).size(),
+			path.get_file()]
+	_clear_note_later()
+
+## What comes back in, and what has to wait. The DATA -- cues, playlist membership and their
+## cue sets, RENAME tags -- is applied live and is on screen immediately, because that is what
+## somebody moving between machines is actually after. The SETTINGS are merged into the config
+## and take effect on the next launch: _load() runs once, against a UI that is still being
+## built, and re-running it over a live player would mean re-applying forty things by hand for
+## the ones that have an _apply_ and silently missing the ones that do not.
+func _import_setup(path: String) -> void:
+	var cfg := ConfigFile.new()
+	if cfg.load(path) != OK:
+		_note = "  //  [!] NOT A SETUP FILE: %s" % path.get_file()
+		_clear_note_later()
+		return
+	# the same four reads _load() does, in the same order and through the same migration: a
+	# setup file is a config file, so a file written by an older build comes in path-keyed and
+	# has to be re-keyed to track ids exactly as one found on disk at boot would be
+	_library.cues = _library.migrate_keys(_cfg_dict(cfg, "cues", "tracks"))
+	_library.labels = _library.migrate_keys(_cfg_dict(cfg, "library", "track_labels"))
+	_library.playlists = _library.migrate_keys(_cfg_dict(cfg, "playlists", "list"))
+	for name in _library.playlists:
+		var ids: Array = []
+		for entry in (_library.playlists[name] as Array):
+			ids.append(_library.id_for(str(entry)) if str(entry).contains("/") else entry)
+		_library.playlists[name] = ids
+	_library.pl_cues = _cfg_dict(cfg, "playlists", "cues")
+	for name in _library.pl_cues:
+		_library.pl_cues[name] = _library.migrate_keys(_library.pl_cues[name])
+	# a playlist scope that did not come with the file would leave both crates showing an
+	# empty list with no way back
+	for c in 2:
+		if not _library.playlists.has(_library.crate_pl[c]):
+			_library.crate_pl[c] = ""
+	_refresh_playlists()
+	_refill()
+	_cue_overlay.queue_redraw()
+	# ONE write, not a merge followed by a save: _save() rebuilds the file from live state, so
+	# it would take the imported settings straight back out again a moment later. The live
+	# state (with the library data imported above) is the base, and the file's own sections go
+	# over the top of it. The scan roots come too -- a setup file from another machine can
+	# point at paths that do not exist here, and RELOCATE beside REMOVE FOLDER is how that is
+	# fixed; dropping them instead would import a library with nothing in it to show.
+	var merged := _build_cfg()
+	for section in cfg.get_sections():
+		if section == "setup":
+			continue
+		for key in cfg.get_section_keys(section):
+			merged.set_value(section, key, cfg.get_value(section, key))
+	_write_cfg_async(merged)
+	_note = "  //  IMPORTED %d CUE SETS, %d PLAYLISTS  //  SETTINGS APPLY ON NEXT LAUNCH" % [
+		(_library.cues as Dictionary).size(), (_library.playlists as Dictionary).size()]
+	_clear_note_later()
 
 ## FILE INFO: what the file actually is, read from the file. The same probe TRACK INFO uses,
 ## laid out where it can be read and left open while other tracks play.
@@ -3022,10 +3132,19 @@ func _open_metadata_tool() -> void:
 ## window is sitting next to. DISPLAY is the VFD readout -- what is playing and who by, nothing
 ## else. CASUAL is the whole answer: a bar, the times, and enough transport to work it without
 ## going back to the player. COMPACT is a title and a hairline of progress.
-const NOW_MODES := ["DISPLAY", "CASUAL", "COMPACT"]
+## MARQUEE is the fourth: a strip with nothing in it but the artist and title, running right to
+## left for as long as it is open. It uses the SAME marquee_frame() the hover scroll on a track
+## row uses -- one character a tick in the program's own typeface, not a pixel slide, so the two
+## scrolls in this program look like the same program.
+const NOW_MODES := ["DISPLAY", "CASUAL", "COMPACT", "MARQUEE"]
 ## Opening size per mode. A FLOOR, not a rule: the fit below grows the window to whatever the
 ## contents actually measure in the font the user picked, and the corner drags it bigger.
-const NOW_MODE_SIZES := [Vector2i(420, 64), Vector2i(500, 116), Vector2i(380, 52)]
+## MARQUEE opens wider than the rest for one reason: the mode button and the close button are
+## fixed width, so on a short strip they take nearly half of it and the scroll runs in what is
+## left. They stay -- a borderless window has no title bar, so without its own X this one
+## could not be closed -- but the text gets the room instead of them.
+const NOW_MODE_SIZES := [Vector2i(420, 64), Vector2i(500, 116), Vector2i(380, 52), Vector2i(620, 44)]
+const NOW_MARQUEE := 3
 ## The padding strip round the contents. No control reaches into it, so a press there is
 ## unambiguously the window's own: the right and bottom strips resize, a press anywhere else drags.
 const NOW_EDGE := 8
@@ -3109,6 +3228,8 @@ func _toggle_now_playing(on: bool) -> void:
 		_now_artist.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		_now_artist.theme_type_variation = &"Green"
 		col.add_child(_now_artist)
+	elif _now_mode == NOW_MARQUEE:
+		pass   # the title line IS the window; no bar, no clock, nothing under it
 	else:
 		_now_bar = ProgressBar.new()
 		_now_bar.show_percentage = false
@@ -3195,6 +3316,12 @@ func _now_update() -> void:
 	if is_instance_valid(_now_artist):
 		_now_title.text = what.to_upper()
 		_now_artist.text = who.to_upper() if not who.is_empty() else "-"
+	elif _now_mode == NOW_MARQUEE:
+		# one character a tick off the wall clock rather than an accumulator: this runs from
+		# _process, and a strip left open for an hour must not drift because some frames were
+		# long. A track with nothing playing still scrolls -- it says so, going past.
+		var line := ("%s - %s" % [who, what] if not who.is_empty() else what).to_upper()
+		_now_title.text = marquee_frame(line, int(Time.get_ticks_msec() * 0.001 * MARQUEE_HZ))
 	else:
 		_now_title.text = ("%s - %s" % [who, what] if not who.is_empty() else what).to_upper()
 	if is_instance_valid(_now_time):
@@ -6883,6 +7010,7 @@ const MENU_PL_DOWN := 16
 const MENU_PLAY_NEXT := 18
 const MENU_QUEUE := 19
 const MENU_QUEUE_CLEAR := 20
+const MENU_CUES := 21
 
 ## RMB anywhere on a row. `item_clicked` hands back the row index, so there is no
 ## hit-testing to do and no gui_input handler to write; `allow_rmb_select` in the scene is
@@ -6946,13 +7074,18 @@ func _popup_track_menu(path: String, picked: Array[String] = []) -> void:
 	# offered only where it can do something, and it is the only way back out of a
 	# mis-click on ADD TO PLAYLIST
 	var playlist: String = _library.crate_pl[_menu_crate]
-	if not playlist.is_empty() and _library.id_for(path) in _library.playlists.get(playlist, []):
-		%Menu.add_item("REMOVE FROM %s" % playlist, MENU_UNFILE)
+	# offered when ANY of the bundle is filed here, not just the row under the pointer: the
+	# item removes all of them, so it has to appear whenever there is something to remove
+	if not playlist.is_empty() and _filed_count(playlist, picked) > 0:
+		%Menu.add_item("REMOVE FROM %s%s" % [playlist, many], MENU_UNFILE)
 		# manual rearrangement: only meaningful while VIEWING the playlist the track is
-		# actually filed in, which not is_empty() + the membership check above both cover
-		%Menu.add_item("MOVE UP IN PLAYLIST", MENU_PL_UP)
-		%Menu.add_item("MOVE DOWN IN PLAYLIST", MENU_PL_DOWN)
+		# actually filed in, which not is_empty() + the membership check above both cover.
+		# Single-track only -- moving nine rows "up one" has no meaning anyone agrees on.
+		if picked.size() == 1:
+			%Menu.add_item("MOVE UP IN PLAYLIST", MENU_PL_UP)
+			%Menu.add_item("MOVE DOWN IN PLAYLIST", MENU_PL_DOWN)
 	%Menu.add_item("PLAY ON DECK A", MENU_DECK_A)
+	%Menu.add_item("EDIT CUES", MENU_CUES)
 	%Menu.add_item("TRACK INFO", MENU_INFO)
 	%Menu.add_separator()
 	%Menu.add_item("DELETE FROM DISK", MENU_DELETE)
@@ -7090,9 +7223,9 @@ func _on_menu_id(id: int) -> void:
 			_reindex()   # the row text and the search haystack are both built there
 			_save_soon())
 	elif id == MENU_UNFILE:
-		(_library.playlists[_library.crate_pl[_menu_crate]] as Array).erase(_library.id_for(path))
-		_refill()
-		_save_soon()
+		_remove_from_playlist(_library.crate_pl[_menu_crate], picked)
+	elif id == MENU_CUES:
+		_edit_cues(path)
 	elif id == MENU_PL_UP or id == MENU_PL_DOWN:
 		var order: Array[String] = []
 		order.assign(_library.playlists.get(_library.crate_pl[_menu_crate], []))
@@ -7172,6 +7305,42 @@ MOVES THE FILE TO THE RECYCLE BIN AND FORGETS ITS CUES, TAG AND PLAYLIST ENTRIES
 		_confirm("DELETE PLAYLIST %s\nAND ITS %d CUE SETS?" % [_menu_ctx.get("playlist", ""),
 			(_library.pl_cues.get(_menu_ctx.get("playlist", ""), {}) as Dictionary).size()],
 			_delete_playlist.bind(_menu_ctx.get("playlist", "")))
+
+## How many of `paths` are filed under `name`. What decides whether REMOVE FROM PLAYLIST is
+## worth offering, and it counts the whole bundle rather than the row under the pointer.
+func _filed_count(name: String, paths: Array[String]) -> int:
+	var list: Array = _library.playlists.get(name, [])
+	var n := 0
+	for path in paths:
+		if list.has(_library.id_for(path)):
+			n += 1
+	return n
+
+## Takes every track in `paths` out of `name`. The bundle, for the same reason _file_track
+## takes it: REMOVE FROM PLAYLIST is offered on a multi-selection like everything else in that
+## menu, and pulling one track out of nine highlighted ones is not what the highlight says.
+func _remove_from_playlist(name: String, paths: Array[String]) -> void:
+	var list: Array = _library.playlists.get(name, [])
+	var gone := 0
+	for path in paths:
+		var id := _library.id_for(path)
+		if list.has(id):
+			list.erase(id)
+			gone += 1
+	_library.playlists[name] = list
+	_note = "  //  REMOVED FROM %s" % name if gone == 1 else "  //  REMOVED %d FROM %s" % [gone, name]
+	_clear_note_later()
+	_refill()   # the rows just left this crate's scope
+	_save_soon()
+
+## EDIT CUES. A track's markers are drawn on the SCRUB BAR and edited there -- dragged along
+## it, right-clicked for colour, scope, key and timestamp -- so editing them means putting the
+## track on the transport. That is all this does, plus say where to go next; a second cue
+## editor in a window would be a second place for the same markers to disagree about.
+func _edit_cues(path: String) -> void:
+	_open_deck(_engine.deck, path)
+	_note = "  //  CUES FOR %s ARE ON THE SCRUB BAR -- DRAG A MARKER, OR RIGHT-CLICK IT" % path.get_file()
+	_clear_note_later()
 
 ## Files every track in `paths` under `name`, skipping the ones already there. Takes the bundle
 ## rather than one path because ADD TO PLAYLIST is offered on a multi-selection: it read only
