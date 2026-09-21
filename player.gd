@@ -316,8 +316,12 @@ func _ready() -> void:
 	assert(AudioEngine.deck_test())     # crossfader gain law and its silence floor
 	assert(write_in_test())             # which rows the write-in is allowed to touch
 	assert(AudioDirector.sync_test())   # beat-sync offset wraps to the nearest beat
+	assert(MidiMap.midi_test())         # MIDI keys, both relative encodings, and clash refusal
 	# same source as the BIOS POST line and STATS VERSION, so one bump in project.godot moves all three
 	$Margin/Main/TopHeaderBar/HB/Title.text += " %s" % ProjectSettings.get_setting("application/config/version", "")
+	# Nothing arrives until this is called -- no events, and an empty device list. Called before
+	# the config loads so a binding read a moment later has somewhere to arrive from.
+	OS.open_midi_inputs()
 	# seeded unconditionally, not inside the config branch below: a first run with no
 	# library.cfg yet must still ship with working shortcuts, not a silently empty map
 	for action in KEYBIND_SPEC:
@@ -486,6 +490,9 @@ func _ready() -> void:
 				if k != KEY_NONE:
 					seen[k] = true
 				_keybinds[action] = k
+		# MidiMap validates and de-duplicates on the way in the same way the block above does,
+		# because this is a hand-editable file and one bad entry must cost that entry only
+		_midi.from_dict(_cfg_dict(cfg, "midibinds", "map"))
 		# the spectral estimate cache, keyed by str(hash(path)) -- this is what makes a
 		# background analysis pass a ONE-TIME cost rather than something every rescan repeats
 		_rack_cfg_decks[0] = _cfg_dict(cfg, "rack", "state")
@@ -1403,6 +1410,9 @@ func _build_cfg() -> ConfigFile:
 	cfg.set_value("visual", "fade_speed", _fade_speed)
 	for action in KEYBIND_SPEC:
 		cfg.set_value("keybinds", action, _keybinds[action])
+	# one key holding the whole map, rather than key-per-action: [keybinds] is shaped that way
+	# because KEYBIND_SPEC is its schema, and a binding here is a dictionary, not an int
+	cfg.set_value("midibinds", "map", _midi.to_dict())
 	if _rack_decks.size() == 2:
 		cfg.set_value("rack", "state", _rack_decks[0].to_dict())
 		cfg.set_value("rack", "state_b", _rack_decks[1].to_dict())
@@ -1519,6 +1529,7 @@ func _notification(what: int) -> void:
 			_engine.save_index(_library.all_paths)   # after the join, so no worker is still writing _meta
 		_library.stop_scan()   # a walk still running has nothing left to report to
 		_finish_cfg_write()    # the config write is on a worker; the process may not outrun it
+		OS.close_midi_inputs()   # hands the device back rather than holding it until the OS notices
 	# A drag begins somewhere and ends somewhere; Godot tells every Control about both
 	# but never says where. So the tab under the cursor is noted at the start, and at the
 	# end the cursor is asked again -- if the drag was not consumed by anything (the tab
@@ -1973,16 +1984,19 @@ func _on_scrub_input(e: InputEvent) -> void:
 func _on_vol_input(e: InputEvent) -> void:
 	var w := _bar_wheel(e, _volume / 100.0, BAR_WHEEL_COARSE)
 	if w >= 0.0:
-		_volume = w * 100.0
-		_vol.value = _volume
-		_apply_volume()
-		_save_soon()
+		_set_volume(w * 100.0)
 		return
 	if _bar_drag(e, _vol):
-		_volume = _ratio_at(e.position.x, _vol.size.x) * 100.0
-		_vol.value = _volume
-		_apply_volume()
-		_save_soon()
+		_set_volume(_ratio_at(e.position.x, _vol.size.x) * 100.0)
+
+## Master volume by NUMBER, 0-100. Extracted from the drag handler above because it was the only
+## way in: every value this program can be set to should be reachable without a mouse, and a MIDI
+## fader has no position to drag from.
+func _set_volume(v: float) -> void:
+	_volume = clampf(v, 0.0, 100.0)
+	_vol.value = _volume
+	_apply_volume()
+	_save_soon()
 
 # --- readout --------------------------------------------------------------
 var _bar_seen: AudioStreamPlayer   # the player _process last saw the bar on
@@ -2787,16 +2801,33 @@ func _setup_visual() -> void:
 		_apply_dual_visual())
 	_apply_dual_visual()
 
-	%VizMode.pressed.connect(func() -> void:
-		_viz.mode = ((_viz.mode + 1) % _viz_mode_count()) as Visualizer.Mode
-		_refresh_visual()
-		_save())
+	%VizMode.pressed.connect(func() -> void: _cycle_viz_mode(1))
 	for bar in [%Sens, %Tilt, %Height, %Speed]:
 		bar.gui_input.connect(_on_viz_bar.bind(bar))
 		# TILT is the one of the four that is not a percentage -- it is a dB slope
 		_hover_note(bar, func() -> String: return "%s: %s" % [bar.name.to_upper(),
 			("%.1f DB" % _viz.tilt_db) if bar == %Tilt else "%d%%" % int(bar.value)])
 	_refresh_visual()
+
+## The MODE button's own action, given a name so something other than a click can reach it.
+## `step` is in whole modes, so an encoder walks the list in both directions.
+func _cycle_viz_mode(step: int) -> void:
+	_viz.mode = posmod(_viz.mode + step, _viz_mode_count()) as Visualizer.Mode
+	_refresh_visual()
+	_save()
+
+## The same walk across the COLOUR row, which had no cycle of its own: every swatch is a button
+## that hard-sets its own index, so there was nothing for a knob to turn. The row runs from
+## CUSTOM_INDEX (-2) through SKIN (-1), the presets, the rainbow and then the saved gradients, and
+## wrapping over that whole span is what makes one encoder reach all of them.
+func _cycle_viz_color(step: int) -> void:
+	# the exact span _rebuild_color_row draws, so a turn of the knob can reach every swatch that
+	# is on screen and land on nothing that is not
+	var first := Visualizer.CUSTOM_INDEX                                  # -2, the lowest slot
+	var past_end: int = _viz.PRESETS.size() + 1 + _gradients.size()       # presets, rainbow, gradients
+	_viz.color_index = first + posmod(_viz.color_index - first + step, past_end - first)
+	_rebuild_color_row()
+	_save()
 
 func _refresh_visual() -> void:
 	%VizMode.text = "MODE: %s" % VIZ_NAMES[_viz.mode]
@@ -2888,6 +2919,7 @@ const TOOLS := [
 	["FILE INFO", "info", "WHAT THE FILE IS: CODEC, RATE, DEPTH, TAGS, SIZE AND PATH"],
 	["EXPORT SETUP", "export", "CUES, PLAYLISTS, TAGS, KEYBINDS AND SETTINGS INTO ONE FILE"],
 	["IMPORT SETUP", "import", "READ THAT FILE BACK -- CUES AND PLAYLISTS LAND AT ONCE"],
+	["MIDI SETUP", "midi", "DEVICES, A LIVE MONITOR, AND LEARN FOR EVERY MAPPABLE ACTION"],
 ]
 var _tool_windows := {}   # kind -> Window
 
@@ -2968,6 +3000,7 @@ func _open_tool(kind: String) -> void:
 		"info": _open_file_info()
 		"export": _pick_setup_file(true)
 		"import": _pick_setup_file(false)
+		"midi": _open_midi_window()
 
 # --- EXPORT / IMPORT SETUP ------------------------------------------------------------------
 ## Everything worth carrying to another machine already lives in ONE ConfigFile -- cues under
@@ -3044,6 +3077,15 @@ func _import_setup(path: String) -> void:
 	for c in 2:
 		if not _library.playlists.has(_library.crate_pl[c]):
 			_library.crate_pl[c] = ""
+	# MIDI bindings come in LIVE with the data rather than waiting for a relaunch like the rest
+	# of the settings: a setup file carried to another machine is usually carried with the
+	# controller, and a mapper that shows the imported binds only after a restart reads as an
+	# import that did not work.
+	var imported_midi := _cfg_dict(cfg, "midibinds", "map")
+	if not imported_midi.is_empty():
+		_midi.from_dict(imported_midi)
+		for action in MidiMap.ACTIONS:
+			_refresh_midi_row(str(action))   # no-op unless the mapper happens to be open
 	_refresh_playlists()
 	_refill()
 	_cue_overlay.queue_redraw()
@@ -3063,6 +3105,346 @@ func _import_setup(path: String) -> void:
 	_note = "  //  IMPORTED %d CUE SETS, %d PLAYLISTS  //  SETTINGS APPLY ON NEXT LAUNCH" % [
 		(_library.cues as Dictionary).size(), (_library.playlists as Dictionary).size()]
 	_clear_note_later()
+
+# --- MIDI ------------------------------------------------------------------------------------
+## Control surfaces. Godot delivers MIDI as InputEventMIDI once OS.open_midi_inputs() has been
+## called, and delivers NOTHING before that -- which is the first thing to check when a
+## controller looks dead.
+##
+## The table of actions and every piece of arithmetic lives in midi_map.gd. What is here is the
+## three things that need the player: routing an event, running an action, and the window.
+##
+## INPUT ONLY. Godot 4.7.1 has no MIDI output of any kind (verified against the binary: there is
+## no open_midi_outputs and no send_midi), so a controller's lights, VU meters and motorised
+## anything cannot be driven from here. Bindings are one-way, permanently, unless MIDI out goes
+## into libsoundscape_dsp.
+var _midi := MidiMap.new()
+var _midi_learn := ""                       # the action currently listening, or ""
+var _midi_monitor: Label                    # the live message line, while the window is open
+var _midi_device: OptionButton
+var _midi_rows := {}                        # action -> [assignment Label, LEARN Button, mode Button]
+## One click of a relative encoder, as a fraction of a fader's travel. 127 clicks end to end,
+## which is one MIDI step per click and about a full turn of a detented knob.
+const MIDI_NUDGE := 1.0 / 127.0
+## And one click of a jog wheel, in seconds of playhead.
+const MIDI_JOG_SEC := 0.10
+
+func _route_midi(e: InputEventMIDI) -> void:
+	if is_instance_valid(_midi_monitor):
+		_midi_monitor.text = MidiMap.describe(e)
+	if not _midi_learn.is_empty():
+		_finish_midi_learn(e)
+		return
+	var action := _midi.action_for(MidiMap.event_key(e))
+	if not action.is_empty():
+		_run_midi(action, e)
+
+## Arms a row. Mirrors _start_rebind exactly, including the timer that re-checks before it
+## cancels -- a capture that finished half a second ago must not be killed by its own stale timer.
+func _start_midi_learn(action: String) -> void:
+	if not _midi_learn.is_empty():
+		var was := _midi_learn
+		_midi_learn = ""
+		_refresh_midi_row(was)         # cancel whichever row was already listening
+	_midi_learn = action
+	var row: Array = _midi_rows.get(action, [])
+	if row.size() == 3:
+		(row[1] as Button).text = "[ TOUCH ]"
+	get_tree().create_timer(REBIND_TIMEOUT_SEC).timeout.connect(func() -> void:
+		if _midi_learn != action:
+			return
+		_midi_learn = ""
+		_refresh_midi_row(action)
+		_note = "  //  MIDI LEARN TIMED OUT"
+		_clear_note_later())
+
+## The first message that arrives while a row is listening takes the binding.
+##
+## A note-OFF is ignored rather than bound: pressing a pad sends both, and binding on the release
+## would make every pad learn itself twice with the second one winning. Message types this does
+## not map are ignored too, so an aftertouch-happy controller cannot steal the capture from the
+## pad somebody is actually pressing.
+func _finish_midi_learn(e: InputEventMIDI) -> void:
+	if MidiMap.event_key(e).is_empty() or e.message == MIDI_MESSAGE_NOTE_OFF:
+		return
+	var action := _midi_learn
+	_midi_learn = ""
+	var clash := _midi.bind(action, e, _midi.mode_of(action))
+	if clash.is_empty():
+		_note = "  //  %s  ->  %s" % [_midi.label_of(action), str(MidiMap.ACTIONS[action][0])]
+	else:
+		# refused, not stolen: the same rule the keyboard rebind follows, and for the same reason
+		_note = "  //  THAT CONTROL IS ALREADY BOUND TO %s" % str(MidiMap.ACTIONS[clash][0])
+	_clear_note_later()
+	_refresh_midi_row(action)
+	_save()
+
+## What a bound control does. Split three ways by the action's KIND rather than by the message,
+## so a pad and a fader bound to the same action behave the way that action needs.
+func _run_midi(action: String, e: InputEventMIDI) -> void:
+	var kind: int = MidiMap.ACTIONS[action][2]
+	var mode := _midi.mode_of(action)
+	var v := MidiMap.event_value(e)
+	if kind == MidiMap.BUTTON:
+		if MidiMap.is_press(e):
+			_midi_button(action)
+		return
+	if kind == MidiMap.STEPPER:
+		# a stepper on an absolute control still works -- a pad press is one click forward --
+		# but it is an encoder's job, which is why the mode button is on every row
+		var clicks := MidiMap.rel_delta(v, mode) if mode != MidiMap.MODE_ABS \
+			else (1 if MidiMap.is_press(e) else 0)
+		if clicks != 0:
+			_midi_step(action, clicks)
+		return
+	if mode == MidiMap.MODE_ABS:
+		_midi_fader(action, MidiMap.to_unit(v))
+		return
+	# A relative fader NEVER writes an absolute position: it moves from wherever the control
+	# already is. Writing the raw value here is what makes an endless encoder slam a fader to one
+	# end on the first click.
+	var d := MidiMap.rel_delta(v, mode)
+	if d != 0:
+		_midi_fader(action, clampf(_midi_fader_at(action) + float(d) * MIDI_NUDGE, 0.0, 1.0))
+
+func _midi_button(action: String) -> void:
+	match action:
+		"play_pause": _toggle()
+		"stop": _stop(_bar_deck())
+		"next": _next()
+		"prev": _prev()
+		"seek_back": _seek_by(-_skip_secs)
+		"seek_fwd": _seek_by(_skip_secs)
+		"cue_set": _add_cue(_pos())
+		"cue_1": _jump_cue_index(1)
+		"cue_2": _jump_cue_index(2)
+		"cue_3": _jump_cue_index(3)
+		"cue_4": _jump_cue_index(4)
+		"sync": _set_beat_sync(not _beat_sync)
+		# The deck-by-name buttons TAKE FOCUS first, because only _stop() is addressable by deck.
+		# That is a visible side effect -- the EQ panel, the transport bar and the crate all follow
+		# -- and it is the honest cost of a focus-based player driven by a two-deck controller.
+		"a_play":
+			_select_deck(0)
+			_toggle()
+		"b_play":
+			_select_deck(1)
+			_toggle()
+		"a_stop": _stop(0)
+		"b_stop": _stop(1)
+		"a_select": _select_deck(0)
+		"b_select": _select_deck(1)
+		"auto_fade": _auto_fade()
+		"both": _toggle_both()
+		"load_a": _load_selected(0)
+		"load_b": _load_selected(1)
+		"viz_full": _toggle_simple_mode()
+		"os_full": _toggle_window_fullscreen()
+		"mark": %Mark.button_pressed = not %Mark.button_pressed
+
+func _midi_step(action: String, clicks: int) -> void:
+	match action:
+		"jog": _seek_by(float(clicks) * MIDI_JOG_SEC)
+		"browse": _browse_step(clicks)
+		"viz_mode": _cycle_viz_mode(clicks)
+		"viz_color": _cycle_viz_color(clicks)
+
+func _midi_fader(action: String, unit: float) -> void:
+	match action:
+		"seek": _seek(unit * _len())
+		"crossfader":
+			_kill_auto_fade()   # a fade you have taken hold of is one you are doing yourself
+			if _engine.both:
+				_engine.set_both(false)
+			_set_crossfader(unit)
+		"master_vol": _set_volume(unit * 100.0)
+		"boost": _set_boost(int(roundf(unit * 100.0)))
+		"eq_low": _set_eq_band(0, unit)
+		"eq_mid": _set_eq_band(1, unit)
+		"eq_high": _set_eq_band(2, unit)
+
+## Where a fader is NOW, 0-1, so a relative encoder has something to move from.
+func _midi_fader_at(action: String) -> float:
+	match action:
+		"seek": return (_pos() / _len()) if _len() > 0.0 else 0.0
+		"crossfader": return _decks.crossfader
+		"master_vol": return _volume / 100.0
+		"boost": return float(_boost) / 100.0
+		"eq_low": return _eq_unit(0)
+		"eq_mid": return _eq_unit(1)
+		"eq_high": return _eq_unit(2)
+	return 0.0
+
+## EQ bands are written through the SLIDER, not through Equalizer.set_ez: the slider's
+## value_changed is already wired to the engine, so going through it keeps the panel and the
+## audio in step with no second path to forget about. 0-1 spans GAIN_MIN..GAIN_MAX, so the
+## middle of a MIDI fader is flat.
+func _set_eq_band(i: int, unit: float) -> void:
+	if i < 0 or i >= _ez_faders.size():
+		return
+	_ez_faders[i].value = lerpf(Equalizer.GAIN_MIN, Equalizer.GAIN_MAX, clampf(unit, 0.0, 1.0))
+
+func _eq_unit(i: int) -> float:
+	if i < 0 or i >= _eq.ez_db.size():
+		return 0.5
+	return inverse_lerp(Equalizer.GAIN_MIN, Equalizer.GAIN_MAX, _eq.ez_db[i])
+
+# --- the MIDI SETUP window -------------------------------------------------------------------
+## Built on _tool_window, which already owns the chassis, the theme, F11, centring, the one-per-
+## kind registry and the close. What is added here is a device row, the monitor, and a scrolling
+## grid of one row per action.
+## Wide enough for a whole row at the program's own font -- 16 px a character, so the action
+## name, the assignment and three buttons come to about 900. Sized to the CONTENT rather than to
+## a round number, because a mapper whose CLEAR button is off the right edge is a mapper you
+## cannot unbind anything with.
+const MIDI_WIN_SIZE := Vector2i(1010, 660)
+const MIDI_WIN_MIN := Vector2i(520, 320)
+
+func _open_midi_window() -> void:
+	var col := _tool_window("midi", "MIDI SETUP & MAPPER", MIDI_WIN_SIZE)
+	if col == null:
+		return   # already open, and _tool_window raised it
+	var win := _tool_windows["midi"] as Window
+	win.min_size = MIDI_WIN_MIN
+
+	var dev_row := HBoxContainer.new()
+	dev_row.add_theme_constant_override("separation", 6)
+	col.add_child(dev_row)
+	var dev_cap := Label.new()
+	dev_cap.text = "DEVICE"
+	dev_row.add_child(dev_cap)
+	_pin_label(dev_cap)   # this window is not under _tabs, so nothing pins its captions for it
+	_midi_device = OptionButton.new()
+	_midi_device.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	dev_row.add_child(_midi_device)
+	var refresh := Button.new()
+	refresh.text = "[ REFRESH ]"
+	refresh.pressed.connect(_refresh_midi_devices)
+	_pin_label(refresh)
+	dev_row.add_child(refresh)
+
+	# A permanent line, not an error state. An empty device list or a silent monitor is almost
+	# always the controller sitting in its own HID mode rather than anything wrong with a
+	# mapping, and there is no way to guess that from inside the app.
+	var hint := Label.new()
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hint.theme_type_variation = &"Green"
+	hint.text = "NO DEVICE, OR NOTHING IN THE MONITOR? NATIVE INSTRUMENTS CONTROLLERS BOOT IN " \
+		+ "HID MODE FOR TRAKTOR AND SEND NO MIDI AT ALL. PUT THE S2 IN GENERIC MIDI MODE " \
+		+ "(SHIFT + QUANT, OR THE NI CONTROLLER EDITOR), THEN PRESS REFRESH."
+	col.add_child(hint)
+
+	_midi_monitor = Label.new()
+	_midi_monitor.clip_text = true
+	_midi_monitor.text = "WAITING FOR A MESSAGE -- TOUCH ANYTHING ON THE CONTROLLER"
+	col.add_child(_midi_monitor)
+
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	# AUTO, not DISABLED: the rows have a real minimum width, so a window dragged narrower than
+	# one has to be scrollable sideways or the buttons are simply gone. Every other scroller in
+	# this program disables it because its rows can shrink; these cannot.
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+	col.add_child(scroll)
+	var grid := VBoxContainer.new()
+	grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	grid.add_theme_constant_override("separation", 2)
+	scroll.add_child(grid)
+
+	_midi_rows = {}
+	var group := ""
+	for action in MidiMap.ACTIONS:
+		var spec: Array = MidiMap.ACTIONS[action]
+		if str(spec[1]) != group:
+			group = str(spec[1])
+			var head := Label.new()
+			head.text = "-- %s --" % group
+			head.theme_type_variation = &"Green"
+			grid.add_child(head)
+		_midi_row(grid, str(action), str(spec[0]))
+	# the window closing takes its controls with it; the refs must not outlive them
+	win.close_requested.connect(func() -> void:
+		_midi_monitor = null
+		_midi_device = null
+		_midi_rows = {}
+		_midi_learn = "")
+	_wheel_through(grid)
+	_wheel_scrolls(scroll)
+	_refresh_midi_devices()
+
+## ACTION | ASSIGNMENT | [ LEARN ] | [ ABS ] | [ CLEAR ]
+func _midi_row(grid: Control, action: String, label: String) -> void:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+	grid.add_child(row)
+	var name_label := Label.new()
+	name_label.text = label
+	name_label.custom_minimum_size.x = 290
+	row.add_child(name_label)
+	var assign := Label.new()
+	assign.custom_minimum_size.x = 200
+	assign.theme_type_variation = &"Green"
+	row.add_child(assign)
+	var learn := Button.new()
+	learn.pressed.connect(func() -> void: _start_midi_learn(action))
+	_hover_note(learn, func() -> String:
+		return "PRESS, THEN TOUCH THE CONTROL ON THE CONTROLLER TO BIND IT")
+	row.add_child(learn)
+	# Both of these change their own text -- LEARN becomes TOUCH IT while armed, and the mode
+	# button cycles through three names of different lengths. Pinned to the WIDEST text each can
+	# ever hold, so a row does not reflow under the pointer the moment it is clicked.
+	_pin_to_widest(learn, ["[ LEARN ]", "[ TOUCH ]"])
+	var mode := Button.new()
+	mode.pressed.connect(func() -> void:
+		_midi.set_mode(action, _midi.mode_of(action) + 1)
+		_refresh_midi_row(action)
+		_save())
+	_hover_note(mode, func() -> String:
+		return "ABS: FADERS AND PADS  //  REL: JOG WHEELS AND ENDLESS ENCODERS, WHICH SEND " \
+			+ "HOW FAR THEY MOVED RATHER THAN WHERE THEY ARE")
+	row.add_child(mode)
+	# bare, not bracketed like the buttons either side: three mode names in brackets cost the row
+	# 70 px, and this is the one control here whose text IS its state rather than its action
+	var mode_texts: Array[String] = []
+	for n in MidiMap.MODE_NAMES:
+		mode_texts.append(str(n))
+	_pin_to_widest(mode, mode_texts)
+	var clear := Button.new()
+	clear.text = "[ CLEAR ]"
+	clear.pressed.connect(func() -> void:
+		_midi.clear(action)
+		_refresh_midi_row(action)
+		_save())
+	_pin_label(clear)
+	row.add_child(clear)
+	_midi_rows[action] = [assign, learn, mode]
+	_refresh_midi_row(action)
+
+func _refresh_midi_row(action: String) -> void:
+	var row: Array = _midi_rows.get(action, [])
+	if row.size() != 3:
+		return
+	(row[0] as Label).text = _midi.label_of(action)
+	(row[1] as Button).text = "[ LEARN ]"
+	var mode_btn := row[2] as Button
+	mode_btn.text = str(MidiMap.MODE_NAMES[_midi.mode_of(action)])
+	mode_btn.disabled = _midi.key_of(action).is_empty()   # nothing to be relative about
+
+## Godot only reports devices it has OPENED, so the list is empty until open_midi_inputs() has
+## run -- which _ready does. Re-opening is how a controller plugged in after launch is noticed.
+func _refresh_midi_devices() -> void:
+	if not is_instance_valid(_midi_device):
+		return
+	OS.open_midi_inputs()
+	var found := OS.get_connected_midi_inputs()
+	_midi_device.clear()
+	if found.is_empty():
+		_midi_device.add_item("NO MIDI DEVICES FOUND")
+		_midi_device.disabled = true
+		return
+	_midi_device.disabled = false
+	for name in found:
+		_midi_device.add_item(str(name))
 
 ## FILE INFO: what the file actually is, read from the file. The same probe TRACK INFO uses,
 ## laid out where it can be read and left open while other tracks play.
@@ -3584,6 +3966,30 @@ static func _select_run(list: ItemList, from: int, to: int) -> void:
 		if row < list.item_count and list.is_item_selectable(row):
 			list.select(row, false)
 
+## Walks the focused crate's selection by `d` rows, for a browse encoder. Keeps the moved-to row
+## on screen, because a selection that has scrolled out of view is the same as no selection.
+func _browse_step(d: int) -> void:
+	var crate := _engine.deck
+	var list: ItemList = [_tracks, _tracks_b][crate]
+	if list.item_count == 0:
+		return
+	var sel := list.get_selected_items()
+	var row: int = clampi((sel[0] if sel.size() > 0 else 0) + d, 0, list.item_count - 1)
+	list.deselect_all()
+	list.select(row)
+	list.ensure_current_is_visible()
+	_marquee_hover(crate, row)   # the row under the cursor scrolls its title; so does this one
+
+## Loads whatever the browse encoder has landed on onto `deck`. Uses _open_deck, which takes a
+## deck index -- so unlike the PLAY buttons, loading deck B steals no focus.
+func _load_selected(deck: int) -> void:
+	var picked := _selected_paths(_engine.deck)
+	if picked.is_empty():
+		_note = "  //  NOTHING SELECTED TO LOAD"
+		_clear_note_later()
+		return
+	_open_deck(deck, picked[0])
+
 ## The paths of every selected row in `crate`, in ROW order -- which is the order the user sees,
 ## and so the order a queued run has to arrive in. Header rows have no path and drop out.
 func _selected_paths(crate: int) -> Array[String]:
@@ -4006,7 +4412,7 @@ const SETTING_GROUPS := {
 		"CursorRow", "CrtRow", "PlayBarRow", "PlayBarShapeRow", "VisualWinRow", "DualDeckRow",
 		"FadeSpeedRow", "BgThrottleRow", "NowPlayingRow"],
 	"VIDEO": ["IntroRow", "VideoTestRow", "VideoColorRow"],
-	"INPUT": ["SkipSecsRow"],
+	"INPUT": ["SkipSecsRow", "MidiSetupRow"],
 	"ADVANCED": ["MessageLogRow", "CheatRow", "AutopsyPanel"],
 }
 
@@ -4359,6 +4765,15 @@ func _add_settings_rows() -> void:
 	_skip_field.text_submitted.connect(func(_s: String) -> void: _commit_skip_secs())
 	_skip_field.focus_exited.connect(_commit_skip_secs)
 	after = _skip_field.get_parent()
+
+	var midi_btn := _add_setting_row("MIDI SETUP", "MidiSetupRow", after)
+	midi_btn.text = "[ OPEN MAPPER ]"
+	midi_btn.pressed.connect(_open_midi_window)
+	_hover_note(midi_btn, func() -> String:
+		var n := _midi.binds.size()
+		return "MIDI DEVICES, A LIVE MONITOR AND LEARN  //  %s" % [
+			"NOTHING BOUND YET" if n == 0 else "%d ACTION%s BOUND" % [n, "" if n == 1 else "S"]])
+	after = midi_btn.get_parent()
 
 	_fade_speed_field = _add_setting_field_row("TAB FADE SPEED (0.25-4X)", "FadeSpeedRow",
 		after, "%.2f" % _fade_speed)
@@ -5908,6 +6323,13 @@ func _input(event: InputEvent) -> void:
 			_finish_rebind(event.keycode)
 			get_viewport().set_input_as_handled()
 		return
+	# MIDI is handled here and nowhere else. It is not an InputEventKey, so _transport_key ignores
+	# it and _unhandled_input returns at its first line -- nothing downstream would ever see it.
+	var midi := event as InputEventMIDI
+	if midi:
+		_route_midi(midi)
+		get_viewport().set_input_as_handled()
+		return
 	if %Intro.visible:
 		var skip: bool = (event is InputEventKey and event.pressed) or (event is InputEventMouseButton and event.pressed)
 		if skip:
@@ -5966,14 +6388,15 @@ func _boost_gain() -> float:
 func _on_boost_bar(e: InputEvent) -> void:
 	var w := _bar_wheel(e, float(_boost) / 100.0, BAR_WHEEL_COARSE)
 	if w >= 0.0:
-		_boost = int(roundf(w * 100.0))
-		_refresh_boost()
-		_eq.set_boost(_boost_gain())
-		_save_soon()
+		_set_boost(int(roundf(w * 100.0)))
 		return
 	if not _bar_drag(e, %Boost):
 		return
-	_boost = clampi(int(roundf(_ratio_at(e.position.x, %Boost.size.x) * 100.0)), 0, 100)
+	_set_boost(int(roundf(_ratio_at(e.position.x, %Boost.size.x) * 100.0)))
+
+## Boost by NUMBER, 0-100, for the same reason _set_volume exists.
+func _set_boost(v: int) -> void:
+	_boost = clampi(v, 0, 100)
 	_refresh_boost()
 	_eq.set_boost(_boost_gain())
 	_save_soon()
@@ -6332,6 +6755,21 @@ func _pin_label(l: Control) -> void:
 		pad = sb.get_margin(SIDE_LEFT) + sb.get_margin(SIDE_RIGHT) if sb else 8.0
 	l.custom_minimum_size.x = ceilf(widest + pad)
 	l.set_meta(LABEL_PINNED, true)
+
+## Pins a control wide enough for ANY of `texts`, not just the one it is showing. _pin_label
+## measures what is there now, which is right for a caption and wrong for a button that renames
+## itself: a LEARN button that becomes TOUCH IT would otherwise widen its row the instant it is
+## pressed, shoving everything after it sideways under the pointer.
+func _pin_to_widest(c: Control, texts: Array[String]) -> void:
+	var font := c.get_theme_font("font")
+	if not font:
+		return
+	var size := c.get_theme_font_size("font_size")
+	var widest := 0.0
+	for t in texts:
+		widest = maxf(widest, font.get_string_size(t, HORIZONTAL_ALIGNMENT_LEFT, -1.0, size).x)
+	var sb := c.get_theme_stylebox("normal")
+	c.custom_minimum_size.x = ceilf(widest + (sb.get_margin(SIDE_LEFT) + sb.get_margin(SIDE_RIGHT) if sb else 8.0))
 
 ## Every pinned caption re-measured. The pin is a pixel width, so a new font or a new size would
 ## otherwise leave every settings column measured for the old one.
@@ -7894,6 +8332,27 @@ static func cue_too_close(cues: Array, t: float, min_gap: float) -> bool:
 		if absf(float(c["time"]) - t) < min_gap:
 			return true
 	return false
+
+## Seeks to the Nth marker on the loaded track, counting from 1 in TIME order.
+##
+## SOUNDSCAPE has no hot-cue slots -- a track carries as many markers as you drop on it, keyed by
+## letter, not four numbered pads. "CUE 3" is therefore a MAPPING convention rather than a stored
+## slot: it means the third marker along the bar. That is the honest way to give a pad grid
+## something to do without inventing a second cue system for the same markers to disagree with.
+func _jump_cue_index(n: int) -> void:
+	var path := _bar_path()
+	if path.is_empty():
+		return
+	var cues := _cues_for(path).duplicate()
+	cues.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return float(a["time"]) < float(b["time"]))
+	if n < 1 or n > cues.size():
+		_note = "  //  NO CUE %d ON THIS TRACK" % n
+		_clear_note_later()
+		return
+	var cue: Dictionary = cues[n - 1]
+	_seek(_cue_stream(float(cue["time"])))   # mirrored back if the deck is running in reverse
+	_note = "  //  CUE %d: %s" % [n, cue.get("label", "")]
+	_clear_note_later()
 
 ## `at` arrives as a position in what is currently SOUNDING. While the deck is reversed that is
 ## the mirror of the track's own time, and the marker is stored in the track's terms.

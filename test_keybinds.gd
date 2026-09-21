@@ -134,6 +134,74 @@ func _initialize() -> void:
 		probe.free()
 	typed.free()
 
+	# --- MIDI ---------------------------------------------------------------------------
+	# The same table-and-learn shape as the keys above, so it lives here rather than in a
+	# script of its own. MidiMap.midi_test() covers the arithmetic; what is checked here is
+	# the half that needs the player: the learn flow, and the dispatch table being complete.
+	var midi_pure: bool = MidiMap.midi_test()
+	ok = ok and midi_pure
+	print("MidiMap.midi_test (keys, channels, both relative encodings, clash, round trip): %s" % midi_pure)
+
+	var map: MidiMap = p.get("_midi")
+	var cc := InputEventMIDI.new()
+	cc.message = MIDI_MESSAGE_CONTROL_CHANGE
+	cc.channel = 0
+	cc.controller_number = 16
+	cc.controller_value = 100
+	p.set("_midi_learn", "crossfader")
+	p.call("_finish_midi_learn", cc)
+	var learned: bool = map.key_of("crossfader") == "cc:0:16" and str(p.get("_midi_learn")).is_empty()
+	ok = ok and learned
+	print("MIDI learn binds the control that arrived, and disarms: %s (%s)" % [
+		learned, map.label_of("crossfader")])
+
+	# the S2 case: the same CC number on channel 2 is a DIFFERENT control and binds cleanly
+	var cc_b := InputEventMIDI.new()
+	cc_b.message = MIDI_MESSAGE_CONTROL_CHANGE
+	cc_b.channel = 1
+	cc_b.controller_number = 16
+	cc_b.controller_value = 20
+	p.set("_midi_learn", "master_vol")
+	p.call("_finish_midi_learn", cc_b)
+	var split: bool = map.key_of("master_vol") == "cc:1:16" and map.key_of("crossfader") == "cc:0:16"
+	ok = ok and split
+	print("deck A ch1 and deck B ch2 on the same CC number stay separate bindings: %s" % split)
+
+	# a clash is refused, and the sitting tenant keeps the control
+	p.set("_midi_learn", "boost")
+	p.call("_finish_midi_learn", cc)
+	var refused: bool = map.key_of("boost").is_empty() and map.action_for("cc:0:16") == "crossfader"
+	ok = ok and refused
+	print("learning a control that is already bound is refused, not stolen: %s" % refused)
+
+	# a note-off must not bind: a pad sends both, and the release would win
+	var off := InputEventMIDI.new()
+	off.message = MIDI_MESSAGE_NOTE_OFF
+	off.channel = 0
+	off.pitch = 36
+	p.set("_midi_learn", "play_pause")
+	p.call("_finish_midi_learn", off)
+	var ignored_off: bool = map.key_of("play_pause").is_empty() \
+		and str(p.get("_midi_learn")) == "play_pause"   # still listening for the press
+	ok = ok and ignored_off
+	print("a note-off does not take the binding, and learn keeps listening: %s" % ignored_off)
+
+	# every action in the table must be dispatchable: an id in ACTIONS with no arm in the
+	# match statements would bind, light up in the mapper and then do nothing at all
+	var missing: Array[String] = []
+	for action in MidiMap.ACTIONS:
+		var kind: int = MidiMap.ACTIONS[action][2]
+		var src := ""
+		match kind:
+			MidiMap.BUTTON: src = "_midi_button"
+			MidiMap.STEPPER: src = "_midi_step"
+			MidiMap.FADER: src = "_midi_fader"
+		if not p.has_method(src):
+			missing.append("%s: no %s" % [action, src])
+	var dispatchable: bool = missing.is_empty() and MidiMap.ACTIONS.size() >= 30
+	ok = ok and dispatchable
+	print("all %d actions have a dispatcher: %s %s" % [MidiMap.ACTIONS.size(), dispatchable, missing])
+
 	print("RESULT ", "PASS" if ok else "FAIL")
 	p.free()
 	quit(0 if ok else 1)
