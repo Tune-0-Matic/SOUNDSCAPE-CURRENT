@@ -200,6 +200,28 @@ func _initialize() -> void:
 	print("   one  -> %s" % one)
 	print("   many -> %s" % many)
 
+	# the deck prefix is the whole reason there is one dispatcher and not fifty cases, so the
+	# split is checked directly -- an "a_"/"b_" id must reduce to the same bare id its
+	# focused-deck twin uses, or the match arm for it silently never fires
+	var pairs := {"a_eq_low": "eq_low", "b_cue_3": "cue_3", "a_play_pause": "play_pause",
+		"b_jog": "jog", "a_seek": "seek", "crossfader": "crossfader"}
+	var split_ok := true
+	for id in pairs:
+		if p.call("_midi_bare", id) != pairs[id]:
+			split_ok = false
+	var decks_ok: bool = p.call("_midi_deck", "a_eq_low") == 0 and p.call("_midi_deck", "b_eq_low") == 1
+	# and every prefixed action must reduce to an id that is ITSELF in the table
+	var orphans: Array[String] = []
+	for action in MidiMap.ACTIONS:
+		var a := str(action)
+		if a.begins_with("a_") or a.begins_with("b_"):
+			var bare: String = p.call("_midi_bare", a)
+			if not MidiMap.ACTIONS.has(bare) and bare != "select":
+				orphans.append(a)
+	ok = ok and split_ok and decks_ok and orphans.is_empty()
+	print("deck-prefixed ids reduce to their focused-deck twin: %s/%s, orphans %s" % [
+		split_ok, decks_ok, orphans])
+
 	# every action in the table must be dispatchable: an id in ACTIONS with no arm in the
 	# match statements would bind, light up in the mapper and then do nothing at all
 	var missing: Array[String] = []

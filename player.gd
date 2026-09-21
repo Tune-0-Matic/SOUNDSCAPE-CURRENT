@@ -3120,6 +3120,7 @@ func _import_setup(path: String) -> void:
 ## into libsoundscape_dsp.
 var _midi := MidiMap.new()
 var _midi_learn := ""                       # the action currently listening, or ""
+var _midi_shift := false                    # the controller's own SHIFT, while it is held
 var _midi_monitor: Label                    # the live message line, while the window is open
 var _midi_device: OptionButton
 var _midi_rows := {}                        # action -> [assignment Label, LEARN Button, mode Button]
@@ -3185,6 +3186,11 @@ func _run_midi(action: String, e: InputEventMIDI) -> void:
 	var kind: int = MidiMap.ACTIONS[action][2]
 	var mode := _midi.mode_of(action)
 	var v := MidiMap.event_value(e)
+	# A modifier is the one thing here that cares about the release as well as the press, so it
+	# is read before the press test rather than inside it.
+	if action in MidiMap.HELD:
+		_midi_shift = MidiMap.is_press(e)
+		return
 	if kind == MidiMap.BUTTON:
 		if MidiMap.is_press(e):
 			_midi_button(action)
@@ -3207,33 +3213,30 @@ func _run_midi(action: String, e: InputEventMIDI) -> void:
 	if d != 0:
 		_midi_fader(action, clampf(_midi_fader_at(action) + float(d) * MIDI_NUDGE, 0.0, 1.0))
 
+## Whether a pad press means CLEAR rather than set-or-jump. Either the controller's own SHIFT,
+## if one is bound to the `shift` action, or the keyboard's -- so the pads work the same whether
+## or not the surface has a spare button to give up.
+func _midi_shift_held() -> bool:
+	return _midi_shift or Input.is_key_pressed(KEY_SHIFT)
+
 func _midi_button(action: String) -> void:
-	match action:
-		"play_pause": _toggle()
-		"stop": _stop(_bar_deck())
-		"next": _next()
-		"prev": _prev()
-		"seek_back": _seek_by(-_skip_secs)
-		"seek_fwd": _seek_by(_skip_secs)
-		"cue_set": _add_cue(_pos())
-		"cue_1": _jump_cue_index(1)
-		"cue_2": _jump_cue_index(2)
-		"cue_3": _jump_cue_index(3)
-		"cue_4": _jump_cue_index(4)
+	# the deck-addressed half of the table, which is most of it: "a_eq_low" -> deck 0, "eq_low"
+	var deck := _midi_deck(action)
+	var bare := _midi_bare(action)
+	match bare:
+		"play_pause": _toggle_deck(deck)
+		"stop": _stop(deck)
+		"next": _deck_step_track(deck, 1)
+		"prev": _deck_step_track(deck, -1)
+		"seek_back": _seek_deck(deck, _deck_pos(deck) - _skip_secs)
+		"seek_fwd": _seek_deck(deck, _deck_pos(deck) + _skip_secs)
+		"cue_set": _add_cue_on(deck, _deck_pos(deck), 0)
+		"cue_1", "cue_2", "cue_3", "cue_4":
+			_pad_cue(deck, int(bare.right(1)), _midi_shift_held())
+		"cue_del_1", "cue_del_2", "cue_del_3", "cue_del_4":
+			_pad_cue(deck, int(bare.right(1)), true)   # the pad grid without a spare SHIFT
 		"sync": _set_beat_sync(not _beat_sync)
-		# The deck-by-name buttons TAKE FOCUS first, because only _stop() is addressable by deck.
-		# That is a visible side effect -- the EQ panel, the transport bar and the crate all follow
-		# -- and it is the honest cost of a focus-based player driven by a two-deck controller.
-		"a_play":
-			_select_deck(0)
-			_toggle()
-		"b_play":
-			_select_deck(1)
-			_toggle()
-		"a_stop": _stop(0)
-		"b_stop": _stop(1)
-		"a_select": _select_deck(0)
-		"b_select": _select_deck(1)
+		"select": _select_deck(deck)
 		"auto_fade": _auto_fade()
 		"both": _toggle_both()
 		"load_a": _load_selected(0)
@@ -3242,52 +3245,81 @@ func _midi_button(action: String) -> void:
 		"os_full": _toggle_window_fullscreen()
 		"mark": %Mark.button_pressed = not %Mark.button_pressed
 
+## Which deck an action id means: "a_" is deck 0, "b_" is deck 1, and a bare id is whichever deck
+## the transport bar is showing. One rule in one place, rather than fifty explicit cases.
+func _midi_deck(action: String) -> int:
+	if action.begins_with("a_"):
+		return 0
+	if action.begins_with("b_"):
+		return 1
+	return _bar_deck()
+
+func _midi_bare(action: String) -> String:
+	return action.substr(2) if action.begins_with("a_") or action.begins_with("b_") else action
+
 func _midi_step(action: String, clicks: int) -> void:
-	match action:
-		"jog": _seek_by(float(clicks) * MIDI_JOG_SEC)
+	var deck := _midi_deck(action)
+	match _midi_bare(action):
+		# Works on a stopped deck as well as a playing one -- see _seek_deck, which lifts the
+		# pause for the seek and puts it straight back, because Godot throws away a seek sent to
+		# a paused player. Cueing up a track you are not playing yet is most of what a jog is for.
+		"jog": _seek_deck(deck, _deck_pos(deck) + float(clicks) * MIDI_JOG_SEC)
 		"browse": _browse_step(clicks)
 		"viz_mode": _cycle_viz_mode(clicks)
 		"viz_color": _cycle_viz_color(clicks)
 
 func _midi_fader(action: String, unit: float) -> void:
-	match action:
-		"seek": _seek(unit * _len())
+	var deck := _midi_deck(action)
+	match _midi_bare(action):
+		"seek": _seek_deck(deck, unit * _deck_len(deck))
 		"crossfader":
 			_kill_auto_fade()   # a fade you have taken hold of is one you are doing yourself
 			if _engine.both:
 				_engine.set_both(false)
 			_set_crossfader(unit)
+		# An analogue pot -- the S2's MAIN knob among them -- sends plain absolute CC, so this
+		# needs nothing special: any CC number on any channel, 0-127 across the full travel.
 		"master_vol": _set_volume(unit * 100.0)
 		"boost": _set_boost(int(roundf(unit * 100.0)))
-		"eq_low": _set_eq_band(0, unit)
-		"eq_mid": _set_eq_band(1, unit)
-		"eq_high": _set_eq_band(2, unit)
+		"eq_low": _set_eq_band(deck, 0, unit)
+		"eq_mid": _set_eq_band(deck, 1, unit)
+		"eq_high": _set_eq_band(deck, 2, unit)
 
 ## Where a fader is NOW, 0-1, so a relative encoder has something to move from.
 func _midi_fader_at(action: String) -> float:
-	match action:
-		"seek": return (_pos() / _len()) if _len() > 0.0 else 0.0
+	var deck := _midi_deck(action)
+	match _midi_bare(action):
+		"seek": return (_deck_pos(deck) / _deck_len(deck)) if _deck_len(deck) > 0.0 else 0.0
 		"crossfader": return _decks.crossfader
 		"master_vol": return _volume / 100.0
 		"boost": return float(_boost) / 100.0
-		"eq_low": return _eq_unit(0)
-		"eq_mid": return _eq_unit(1)
-		"eq_high": return _eq_unit(2)
+		"eq_low": return _eq_unit(deck, 0)
+		"eq_mid": return _eq_unit(deck, 1)
+		"eq_high": return _eq_unit(deck, 2)
 	return 0.0
 
-## EQ bands are written through the SLIDER, not through Equalizer.set_ez: the slider's
-## value_changed is already wired to the engine, so going through it keeps the panel and the
-## audio in step with no second path to forget about. 0-1 spans GAIN_MIN..GAIN_MAX, so the
-## middle of a MIDI fader is flat.
-func _set_eq_band(i: int, unit: float) -> void:
-	if i < 0 or i >= _ez_faders.size():
+## EQ for one deck. The FOCUSED deck is written through its slider, whose value_changed is
+## already wired to the engine, so the panel and the audio cannot disagree. Any other deck has no
+## slider on screen -- the panel only ever shows the focused rack -- so it is written straight to
+## that deck's Equalizer. 0-1 spans GAIN_MIN..GAIN_MAX, which puts flat in the middle of the
+## travel, where a centre-detented EQ knob rests.
+func _set_eq_band(deck: int, i: int, unit: float) -> void:
+	if i < 0 or i > 2:
 		return
-	_ez_faders[i].value = lerpf(Equalizer.GAIN_MIN, Equalizer.GAIN_MAX, clampf(unit, 0.0, 1.0))
+	var db := lerpf(Equalizer.GAIN_MIN, Equalizer.GAIN_MAX, clampf(unit, 0.0, 1.0))
+	if deck == _engine.deck and i < _ez_faders.size():
+		_ez_faders[i].value = db
+		return
+	if deck >= 0 and deck < _eq_decks.size():
+		(_eq_decks[deck] as Equalizer).set_ez(i, db)
 
-func _eq_unit(i: int) -> float:
-	if i < 0 or i >= _eq.ez_db.size():
+func _eq_unit(deck: int, i: int) -> float:
+	if deck < 0 or deck >= _eq_decks.size():
 		return 0.5
-	return inverse_lerp(Equalizer.GAIN_MIN, Equalizer.GAIN_MAX, _eq.ez_db[i])
+	var eq: Equalizer = _eq_decks[deck]
+	if i < 0 or i >= eq.ez_db.size():
+		return 0.5
+	return inverse_lerp(Equalizer.GAIN_MIN, Equalizer.GAIN_MAX, eq.ez_db[i])
 
 # --- the MIDI SETUP window -------------------------------------------------------------------
 ## Built on _tool_window, which already owns the chassis, the theme, F11, centring, the one-per-
@@ -5522,6 +5554,101 @@ func _kill_fade(deck: int) -> void:
 ## player -- or the primary, if it never played -- for the parked one.
 func _live_player(deck: int) -> AudioStreamPlayer:
 	return _decks.live(deck)
+
+# --- addressing ONE deck ----------------------------------------------------------------------
+## Everything above this line works on the deck the transport bar is showing -- that is what
+## _bar_deck() is for, and it is the right model for a keyboard and a mouse, where there is one
+## pointer and one focus. A two-deck control surface is not that: the S2's right-hand play button
+## means DECK B whatever the screen is looking at, and taking focus on every press would drag the
+## EQ panel, the crate and the transport bar back and forth under the user's hands all night.
+##
+## So these are the same operations addressed by index instead. They deliberately do NOT touch
+## focus, the video player (one picture, which belongs to the bar deck) or the crossfader.
+func _deck_path(deck: int) -> String:
+	return _current if deck == _engine.deck else _decks.deck_cur[deck]
+
+func _deck_len(deck: int) -> float:
+	var pl := _live_player(deck)
+	return pl.stream.get_length() if pl and pl.stream else 0.0
+
+func _deck_pos(deck: int) -> float:
+	var pl := _live_player(deck)
+	return pl.get_playback_position() if pl else 0.0
+
+## SEEKING A PAUSED DECK, which Godot will not do on its own.
+##
+## AudioStreamPlayer.seek() on a paused player is DISCARDED -- not deferred, not applied on
+## resume: measured, a seek to 60 s while paused left the position at 30 s and resuming carried
+## on from 30 s as though nothing had been asked. That is why scrubbing a stopped deck never
+## worked here, and it is the whole of what stood between a jog wheel and a cue point.
+##
+## Lifting the pause for the seek and putting it straight back, inside one frame, does land it:
+## the same test then reports 45.005 for a seek to 45, the deck is still paused afterwards, and a
+## run of small steps accumulates exactly. The audio thread never gets a frame to sound, so there
+## is nothing to hear.
+func _seek_deck(deck: int, t: float) -> void:
+	var pl := _live_player(deck)
+	if not pl or not pl.stream:
+		return
+	var target := clampf(t, 0.0, _deck_len(deck))
+	if pl.stream_paused:
+		pl.stream_paused = false
+		pl.seek(target)
+		pl.stream_paused = true
+	else:
+		pl.seek(target)
+	if deck == _bar_deck():
+		_scrub_to(target)   # the bar is showing this deck, so the overlay has to follow
+
+## Pushes the scrub bar and its overlay to a position without waiting for _process to notice.
+## A jog wheel moves in steps far smaller than the bar's own repaint, and a playhead that catches
+## up a frame later reads as a wheel that is not connected to anything.
+func _scrub_to(t: float) -> void:
+	var span := _len()
+	if span > 0.0:
+		_scrub.value = clampf(t / span * 100.0, 0.0, 100.0)
+	_cue_overlay.queue_redraw()
+
+## PAUSED IS TESTED FIRST, for the reason _state() gives: AudioStreamPlayer.playing goes false
+## while stream_paused is set, so asking "is it playing" about a paused deck answers no and the
+## deck reads as STOPPED.
+func _deck_state(deck: int) -> String:
+	var pl := _live_player(deck)
+	if not pl or not pl.stream:
+		return "EMPTY"
+	if pl.stream_paused:
+		return "PAUSED"
+	return "PLAYING" if pl.playing else "STOPPED"
+
+## Play/pause ONE deck. The bar deck's version goes through _toggle() so the video player and the
+## fades come with it; any other deck is the player alone.
+func _toggle_deck(deck: int) -> void:
+	if deck == _bar_deck():
+		_toggle()
+		return
+	var pl := _live_player(deck)
+	if not pl or not pl.stream:
+		return
+	# Same trap as _deck_state, and worse here: `playing` is false while paused, so asking it
+	# first sent a paused deck down the "not playing" arm and pl.play() RESTARTED the track from
+	# the beginning instead of resuming it.
+	if pl.stream_paused:
+		pl.stream_paused = false
+	elif pl.playing:
+		pl.stream_paused = true
+	else:
+		pl.play()
+	_refresh_deck_ui()
+
+## NEXT / PREVIOUS for one deck, walked across that crate's own visible list rather than the
+## engine queue -- the queue belongs to the driven deck, and this must work on the other one.
+func _deck_step_track(deck: int, delta: int) -> void:
+	var shown: Array = _library.shown[deck]
+	if shown.is_empty():
+		return
+	var at := shown.find(_deck_path(deck))
+	var to := posmod(at + delta, shown.size()) if at >= 0 else 0
+	_open_deck(deck, str(shown[to]))
 
 func _commit_delay_ms() -> void:
 	_decks.delay_ms = clampi(int(%DelayMs.text), DELAY_MS_MIN, DELAY_MS_MAX)
@@ -8352,6 +8479,52 @@ static func cue_too_close(cues: Array, t: float, min_gap: float) -> bool:
 			return true
 	return false
 
+# --- hot cues, for a pad grid -----------------------------------------------------------------
+## A pad is not a list position. SOUNDSCAPE's markers are an arbitrary keyed list -- as many as
+## you drop, ordered by time -- and mapping pad N to "the Nth marker along" was fine for jumping
+## and useless for the thing a pad grid is actually for, which is: press an empty pad to drop a
+## cue, press a lit one to go there, shift-press to clear it. "The Nth marker" moves under you
+## the moment you add one earlier in the track.
+##
+## So a cue created from a pad carries a SLOT. Slots are per track, live in the same cue
+## dictionary as everything else, and persist through the same config with no new storage.
+## Markers made the old way (clicking the bar in MARK MODE) have no slot and are untouched by
+## this -- they still jump by key, and a pad will never delete one.
+const CUE_PADS := 4
+
+func _cue_in_slot(deck: int, slot: int) -> Dictionary:
+	for c in _cues_for(_deck_path(deck)):
+		if int((c as Dictionary).get("slot", 0)) == slot:
+			return c
+	return {}
+
+## One pad press. `shift` is the modifier -- from the controller's own SHIFT button if one is
+## bound, or the keyboard's.
+##
+## MARK MODE has nothing to do with this. That toggle exists to stop a click on the scrub bar
+## being read as a seek; a pad is not the scrub bar, so a pad drops its cue either way. Anything
+## else would be a mode nobody can see from the controller.
+func _pad_cue(deck: int, slot: int, shift: bool) -> void:
+	var path := _deck_path(deck)
+	if path.is_empty():
+		_note = "  //  NOTHING ON %s TO CUE" % AudioEngine.DECK_NAMES[deck]
+		_clear_note_later()
+		return
+	var cue := _cue_in_slot(deck, slot)
+	if shift:
+		if cue.is_empty():
+			return
+		_delete_cue(cue)
+		_note = "  //  CUE %d CLEARED ON %s" % [slot, AudioEngine.DECK_NAMES[deck]]
+		_clear_note_later()
+		return
+	if cue.is_empty():
+		_add_cue_on(deck, _deck_pos(deck), slot)
+		return
+	_seek_deck(deck, _cue_stream_deck(deck, float(cue["time"])))
+	_note = "  //  CUE %d  //  %s" % [slot, AudioEngine.DECK_NAMES[deck]]
+	_clear_note_later()
+
 ## Seeks to the Nth marker on the loaded track, counting from 1 in TIME order.
 ##
 ## SOUNDSCAPE has no hot-cue slots -- a track carries as many markers as you drop on it, keyed by
@@ -8394,24 +8567,55 @@ func _add_cue(at: float) -> void:
 		_note = "  //  TOO CLOSE TO AN EXISTING MARKER"
 		_clear_note_later()
 		return
-	var store := _cue_store(not _library.crate_pl[_bar_deck()].is_empty())
-	var bar_id := _library.id_for(_bar_path())
-	var list: Array = store.get(bar_id, [])
+	_write_cue(_bar_deck(), clampf(at, 0.0, _len()), 0)
+
+## The same marker, on ANY deck, optionally carrying a pad SLOT. Split out of _add_cue so a pad
+## on deck B can drop one without the transport bar being anywhere near that track.
+func _write_cue(deck: int, t: float, slot: int) -> void:
+	var path := _deck_path(deck)
+	if path.is_empty():
+		return
+	var store := _cue_store(not _library.crate_pl[deck].is_empty())
+	var id := _library.id_for(path)
+	var list: Array = store.get(id, [])
 	var cue := {
-		"id": next_cue_id(_cues_for(_bar_path())),
-		"time": clampf(at, 0.0, _len()),
+		"id": next_cue_id(_cues_for(path)),
+		"time": t,
 		"shape": "square",
-		"label": "CUE %d" % (_cues_for(_bar_path()).size() + 1),
+		"label": ("CUE %d" % slot) if slot > 0 else "CUE %d" % (_cues_for(path).size() + 1),
 		# the skin accent, captured at creation: markers read against every scheme, and a
 		# cue keeps the colour it was born with even after the skin changes
 		"color": theme.get_color("font_color", "Green").to_html(false),
 	}
+	if slot > 0:
+		cue["slot"] = slot   # only a pad's cue carries one; markers made on the bar have none
 	list.append(cue)
-	store[bar_id] = list
-	_note = "  //  %s @ %s" % [cue["label"], _time_text(float(cue["time"]))]
+	store[id] = list
+	_note = "  //  %s @ %s" % [cue["label"], _time_text(t)]
 	_clear_note_later()
 	_cue_overlay.queue_redraw()
 	_save_soon()
+
+## A pad's cue, dropped at that deck's own playhead. Refuses for the same reasons _add_cue does
+## -- nothing loaded, or a marker already within MIN_CUE_GAP_SEC -- but says so per deck.
+func _add_cue_on(deck: int, at: float, slot: int) -> void:
+	var path := _deck_path(deck)
+	var span := _deck_len(deck)
+	if path.is_empty() or span <= 0.0:
+		_note = "  //  NOTHING ON %s TO MARK" % AudioEngine.DECK_NAMES[deck]
+		_clear_note_later()
+		return
+	var t := clampf(_cue_stream_deck(deck, at), 0.0, span)
+	if cue_too_close(_cues_for(path), t, MIN_CUE_GAP_SEC):
+		_note = "  //  TOO CLOSE TO AN EXISTING MARKER"
+		_clear_note_later()
+		return
+	_write_cue(deck, t, slot)
+
+## Stored time <-> sounding time for one deck. _cue_stream() answers for the bar deck only, and a
+## pad on the other deck needs the same mirror when that deck is running in reverse.
+func _cue_stream_deck(deck: int, t: float) -> float:
+	return cue_stream_time(t, _deck_len(deck), _is_reversed(deck))
 
 ## The dictionary a cue of the given scope lives in, created on demand. Playlist scope
 ## with no playlist selected has nowhere to go, and the caller says so rather than

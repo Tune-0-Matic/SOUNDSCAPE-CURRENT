@@ -30,6 +30,11 @@ enum { BUTTON, FADER, STEPPER }
 ## action id -> [label, group, kind]. Order is the order the mapper draws them, exactly as
 ## KEYBIND_SPEC drives the keybind rows in TBS.
 ##
+## IDS ARE STRUCTURED, not arbitrary: an "a_" or "b_" prefix names the deck and the rest is the
+## same id the focused-deck action uses, so player.gd splits one off the other with two lines
+## instead of fifty explicit cases. Keep that shape when adding to this table -- "a_eq_low" works
+## because "eq_low" exists.
+##
 ## Every one of these calls something that already exists in the player. Nothing here is a
 ## feature waiting to be written -- see the gaps note at the bottom of this file for the three
 ## DJ controls that are NOT in this table, and why.
@@ -52,13 +57,48 @@ const ACTIONS := {
 	"eq_mid":      ["EQ MID", "DECK", FADER],
 	"eq_high":     ["EQ HIGH", "DECK", FADER],
 	"sync":        ["BEAT SYNC", "DECK", BUTTON],
-	# --- the decks by name. These STEAL FOCUS: see _run_midi in player.gd ---
-	"a_play":      ["A PLAY / PAUSE", "DECK A", BUTTON],
+	"cue_del_1":   ["CUE 1 CLEAR", "DECK", BUTTON],
+	"cue_del_2":   ["CUE 2 CLEAR", "DECK", BUTTON],
+	"cue_del_3":   ["CUE 3 CLEAR", "DECK", BUTTON],
+	"cue_del_4":   ["CUE 4 CLEAR", "DECK", BUTTON],
+	# --- the decks BY NAME, addressed directly ---
+	#
+	# These do NOT take focus. Every one of them drives its own deck's player, EQ rack and
+	# markers by index, so the right-hand side of a controller can run deck B while the screen
+	# is still showing deck A -- which is the only way a two-deck surface is usable at all.
+	# SELECT is here for when moving the screen IS what you want.
+	"a_play_pause": ["A PLAY / PAUSE", "DECK A", BUTTON],
 	"a_stop":      ["A STOP", "DECK A", BUTTON],
-	"a_select":    ["A SELECT", "DECK A", BUTTON],
-	"b_play":      ["B PLAY / PAUSE", "DECK B", BUTTON],
+	"a_select":    ["A SELECT (MOVES FOCUS)", "DECK A", BUTTON],
+	"a_seek":      ["A SEEK POSITION", "DECK A", FADER],
+	"a_jog":       ["A JOG NUDGE", "DECK A", STEPPER],
+	"a_next":      ["A NEXT TRACK", "DECK A", BUTTON],
+	"a_prev":      ["A PREVIOUS TRACK", "DECK A", BUTTON],
+	"a_sync":      ["A BEAT SYNC", "DECK A", BUTTON],
+	"a_cue_set":   ["A CUE SET HERE", "DECK A", BUTTON],
+	"a_cue_1":     ["A CUE 1", "DECK A", BUTTON],
+	"a_cue_2":     ["A CUE 2", "DECK A", BUTTON],
+	"a_cue_3":     ["A CUE 3", "DECK A", BUTTON],
+	"a_cue_4":     ["A CUE 4", "DECK A", BUTTON],
+	"a_eq_low":    ["A EQ LOW", "DECK A", FADER],
+	"a_eq_mid":    ["A EQ MID", "DECK A", FADER],
+	"a_eq_high":   ["A EQ HIGH", "DECK A", FADER],
+	"b_play_pause": ["B PLAY / PAUSE", "DECK B", BUTTON],
 	"b_stop":      ["B STOP", "DECK B", BUTTON],
-	"b_select":    ["B SELECT", "DECK B", BUTTON],
+	"b_select":    ["B SELECT (MOVES FOCUS)", "DECK B", BUTTON],
+	"b_seek":      ["B SEEK POSITION", "DECK B", FADER],
+	"b_jog":       ["B JOG NUDGE", "DECK B", STEPPER],
+	"b_next":      ["B NEXT TRACK", "DECK B", BUTTON],
+	"b_prev":      ["B PREVIOUS TRACK", "DECK B", BUTTON],
+	"b_sync":      ["B BEAT SYNC", "DECK B", BUTTON],
+	"b_cue_set":   ["B CUE SET HERE", "DECK B", BUTTON],
+	"b_cue_1":     ["B CUE 1", "DECK B", BUTTON],
+	"b_cue_2":     ["B CUE 2", "DECK B", BUTTON],
+	"b_cue_3":     ["B CUE 3", "DECK B", BUTTON],
+	"b_cue_4":     ["B CUE 4", "DECK B", BUTTON],
+	"b_eq_low":    ["B EQ LOW", "DECK B", FADER],
+	"b_eq_mid":    ["B EQ MID", "DECK B", FADER],
+	"b_eq_high":   ["B EQ HIGH", "DECK B", FADER],
 	# --- the mixer ---
 	"crossfader":  ["CROSSFADER", "MIXER", FADER],
 	"auto_fade":   ["AUTO FADE ACROSS", "MIXER", BUTTON],
@@ -75,7 +115,14 @@ const ACTIONS := {
 	"viz_full":    ["VIZ FULLSCREEN", "GLOBAL", BUTTON],
 	"os_full":     ["OS FULLSCREEN", "GLOBAL", BUTTON],
 	"mark":        ["MARK MODE", "GLOBAL", BUTTON],
+	# The controller's own SHIFT, so a pad grid can do two things. Held rather than pressed:
+	# player.gd reads this one's value on EVERY message instead of only on the press, which is
+	# what a modifier needs and what nothing else here wants.
+	"shift":       ["SHIFT (HOLD)", "GLOBAL", BUTTON],
 }
+
+## Actions whose RELEASE matters as much as their press. Everything else fires once and forgets.
+const HELD := ["shift"]
 
 ## action -> {"kind": "cc"|"note", "ch": int, "num": int, "mode": int}
 ## Empty by default: an unbound program is the right thing to ship, because a default map for a
