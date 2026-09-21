@@ -1783,19 +1783,31 @@ func _setup_queue_tab() -> void:
 				_recount())
 	var row := HFlowContainer.new()
 	tab.add_child(row)
-	for spec in [["[ UP ]", -1], ["[ DOWN ]", 1]]:
+	# Spelled out rather than UP / DOWN / REMOVE / CLEAR: two of those four are ambiguous the
+	# moment there is a track list on the same screen -- REMOVE reads as "off the disk" and
+	# CLEAR as "clear the selection" -- and this is the one tab where a mis-click silently
+	# throws away an order somebody built by hand.
+	for spec in [["[ MOVE UP ]", -1], ["[ MOVE DOWN ]", 1]]:
 		var delta: int = spec[1]
 		var b := Button.new()
 		b.text = spec[0]
 		b.pressed.connect(func() -> void: _queue_move(delta))
+		var way: String = "UP" if delta < 0 else "DOWN"
+		_hover_note(b, func() -> String:
+			return "MOVES THE SELECTED TRACK ONE PLACE %s THE QUEUE" % way)
 		row.add_child(b)
 	var drop := Button.new()
-	drop.text = "[ REMOVE ]"
+	drop.text = "[ REMOVE TRACK ]"
 	drop.pressed.connect(_queue_drop)
+	_hover_note(drop, func() -> String:
+		return "TAKES THE SELECTED TRACK OUT OF THE QUEUE  //  THE FILE AND THE LIBRARY ARE UNTOUCHED")
 	row.add_child(drop)
 	var clear := Button.new()
-	clear.text = "[ CLEAR ]"
+	clear.text = "[ CLEAR QUEUE ]"
 	clear.pressed.connect(_clear_queue)
+	_hover_note(clear, func() -> String:
+		return "EMPTIES THE QUEUE: %d TRACK%s  //  PLAYBACK CARRIES ON FROM THE CRATE" % [
+			_up_next.size(), "" if _up_next.size() == 1 else "S"])
 	row.add_child(clear)
 	var note := Label.new()
 	note.text = "PLAY NEXT GOES TO THE TOP\nADD TO QUEUE GOES TO THE BOTTOM"
@@ -2033,6 +2045,7 @@ func _process(delta: float) -> void:
 	_flash = maxf(_flash - delta, 0.0)
 	_clamp_playbar()
 	_now_update()
+	_now_drag_step()
 	_marquee_step(delta)
 	%Play.text = "PAUSE" if _state() == "PLAYING" else "PLAY"
 	# tracks the fit in wall-clock time, so the readout settles the same at any FPS
@@ -3255,20 +3268,19 @@ func _toggle_now_playing(on: bool) -> void:
 	# the RIGHT or BOTTOM padding strip resizes instead -- a borderless window has no frame to
 	# grab, and a fixed size clipped the time and the buttons off the right edge the moment the
 	# font got wider than the 460 px this was built at.
+	# Only the PRESS and the release are read here. The motion is polled in _now_drag_step()
+	# instead, because a window stops receiving motion events the moment the pointer leaves it
+	# -- which is the first thing that happens when you drag a corner outward. Reading the
+	# screen position every frame while the button is down is what makes both smooth.
 	win.window_input.connect(func(e: InputEvent) -> void:
 		var click := e as InputEventMouseButton
-		if click and click.button_index == MOUSE_BUTTON_LEFT:
-			var local := DisplayServer.mouse_get_position() - win.position
-			_now_resizing = click.pressed and (local.x >= win.size.x - NOW_EDGE \
-				or local.y >= win.size.y - NOW_EDGE)
-			_now_dragging = click.pressed and not _now_resizing
-			_now_grab = DisplayServer.mouse_get_position() - (win.size if _now_resizing else win.position)
-		elif e is InputEventMouseMotion and (_now_dragging or _now_resizing):
-			var at := DisplayServer.mouse_get_position() - _now_grab
-			if _now_resizing:
-				win.size = Vector2i(maxi(at.x, win.min_size.x), maxi(at.y, win.min_size.y))
-			else:
-				win.position = at)
+		if not click or click.button_index != MOUSE_BUTTON_LEFT:
+			return
+		var local := DisplayServer.mouse_get_position() - win.position
+		_now_resizing = click.pressed and (local.x >= win.size.x - NOW_EDGE \
+			or local.y >= win.size.y - NOW_EDGE)
+		_now_dragging = click.pressed and not _now_resizing
+		_now_grab = DisplayServer.mouse_get_position() - (win.size if _now_resizing else win.position))
 	_now_win = win
 	if _now_pos.x >= 0:
 		win.position = _now_pos   # a mode switch reopens the window; it must not jump to the middle
@@ -3286,7 +3298,8 @@ func _toggle_now_playing(on: bool) -> void:
 		win.size = Vector2i(maxi(win.size.x, need.x), maxi(win.size.y, need.y))).call_deferred()
 	_now_update()
 
-## Cycles DISPLAY -> CASUAL -> COMPACT. The window is rebuilt rather than reshuffled: three
+## Cycles DISPLAY -> CASUAL -> COMPACT -> MARQUEE. The window is rebuilt rather than reshuffled:
+## four
 ## layouts that share two labels is less code than one layout that has to unbuild itself, and
 ## the position is carried across so it reopens exactly where it was.
 func _set_now_mode(mode: int) -> void:
@@ -3329,6 +3342,25 @@ func _now_update() -> void:
 			else "%s / %s" % [_time_text(_pos()), _time_text(length)]
 	if is_instance_valid(_now_bar):
 		_now_bar.value = (_pos() / length * 100.0) if not path.is_empty() and length > 0.0 else 0.0
+
+## Moves or resizes the mini bar while its own face is held. Run from _process, off the SCREEN
+## pointer rather than off window motion events: the window stops getting those as soon as the
+## pointer crosses its edge, so a corner drag used to travel a few pixels and stop dead. The
+## button state is read from Input for the same reason -- the release can land outside too.
+func _now_drag_step() -> void:
+	if not (_now_dragging or _now_resizing) or not is_instance_valid(_now_win):
+		return
+	if not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+		_now_dragging = false
+		_now_resizing = false
+		return
+	var at := DisplayServer.mouse_get_position() - _now_grab
+	if _now_resizing:
+		# min_size is what the contents measure, so this cannot be dragged small enough to
+		# clip a button off the end whichever of the four modes is showing
+		_now_win.size = Vector2i(maxi(at.x, _now_win.min_size.x), maxi(at.y, _now_win.min_size.y))
+	else:
+		_now_win.position = at
 
 func _refresh_now_btn() -> void:
 	if is_instance_valid(_now_btn):
@@ -3487,18 +3519,9 @@ static func marquee_test() -> bool:
 ## twenty tracks into the queue should not mean shift-clicking the far end of them.
 func _on_list_pointer(e: InputEvent, crate: int) -> void:
 	var list: ItemList = [_tracks, _tracks_b][crate]
-	# A FOCUSED ItemList eats the arrow keys, and in KEYBOARD NAVIGATION mode the track lists can
-	# hold focus -- so SEEK BACK and SEEK FORWARD (LEFT and RIGHT by default) simply stopped
-	# working while a list was focused. UP and DOWN stay with the list, because walking rows is
-	# what they are for in a one-column list and what kb_nav exists to do; every other key the
-	# transport has a binding for belongs to the transport, focus or no focus.
-	var key := e as InputEventKey
-	if key and key.pressed and not key.is_echo():
-		if key.keycode != KEY_UP and key.keycode != KEY_DOWN and not _action_for_key(key.keycode).is_empty():
-			# the same handler the key would have reached had the list not been focused
-			_unhandled_input(key)
-			list.accept_event()
-		return
+	# The key forwarding that used to live here is gone: _transport_key() takes the transport's
+	# keys at the root now, before any focused control sees them, so it covers these two lists
+	# and every button, tab and tree besides.
 	var click := e as InputEventMouseButton
 	if click and click.pressed and click.button_index == MOUSE_BUTTON_RIGHT:
 		# BEFORE ItemList sees it: this signal runs ahead of the control's own handler, which is
@@ -3885,6 +3908,28 @@ func _setup_tbs() -> void:
 	_tbs_tab = tab
 	_add_settings_rows()
 	_group_settings()
+	_wheel_through(_tbs_home)
+
+## Wheel events reach a ScrollContainer only if nothing under the pointer swallows them first,
+## and a Button's default mouse_filter is STOP. TBS is mostly buttons, so the wheel worked over
+## the gaps between rows and nowhere else -- which reads as "the panel does not scroll", because
+## the gaps are not where anyone puts the pointer. PASS lets each control handle what it wants
+## and hands the rest up to its parent, so the panel scrolls wherever the pointer is sitting.
+##
+## RANGES ARE LEFT ALONE ON PURPOSE. The bars in here -- VOLUME BOOST, FADE TIME, the visual
+## sliders -- take the wheel themselves through _bar_wheel, and passing it on as well would
+## change the value AND scroll the panel out from under it on the same notch. Same for the
+## dropdowns and any text field.
+func _wheel_through(from: Node) -> void:
+	var stack: Array[Node] = [from]
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		var c := n as Control
+		if c and not (c is Range) and not (c is LineEdit) and not (c is OptionButton) \
+				and c.mouse_filter == Control.MOUSE_FILTER_STOP:
+			c.mouse_filter = Control.MOUSE_FILTER_PASS
+		for child in n.get_children():
+			stack.append(child)
 
 ## WHICH GROUP EACH SETTING BELONGS TO, by the row's node name. Anything not named here lands
 ## in ADVANCED, so a row added later shows up somewhere rather than vanishing -- and a keybind
@@ -5391,10 +5436,16 @@ func _unhandled_input(event: InputEvent) -> void:
 	# track dozens of times a second and backed up a queue of seeks behind the mix.
 	if k.is_echo():
 		return
+	# Typing wins, stated rather than relied upon. A VISIBLE focused LineEdit eats the key
+	# before this ever runs, which is what has kept SEARCH typing out of the shortcuts and out
+	# of the code buffer -- but a field that holds focus while hidden eats nothing, and then
+	# every letter of a search would drive a shortcut. One line beats reasoning about which
+	# fields can be in that state.
+	if get_viewport().gui_get_focus_owner() is LineEdit:
+		return
 	# Fed BEFORE the shortcuts below and deliberately NOT consuming the event, so a letter
-	# can drive its shortcut and advance a code in the same press. A focused LineEdit has
-	# already eaten the key long before this point, which is what keeps SEARCH typing out
-	# of the buffer -- see the note on LOCAL_CODES.
+	# can drive its shortcut and advance a code in the same press -- see the note on
+	# LOCAL_CODES.
 	var ch := OS.get_keycode_string(k.keycode)
 	if ch.length() == 1 and ch >= "A" and ch <= "Z":
 		_push_code_key(ch)
@@ -5783,12 +5834,44 @@ func _input(event: InputEvent) -> void:
 			_finish_rebind(event.keycode)
 			get_viewport().set_input_as_handled()
 		return
-	if not %Intro.visible:
+	if %Intro.visible:
+		var skip: bool = (event is InputEventKey and event.pressed) or (event is InputEventMouseButton and event.pressed)
+		if skip:
+			_begin_boot()
+			get_viewport().set_input_as_handled()
 		return
-	var skip: bool = (event is InputEventKey and event.pressed) or (event is InputEventMouseButton and event.pressed)
-	if skip:
-		_begin_boot()
+	if _transport_key(event):
 		get_viewport().set_input_as_handled()
+
+## The transport's keys, taken at the ROOT before the focused control ever sees them.
+##
+## _unhandled_input runs only for events nothing consumed, and a focused control consumes
+## them: click a button, a tab or a list and SPACE belonged to that control rather than to
+## PLAY/PAUSE. Outside KEYBOARD NAVIGATION nothing in this program is focusable -- _drop_focus
+## sees to that -- so this is belt and braces there; inside it, it is the whole fix.
+##
+## TWO EXCEPTIONS, and both earn their keep:
+##   - a LineEdit with focus is somebody TYPING. Every letter, arrow and space belongs to them,
+##     and this is the one case where the transport must keep its hands off entirely.
+##   - UP and DOWN while KEYBOARD NAVIGATION is on walk the UI, which is what that mode is
+##     for. Everything else still reaches the transport there, and ENTER still activates the
+##     focused control, so the mode stays usable with SPACE taken.
+##
+## Routed through _unhandled_input rather than a second copy of the match: that function also
+## feeds the cheat-code buffer, and a shortcut intercepted here would otherwise stop a letter
+## key counting toward a code.
+func _transport_key(event: InputEvent) -> bool:
+	var k := event as InputEventKey
+	if not k or not k.pressed or k.is_echo():
+		return false
+	if get_viewport().gui_get_focus_owner() is LineEdit:
+		return false
+	if _kb_nav and (k.keycode == KEY_UP or k.keycode == KEY_DOWN):
+		return false
+	if _action_for_key(k.keycode).is_empty():
+		return false
+	_unhandled_input(k)
+	return true
 
 
 # --- volume booster --------------------------------------------------------
