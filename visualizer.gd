@@ -8,7 +8,10 @@ extends Control
 
 ## SNAKE is last and deliberately outside the normal cycle: player.gd's VIZ_NAMES only
 ## reaches it once the code has been typed, so an unlocked mode cannot be stumbled into.
-enum Mode { SEGMENTS, MIRROR, WATERFALL, GRID, RADIAL, MATRIX, TUNNEL, CRUISE, FIRE, KALEIDO, SNAKE }
+## COUNTACH is CRUISE's road with the LP5000 S parked on it instead of the original wedge.
+## It goes BEFORE snake, never after: player.gd hides the LAST entry until SNAKE is unlocked.
+enum Mode { SEGMENTS, MIRROR, WATERFALL, GRID, RADIAL, MATRIX, TUNNEL, CRUISE, FIRE, KALEIDO,
+	COUNTACH, SNAKE }
 
 const PRESETS: Array[Color] = [
 	Color(0.18, 0.8, 0.443),   # green
@@ -118,6 +121,7 @@ var _fire_img: Image
 var _fire_tex: ImageTexture
 var _road_phase := 0.0
 var _car := Countach.new()
+var _car_s := CountachS.new()   # the LP5000 S, for COUNTACH mode; CRUISE keeps the original
 
 func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -145,6 +149,7 @@ func _ready() -> void:
 	_field_mat.shader = load("res://viz_field.gdshader")
 	_field_mat.set_shader_parameter("palette", _pal_tex)
 	add_child(_car)  # child so its _process drives the suspension jitter
+	add_child(_car_s)
 
 ## Wide enough that a gradient reads as a gradient across the display and narrow enough that
 ## rebuilding it every frame is nothing: 64 colours against the 2,240 the fire used to build.
@@ -471,7 +476,7 @@ func _process(delta: float) -> void:
 	elif mode == Mode.TUNNEL:
 		# flight speed rides the bass; SPEED scales the whole thing
 		_tun_phase += delta * (0.35 + bass * 2.4) * lerpf(0.5, 2.2, speed)
-	elif mode == Mode.CRUISE:
+	elif mode == Mode.CRUISE or mode == Mode.COUNTACH:
 		_road_phase += delta * (2.0 + bass * 9.0) * lerpf(0.5, 2.0, speed)
 	_sync_field_material()
 	queue_redraw()
@@ -500,9 +505,10 @@ func _draw() -> void:
 		Mode.RADIAL: _draw_radial()
 		Mode.MATRIX: _draw_matrix()
 		Mode.TUNNEL: _draw_tunnel()
-		Mode.CRUISE: _draw_cruise()
+		Mode.CRUISE: _draw_cruise(_car)
 		Mode.FIRE: _draw_fire()
 		Mode.KALEIDO: _draw_kaleido()
+		Mode.COUNTACH: _draw_cruise(_car_s)
 		Mode.SNAKE: _draw_snake()
 
 ## Classic lit-cell ladder. Every coordinate is snapped to an integer or the low-res
@@ -674,7 +680,10 @@ func _quad(a: Vector3, b: Vector3, c: Vector3, d: Vector3, col: Color) -> void:
 func _depth_fade(z: float, c: Color) -> Color:
 	return Color(c, clampf(1.0 - (z - Z_NEAR) / Z_FAR, 0.12, 1.0))
 
-func _draw_cruise() -> void:
+## `car` is the only thing that differs between CRUISE and COUNTACH: same road, same sun,
+## same verge bars, a different wireframe parked on it. Passing the car in rather than
+## copying the mode wholesale means the road can never drift apart between the two.
+func _draw_cruise(car: Countach) -> void:
 	var n := AudioDirector.BAND_COUNT
 	var c := color()
 	_draw_sun(c)
@@ -717,17 +726,17 @@ func _draw_cruise() -> void:
 	# --- the car: square to the road, wheels sitting on the road plane
 	var cz := 6.2
 	var body := Color(c, 1.0)
-	var pts := _car.edges()
+	var pts := car.edges()
 	var i := 0
 	while i < pts.size():
-		_seg(_car_pt(pts[i], cz), _car_pt(pts[i + 1], cz), body)
+		_seg(_car_pt(car, pts[i], cz), _car_pt(car, pts[i + 1], cz), body)
 		i += 2
 
 ## Local car space -> world. No yaw: the car's axis stays parallel to the road edges.
 ## The suspension offset is applied here rather than baked into the geometry, so the
 ## edge list stays immutable and is built exactly once.
-func _car_pt(p: Vector3, cz: float) -> Vector3:
-	var o := _car.offset
+func _car_pt(car: Countach, p: Vector3, cz: float) -> Vector3:
+	var o := car.offset
 	return Vector3(p.x + o.x, p.y + o.y, cz + p.z)
 
 

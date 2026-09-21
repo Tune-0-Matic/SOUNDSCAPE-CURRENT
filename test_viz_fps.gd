@@ -11,6 +11,7 @@ extends SceneTree
 ##   4. nobody can see it: inside a SubViewport switched to UPDATE_DISABLED -- what its container
 ##      does while a Video TEST picture hides the cell -- _process does no work, and wakes when on
 ##   5. the field shader is on for WATERFALL and FIRE only, and comes off when either is left
+##   6. the COUNTACH car's silhouette holds up, and SNAKE is still the last mode in the enum
 ##   godot --headless --path . --script res://test_viz_fps.gd
 
 const RATES := [60.0, 144.0, 240.0]
@@ -168,6 +169,16 @@ func _initialize() -> void:
 	ok = ok and field_only
 	print("field shader on for FIRE / CRUISE / WATERFALL / SEGMENTS in turn: %s: %s" % [mats, field_only])
 	shader_viz.free()
+
+	# 6. the LP5000 S silhouette: denser than the car it replaces, nothing under the road, and
+	# the wing, the flares and the engine louvres all still there. Pure geometry, no viewport.
+	var shape := CountachS.model_test()
+	ok = ok and shape
+	print("countach LP5000 S silhouette (wing V, rear flare, louvres, edge budget): %s" % shape)
+	# and COUNTACH must not have landed after SNAKE, which is the slot player.gd hides
+	var last_is_snake: bool = Visualizer.Mode.keys()[Visualizer.Mode.size() - 1] == "SNAKE"
+	ok = ok and last_is_snake
+	print("SNAKE is still the last mode (the unlock gate hides the last one): %s" % last_is_snake)
 
 	player.stop()
 	print("RESULT ", "PASS" if ok else "FAIL")
