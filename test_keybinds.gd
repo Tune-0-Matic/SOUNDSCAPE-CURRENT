@@ -186,6 +186,20 @@ func _initialize() -> void:
 	ok = ok and ignored_off
 	print("a note-off does not take the binding, and learn keeps listening: %s" % ignored_off)
 
+	# device enumeration, against mock lists -- the only way to check it on a machine with
+	# nothing plugged in, and the empty case is the one people actually hit
+	var none := MidiMap.device_note(PackedStringArray([]))
+	var one := MidiMap.device_note(PackedStringArray(["Traktor Kontrol S2 MK2"]))
+	var many := MidiMap.device_note(PackedStringArray(["Traktor Kontrol S2 MK2", "loopMIDI Port"]))
+	var devices: bool = none == "NO MIDI DEVICES FOUND" \
+		and one.contains("Traktor Kontrol S2 MK2") and one.begins_with("1 MIDI INPUT") \
+		and many.begins_with("2 MIDI INPUTS") and many.contains("loopMIDI Port")
+	ok = ok and devices
+	print("device enumeration reports its exact names: %s" % devices)
+	print("   none -> %s" % none)
+	print("   one  -> %s" % one)
+	print("   many -> %s" % many)
+
 	# every action in the table must be dispatchable: an id in ACTIONS with no arm in the
 	# match statements would bind, light up in the mapper and then do nothing at all
 	var missing: Array[String] = []

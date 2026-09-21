@@ -117,6 +117,21 @@ static func is_press(e: InputEventMIDI) -> bool:
 static func to_unit(v: int) -> float:
 	return clampf(float(v) / 127.0, 0.0, 1.0)
 
+## What the device row and the status line say about a list of connected inputs. Pure, so the
+## enumeration can be checked against mock lists -- which is the only way to check it at all on a
+## machine with no controller plugged in.
+##
+## The exact string Godot hands back is printed rather than summarised: a controller can enumerate
+## under a name nobody expects ("2- Traktor Kontrol S2 MK2", a vendor's own wrapper port), and
+## knowing which of several ports is the one sending is the whole question when nothing arrives.
+static func device_note(names: PackedStringArray) -> String:
+	if names.is_empty():
+		return "NO MIDI DEVICES FOUND"
+	if names.size() == 1:
+		return "1 MIDI INPUT: %s" % names[0]
+	return "%d MIDI INPUTS, USING %s  //  ALSO: %s" % [names.size(), names[0],
+		", ".join(Array(names).slice(1))]
+
 ## The monitor line. Channels are printed 1-16 the way every controller's own documentation
 ## numbers them, while the event carries 0-15 -- getting that backwards is an hour of wondering
 ## why the manual disagrees with the screen.

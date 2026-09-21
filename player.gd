@@ -3326,12 +3326,18 @@ func _open_midi_window() -> void:
 	# A permanent line, not an error state. An empty device list or a silent monitor is almost
 	# always the controller sitting in its own HID mode rather than anything wrong with a
 	# mapping, and there is no way to guess that from inside the app.
+	# The wording matters more than it looks. "IT WORKS IN MIXXX" is the single most likely thing
+	# somebody will have tried before opening this window, and it is not reassurance -- it is the
+	# diagnosis. Mixxx drives these controllers over raw HID; Godot has no HID at all, only MIDI.
+	# A controller happily working there can be completely invisible here, and the fix is on the
+	# controller, not in this program.
 	var hint := Label.new()
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hint.theme_type_variation = &"Green"
-	hint.text = "NO DEVICE, OR NOTHING IN THE MONITOR? NATIVE INSTRUMENTS CONTROLLERS BOOT IN " \
-		+ "HID MODE FOR TRAKTOR AND SEND NO MIDI AT ALL. PUT THE S2 IN GENERIC MIDI MODE " \
-		+ "(SHIFT + QUANT, OR THE NI CONTROLLER EDITOR), THEN PRESS REFRESH."
+	hint.text = "NO DEVICE DETECTED? WORKING IN MIXXX DOES NOT MEAN IT WILL APPEAR HERE: " \
+		+ "MIXXX DRIVES THESE OVER HID, AND THIS READS MIDI ONLY. OPEN THE NI CONTROLLER " \
+		+ "EDITOR AND CHECK 'ENABLE MIDI INTERFACE' IN PREFERENCES, THEN PRESS REFRESH. " \
+		+ "UNTIL WINDOWS LISTS IT AS A MIDI INPUT, NOTHING HERE CAN SEE IT."
 	col.add_child(hint)
 
 	_midi_monitor = Label.new()
@@ -3430,21 +3436,34 @@ func _refresh_midi_row(action: String) -> void:
 	mode_btn.text = str(MidiMap.MODE_NAMES[_midi.mode_of(action)])
 	mode_btn.disabled = _midi.key_of(action).is_empty()   # nothing to be relative about
 
-## Godot only reports devices it has OPENED, so the list is empty until open_midi_inputs() has
-## run -- which _ready does. Re-opening is how a controller plugged in after launch is noticed.
+## Godot only reports devices it has OPENED, and it enumerates ONCE, inside open_midi_inputs().
+## A controller plugged in after launch is therefore invisible until the driver is taken down and
+## brought back up -- which is what REFRESH is for.
+##
+## CLOSE FIRST, always. Godot's Windows driver appends to its list of open sources rather than
+## rebuilding it, so calling open twice without a close leaves the same device connected twice
+## and every message arriving twice with it -- a fader that jumps two steps a notch and a pad
+## that toggles play and then toggles it back. The pair is not optional.
 func _refresh_midi_devices() -> void:
 	if not is_instance_valid(_midi_device):
 		return
+	OS.close_midi_inputs()
 	OS.open_midi_inputs()
 	var found := OS.get_connected_midi_inputs()
 	_midi_device.clear()
+	_midi_device.disabled = found.is_empty()
 	if found.is_empty():
 		_midi_device.add_item("NO MIDI DEVICES FOUND")
-		_midi_device.disabled = true
-		return
-	_midi_device.disabled = false
-	for name in found:
-		_midi_device.add_item(str(name))
+	else:
+		for name in found:
+			_midi_device.add_item(str(name))
+		_midi_device.selected = 0   # something is always chosen, so the row never reads as unset
+	# printed as well as shown: the name Godot reports is the one piece of evidence worth having
+	# when a controller is connected and still silent, and the status line scrolls away
+	var note := MidiMap.device_note(found)
+	print("MIDI: ", note)
+	_note = "  //  %s" % note
+	_clear_note_later()
 
 ## FILE INFO: what the file actually is, read from the file. The same probe TRACK INFO uses,
 ## laid out where it can be read and left open while other tracks play.
