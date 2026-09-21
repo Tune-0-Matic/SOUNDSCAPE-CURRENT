@@ -1783,32 +1783,31 @@ func _setup_queue_tab() -> void:
 				_recount())
 	var row := HFlowContainer.new()
 	tab.add_child(row)
-	# Spelled out rather than UP / DOWN / REMOVE / CLEAR: two of those four are ambiguous the
-	# moment there is a track list on the same screen -- REMOVE reads as "off the disk" and
-	# CLEAR as "clear the selection" -- and this is the one tab where a mis-click silently
-	# throws away an order somebody built by hand.
-	for spec in [["[ MOVE UP ]", -1], ["[ MOVE DOWN ]", 1]]:
+	# A symbol and a short word each. The glyphs are CHECKED against the program's own font
+	# rather than chosen from a character map: Px437 IBM BIOS has the two triangles at U+25B2
+	# and U+25BC, and does NOT have the heavy X at U+2716 or the wastebasket at U+1F5D1 -- a
+	# button carrying either of those would have drawn empty, which is the bug being fixed
+	# here. X and the filled block are in the font and say the same thing.
+	#
+	# Short words, not the full sentences these had: REMOVE alone reads as "off the disk" with
+	# a track list on the same screen, and DEL beside an X does not. The hover line carries the
+	# rest, and this is the one tab where a mis-click silently throws away a hand-built order.
+	for spec in [["[ ▲ UP ]", -1], ["[ ▼ DOWN ]", 1]]:
 		var delta: int = spec[1]
-		var b := Button.new()
-		b.text = spec[0]
+		var b := _queue_button(row, str(spec[0]))
 		b.pressed.connect(func() -> void: _queue_move(delta))
 		var way: String = "UP" if delta < 0 else "DOWN"
 		_hover_note(b, func() -> String:
 			return "MOVES THE SELECTED TRACK ONE PLACE %s THE QUEUE" % way)
-		row.add_child(b)
-	var drop := Button.new()
-	drop.text = "[ REMOVE TRACK ]"
+	var drop := _queue_button(row, "[ X DEL ]")
 	drop.pressed.connect(_queue_drop)
 	_hover_note(drop, func() -> String:
 		return "TAKES THE SELECTED TRACK OUT OF THE QUEUE  //  THE FILE AND THE LIBRARY ARE UNTOUCHED")
-	row.add_child(drop)
-	var clear := Button.new()
-	clear.text = "[ CLEAR QUEUE ]"
+	var clear := _queue_button(row, "[ ■ CLEAR ]")
 	clear.pressed.connect(_clear_queue)
 	_hover_note(clear, func() -> String:
 		return "EMPTIES THE QUEUE: %d TRACK%s  //  PLAYBACK CARRIES ON FROM THE CRATE" % [
 			_up_next.size(), "" if _up_next.size() == 1 else "S"])
-	row.add_child(clear)
 	var note := Label.new()
 	note.text = "PLAY NEXT GOES TO THE TOP\nADD TO QUEUE GOES TO THE BOTTOM"
 	note.theme_type_variation = &"Green"
@@ -1820,6 +1819,19 @@ func _setup_queue_tab() -> void:
 ## costs nothing to refill, while `is_visible_in_tree()` is false for a tab nobody has clicked --
 ## so the guard left the list permanently empty and only the first visit would have filled it.
 ## The 20k-row relayout that guards like that exist for is the TRACK list's problem, not this one.
+## One queue button, added and then PINNED. The order matters: _drop_focus runs off node_added
+## and sets clip_text on everything under the tabs, so the pin has to be taken after the button
+## is in the tree or the clip wins and the button collapses to a couple of characters. Pinning
+## also survives the re-walk that toggling KEYBOARD NAVIGATION does, where simply clearing
+## clip_text here would not.
+func _queue_button(row: Control, text: String) -> Button:
+	var b := Button.new()
+	b.text = text
+	row.add_child(b)
+	b.custom_minimum_size.y = 24   # a comfortable target for a destructive button
+	_pin_label(b)
+	return b
+
 func _queue_refresh() -> void:
 	if not is_instance_valid(_queue_list):
 		return   # _recount() runs during boot, before the tab is built
@@ -3202,7 +3214,12 @@ func _toggle_now_playing(on: bool) -> void:
 	if root_sb:
 		chassis.add_theme_stylebox_override("panel", root_sb)
 	win.add_child(chassis)
+	# PASS, not the default STOP: the whole face of this window is a drag handle and its edges
+	# are a resize handle, so the chassis and its padding must not be the reason a press near
+	# an edge is somebody else's event.
+	chassis.mouse_filter = Control.MOUSE_FILTER_PASS
 	var pad := MarginContainer.new()
+	pad.mouse_filter = Control.MOUSE_FILTER_PASS
 	pad.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	pad.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	for side in ["left", "top", "right", "bottom"]:
@@ -3281,6 +3298,21 @@ func _toggle_now_playing(on: bool) -> void:
 			or local.y >= win.size.y - NOW_EDGE)
 		_now_dragging = click.pressed and not _now_resizing
 		_now_grab = DisplayServer.mouse_get_position() - (win.size if _now_resizing else win.position))
+	# The grip. A borderless window gives no sign that its corner does anything, and an 8 px
+	# strip nobody can see is a feature nobody finds. Added to the WINDOW rather than into the
+	# column, anchored to the bottom-right, so it floats over whichever of the four layouts is
+	# showing without taking part in any of them. U+25E2 is in Px437; it was checked, unlike
+	# the two glyphs the queue buttons were nearly given.
+	var grip := Label.new()
+	grip.name = "Grip"
+	grip.text = "◢"
+	grip.mouse_filter = Control.MOUSE_FILTER_IGNORE   # window_input does the work, not this
+	grip.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT)
+	grip.offset_left = -20.0
+	grip.offset_top = -22.0
+	grip.offset_right = -2.0
+	grip.offset_bottom = -2.0
+	win.add_child(grip)
 	_now_win = win
 	if _now_pos.x >= 0:
 		win.position = _now_pos   # a mode switch reopens the window; it must not jump to the middle
@@ -3909,6 +3941,36 @@ func _setup_tbs() -> void:
 	_add_settings_rows()
 	_group_settings()
 	_wheel_through(_tbs_home)
+	_wheel_scrolls(scroll)
+
+## Wheel handling written out rather than left to the ScrollContainer's own.
+##
+## The container does handle the wheel, but only for events that actually reach it, and what
+## reaches it depends on the mouse_filter of everything stacked above -- which is a property on
+## forty-odd controls that anything adding a row later can get wrong again. This connects the
+## notch to scroll_vertical directly, on both the scroller and the column inside it, and
+## accepts the event so the container's own handler does not scroll a second time on top.
+##
+## A gui_input SIGNAL runs before the control's own _gui_input, which is what makes accepting
+## here enough to replace the built-in behaviour rather than add to it.
+const TBS_WHEEL_STEP := 40
+
+func _wheel_scrolls(scroll: ScrollContainer) -> void:
+	var step := func(e: InputEvent) -> void:
+		var click := e as InputEventMouseButton
+		if not click or not click.pressed:
+			return
+		if click.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+			scroll.scroll_vertical += TBS_WHEEL_STEP
+		elif click.button_index == MOUSE_BUTTON_WHEEL_UP:
+			scroll.scroll_vertical -= TBS_WHEEL_STEP
+		else:
+			return
+		scroll.accept_event()
+	scroll.gui_input.connect(step)
+	for child in scroll.get_children():
+		if child is Control:
+			(child as Control).gui_input.connect(step)
 
 ## Wheel events reach a ScrollContainer only if nothing under the pointer swallows them first,
 ## and a Button's default mouse_filter is STOP. TBS is mostly buttons, so the wheel worked over
@@ -4634,11 +4696,23 @@ func _open_tbs_window() -> void:
 	for side in ["left", "top", "right", "bottom"]:
 		pad.add_theme_constant_override("margin_" + side, 6)
 	chassis.add_child(pad)
+	# The detached window had NO scroller: the tab got one when the settings outgrew it, and
+	# this window -- which holds the same rows and can be dragged smaller than the tab ever is
+	# -- was left with a plain column, so anything past the bottom was simply unreachable.
+	var scroll := ScrollContainer.new()
+	scroll.name = "TbsWinScroll"
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+	pad.add_child(scroll)
 	# leave a marker behind so the tab does not just lose a third of itself
 	_tbs_col = VBoxContainer.new()
+	_tbs_col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_tbs_col.add_theme_constant_override("separation", 4)
-	pad.add_child(_tbs_col)
+	scroll.add_child(_tbs_col)
 	_move_rows(_tbs_home, _tbs_col)
+	_wheel_through(_tbs_col)
+	_wheel_scrolls(scroll)
 
 	_tbs_win = win
 	win.show()
@@ -6234,17 +6308,29 @@ func _drop_focus(n: Node) -> void:
 ## sidebar, the thing clip_text was for.
 const LABEL_PINNED := "pinned_width"
 
-func _pin_label(l: Label) -> void:
-	if l.text.is_empty() or (l.custom_minimum_size.x > 0.0 and not l.has_meta(LABEL_PINNED)):
+## Takes a Control rather than a Label because BUTTONS need it too, and for the same reason:
+## _drop_focus clips them, a clipped control reports no minimum width, and one sharing a row
+## with anything that expands is then squeezed to a couple of characters. Measured on the QUEUE
+## tab before this: four buttons 28 px wide holding text that needed 176 to 256, which reads as
+## four blank buttons. Pinning is used sparingly -- a button whose label CHANGES would put a
+## floor under the sidebar at its longest text, which is what the clipping is there to prevent.
+func _pin_label(l: Control) -> void:
+	var text := str(l.get("text"))
+	if text.is_empty() or (l.custom_minimum_size.x > 0.0 and not l.has_meta(LABEL_PINNED)):
 		return   # empty, or a width somebody set on purpose
 	var font := l.get_theme_font("font")
 	if not font:
 		return
 	var size := l.get_theme_font_size("font_size")
 	var widest := 0.0
-	for line in l.text.split("\n"):
+	for line in text.split("\n"):
 		widest = maxf(widest, font.get_string_size(line, HORIZONTAL_ALIGNMENT_LEFT, -1.0, size).x)
-	l.custom_minimum_size.x = ceilf(widest)
+	# buttons carry their own stylebox padding, which the text width knows nothing about
+	var pad := 0.0
+	if l is Button:
+		var sb := l.get_theme_stylebox("normal")
+		pad = sb.get_margin(SIDE_LEFT) + sb.get_margin(SIDE_RIGHT) if sb else 8.0
+	l.custom_minimum_size.x = ceilf(widest + pad)
 	l.set_meta(LABEL_PINNED, true)
 
 ## Every pinned caption re-measured. The pin is a pixel width, so a new font or a new size would
@@ -6255,9 +6341,9 @@ func _repin_labels() -> void:
 		var n: Node = stack.pop_back()
 		for c in n.get_children():
 			stack.append(c)
-		if n is Label and n.has_meta(LABEL_PINNED):
-			(n as Label).custom_minimum_size.x = 0.0
-			_pin_label(n as Label)
+		if (n is Label or n is Button) and n.has_meta(LABEL_PINNED):
+			(n as Control).custom_minimum_size.x = 0.0
+			_pin_label(n as Control)
 
 # --- RECORD SET tab ----------------------------------------------------------
 ## The one colour in the program that does not come from the skin. A failed take has to read as
