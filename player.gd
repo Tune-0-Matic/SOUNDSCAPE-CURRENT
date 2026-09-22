@@ -322,6 +322,9 @@ func _ready() -> void:
 	# Nothing arrives until this is called -- no events, and an empty device list. Called before
 	# the config loads so a binding read a moment later has somewhere to arrive from.
 	OS.open_midi_inputs()
+	# Deferred, so it runs after the config has been read: a remembered output device is honoured
+	# at launch, and falls back to Default on its own if that interface is not on this machine.
+	_set_output_device.call_deferred(_output_device)
 	# seeded unconditionally, not inside the config branch below: a first run with no
 	# library.cfg yet must still ship with working shortcuts, not a silently empty map
 	for action in KEYBIND_SPEC:
@@ -456,6 +459,9 @@ func _ready() -> void:
 		_bg_throttle = _cfg_bool(cfg, "visual", "bg_throttle", false)
 		_playbar_offset = int(_cfg_num(cfg, "visual", "playbar_split", 0.0))
 		_now_playing = _cfg_bool(cfg, "visual", "now_playing", false)
+		_meter_on = _cfg_bool(cfg, "visual", "meter", true)
+		_dual_bars = _cfg_bool(cfg, "visual", "dual_bars", false)
+		_output_device = _cfg_str(cfg, "audio", "output_device", "Default")
 		_now_mode = clampi(int(_cfg_num(cfg, "visual", "now_mode", 1.0)), 0, NOW_MODES.size() - 1)
 		_video_test = _cfg_bool(cfg, "visual", "video_test", false)
 		_video_color = clampi(int(_cfg_num(cfg, "visual", "video_color", 1.0)), 0, 1) as VideoTest.ColorMode
@@ -550,6 +556,7 @@ func _ready() -> void:
 	_setup_feed()
 	_setup_fps()
 	_setup_boost()
+	_setup_meter()
 	_setup_layout()
 	_setup_beat()
 	_setup_playbar_split()
@@ -1393,6 +1400,9 @@ func _build_cfg() -> ConfigFile:
 	cfg.set_value("visual", "playbar_split", _playbar_offset)
 	cfg.set_value("visual", "now_playing", _now_playing)
 	cfg.set_value("visual", "now_mode", _now_mode)
+	cfg.set_value("visual", "meter", _meter_on)
+	cfg.set_value("visual", "dual_bars", _dual_bars)
+	cfg.set_value("audio", "output_device", _output_device)
 	cfg.set_value("visual", "video_test", _video_test)
 	cfg.set_value("visual", "listening_mode", _listening_mode)
 	cfg.set_value("visual", "video_color", int(_video_color))
@@ -1989,6 +1999,88 @@ func _on_vol_input(e: InputEvent) -> void:
 	if _bar_drag(e, _vol):
 		_set_volume(_ratio_at(e.position.x, _vol.size.x) * 100.0)
 
+# --- master level meter -------------------------------------------------------------------
+## What is actually leaving the program, as opposed to where the volume fader is sitting. Those
+## are different questions: a boosted track through a rack that is clipping reads 100 on the
+## fader and -0.2 dBFS here, and only one of those tells you the room is about to get a crunch.
+##
+## Peak, not RMS. RMS is the better number for loudness and the wrong one for this: the thing
+## worth seeing on a transport bar is whether anything TOUCHED full scale, and an average never
+## shows that. AudioServer tracks peak per bus for free -- measured -20 dB while playing and
+## -200 with nothing running -- so there is no analyser to add and nothing per-frame to compute.
+const METER_FLOOR_DB := -48.0     # below this the bar is empty; quieter than anything musical
+const METER_HOLD_SEC := 1.2       # how long the peak pip sits before it falls
+const METER_FALL := 22.0          # dB a second, once it lets go
+var _meter: Control
+var _meter_on := true             # TBS MASTER METER, saved
+var _meter_btn: Button
+var _meter_peak := [METER_FLOOR_DB, METER_FLOOR_DB]   # the held pip, per channel
+var _meter_held := [0.0, 0.0]
+
+func _setup_meter() -> void:
+	_meter = Control.new()
+	_meter.name = "MasterMeter"
+	_meter.custom_minimum_size = Vector2(90, 16)
+	_meter.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_meter.mouse_filter = Control.MOUSE_FILTER_PASS
+	_meter.draw.connect(_draw_meter)
+	# beside the volume bar it reports on, rather than off in the header: the fader and what
+	# came out of it are read together or not at all
+	var row := _vol.get_parent()
+	row.add_child(_meter)
+	row.move_child(_meter, _vol.get_index() + 1)
+	_hover_note(_meter, func() -> String:
+		return "MASTER OUTPUT PEAK: %s  //  %s" % [_meter_text(), "CLIPPING" if _meter_clipping() else "HEADROOM OK"])
+	_meter.visible = _meter_on
+
+func _meter_text() -> String:
+	var l: float = _meter_peak[0]
+	var r: float = _meter_peak[1]
+	if maxf(l, r) <= METER_FLOOR_DB + 0.1:
+		return "SILENT"
+	return "L %+.1f  R %+.1f DB" % [l, r]
+
+func _meter_clipping() -> bool:
+	return maxf(_meter_peak[0], _meter_peak[1]) > -0.2
+
+## Read once a frame from the bus itself. The fall is in dB per second rather than per frame so
+## the pip drops at one speed whatever the FPS cap is doing -- the same rule the visualizer's
+## own decay follows.
+func _step_meter(delta: float) -> void:
+	if not _meter_on or not is_instance_valid(_meter) or not _meter.is_visible_in_tree():
+		return
+	var bus := AudioServer.get_bus_index("Master")
+	var now := [AudioServer.get_bus_peak_volume_left_db(bus, 0),
+		AudioServer.get_bus_peak_volume_right_db(bus, 0)]
+	for ch in 2:
+		var v: float = maxf(float(now[ch]), METER_FLOOR_DB)
+		if v >= _meter_peak[ch]:
+			_meter_peak[ch] = v
+			_meter_held[ch] = METER_HOLD_SEC
+		else:
+			_meter_held[ch] = maxf(_meter_held[ch] - delta, 0.0)
+			if _meter_held[ch] <= 0.0:
+				_meter_peak[ch] = maxf(_meter_peak[ch] - METER_FALL * delta, maxf(v, METER_FLOOR_DB))
+	_meter.queue_redraw()
+
+func _draw_meter() -> void:
+	var w := _meter.size.x
+	var h := _meter.size.y
+	var lane := maxf((h - 2.0) * 0.5, 1.0)
+	var accent := theme.get_color("font_color", "Green")
+	for ch in 2:
+		var y := ch * (lane + 2.0)
+		_meter.draw_rect(Rect2(0.0, y, w, lane), Color(accent, 0.12))
+		var frac: float = clampf(inverse_lerp(METER_FLOOR_DB, 0.0, float(_meter_peak[ch])), 0.0, 1.0)
+		if frac <= 0.0:
+			continue
+		# red only at the very top, and only there: a meter that goes amber at -12 trains people
+		# to ignore it, because most music lives there
+		var col := accent if _meter_peak[ch] < -0.2 else REC_ERROR_COLOR
+		_meter.draw_rect(Rect2(0.0, y, w * frac, lane), col)
+	# the 0 dB mark, so the end of the scale is a place rather than just the end of the box
+	_meter.draw_rect(Rect2(w - 1.0, 0.0, 1.0, h), Color(accent, 0.5))
+
 ## Master volume by NUMBER, 0-100. Extracted from the drag handler above because it was the only
 ## way in: every value this program can be set to should be reachable without a mouse, and a MIDI
 ## fader has no position to drag from.
@@ -2072,6 +2164,8 @@ func _process(delta: float) -> void:
 	_clamp_playbar()
 	_now_update()
 	_now_drag_step()
+	_step_meter(delta)
+	_step_dual_bars()
 	_marquee_step(delta)
 	%Play.text = "PAUSE" if _state() == "PLAYING" else "PLAY"
 	# tracks the fit in wall-clock time, so the readout settles the same at any FPS
@@ -2920,6 +3014,7 @@ const TOOLS := [
 	["EXPORT SETUP", "export", "CUES, PLAYLISTS, TAGS, KEYBINDS AND SETTINGS INTO ONE FILE"],
 	["IMPORT SETUP", "import", "READ THAT FILE BACK -- CUES AND PLAYLISTS LAND AT ONCE"],
 	["MIDI SETUP", "midi", "DEVICES, A LIVE MONITOR, AND LEARN FOR EVERY MAPPABLE ACTION"],
+	["AUDIO OUTPUT", "output", "WHICH DEVICE THE MASTER BUS PLAYS OUT OF"],
 ]
 var _tool_windows := {}   # kind -> Window
 
@@ -3001,6 +3096,7 @@ func _open_tool(kind: String) -> void:
 		"export": _pick_setup_file(true)
 		"import": _pick_setup_file(false)
 		"midi": _open_midi_window()
+		"output": _open_output_window()
 
 # --- EXPORT / IMPORT SETUP ------------------------------------------------------------------
 ## Everything worth carrying to another machine already lives in ONE ConfigFile -- cues under
@@ -3086,6 +3182,8 @@ func _import_setup(path: String) -> void:
 		_midi.from_dict(imported_midi)
 		for action in MidiMap.ACTIONS:
 			_refresh_midi_row(str(action))   # no-op unless the mapper happens to be open
+	# the undo stack points AT the old store dictionaries, which have just been replaced
+	_cue_undo_clear()
 	_refresh_playlists()
 	_refill()
 	_cue_overlay.queue_redraw()
@@ -3174,8 +3272,14 @@ func _finish_midi_learn(e: InputEventMIDI) -> void:
 	if clash.is_empty():
 		_note = "  //  %s  ->  %s" % [_midi.label_of(action), str(MidiMap.ACTIONS[action][0])]
 	else:
-		# refused, not stolen: the same rule the keyboard rebind follows, and for the same reason
-		_note = "  //  THAT CONTROL IS ALREADY BOUND TO %s" % str(MidiMap.ACTIONS[clash][0])
+		# Refused, not stolen: the same rule the keyboard rebind follows. The message says WHY
+		# and WHAT TO DO, and names the control as well as the action it already drives -- the
+		# usual cause is two things on the surface sending identical messages, and a controller
+		# whose deck A and deck B jogs are on the same channel and CC cannot have them told
+		# apart by anything in here. Seeing the control printed is what turns that from "the
+		# mapper is broken" into "the controller needs a different CC on that wheel".
+		_note = "  //  THAT CONTROL (%s) IS ALREADY BOUND TO %s -- CLEAR THAT ROW FIRST" % [
+			_midi.label_of(clash), str(MidiMap.ACTIONS[clash][0])]
 	_clear_note_later()
 	_refresh_midi_row(action)
 	_save()
@@ -3320,6 +3424,68 @@ func _eq_unit(deck: int, i: int) -> float:
 	if i < 0 or i >= eq.ez_db.size():
 		return 0.5
 	return inverse_lerp(Equalizer.GAIN_MIN, Equalizer.GAIN_MAX, eq.ez_db[i])
+
+# --- AUDIO OUTPUT ------------------------------------------------------------------------------
+## Which device the master bus plays out of. A window rather than a TBS row that cycles on click:
+## every other setting in TBS can be cycled past and back with no consequence, and an output
+## device cannot -- landing on the wrong one mid-set means silence in the room while the music
+## carries on somewhere else.
+##
+## "Default" is Godot's own name for "whatever Windows is using", and it is kept at the top of
+## the list rather than resolved to a real device, so a setup carried to another machine still
+## makes sense there.
+var _output_device := "Default"
+
+func _open_output_window() -> void:
+	var col := _tool_window("output", "AUDIO OUTPUT", Vector2i(620, 260))
+	if col == null:
+		return
+	var cap := Label.new()
+	cap.text = "THE MASTER BUS PLAYS OUT OF:"
+	col.add_child(cap)
+	var picker := OptionButton.new()
+	picker.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	col.add_child(picker)
+	var status := Label.new()
+	status.theme_type_variation = &"Green"
+	status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	col.add_child(status)
+	var fill := func() -> void:
+		picker.clear()
+		var devices := AudioServer.get_output_device_list()
+		for d in devices:
+			picker.add_item(str(d))
+		var at := Array(devices).find(AudioServer.get_output_device())
+		picker.selected = maxi(at, 0)
+		status.text = "NOW PLAYING OUT OF: %s" % AudioServer.get_output_device()
+	fill.call()
+	picker.item_selected.connect(func(i: int) -> void:
+		_set_output_device(picker.get_item_text(i))
+		status.text = "NOW PLAYING OUT OF: %s" % AudioServer.get_output_device())
+	var refresh := Button.new()
+	refresh.text = "[ REFRESH ]"
+	refresh.pressed.connect(fill)
+	col.add_child(refresh)
+	var note := Label.new()
+	note.theme_type_variation = &"Green"
+	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	note.text = "A DEVICE UNPLUGGED WHILE SELECTED FALLS BACK TO DEFAULT ON THE NEXT LAUNCH, " \
+		+ "SO A MISSING INTERFACE CANNOT LEAVE THE PLAYER WITH NOWHERE TO PLAY."
+	col.add_child(note)
+
+## Applies and remembers a device. The name is checked against the live list before it is used:
+## a config carried from another machine, or an interface that has been unplugged, would
+## otherwise hand AudioServer a device that is not there.
+func _set_output_device(name: String) -> void:
+	if name.is_empty() or not Array(AudioServer.get_output_device_list()).has(name):
+		_output_device = "Default"
+		AudioServer.set_output_device("Default")
+		return
+	_output_device = name
+	AudioServer.set_output_device(name)
+	_note = "  //  AUDIO OUT: %s" % name
+	_clear_note_later()
+	_save_soon()
 
 # --- the MIDI SETUP window -------------------------------------------------------------------
 ## Built on _tool_window, which already owns the chassis, the theme, F11, centring, the one-per-
@@ -3826,6 +3992,14 @@ func _now_drag_step() -> void:
 		_now_win.size = Vector2i(maxi(at.x, _now_win.min_size.x), maxi(at.y, _now_win.min_size.y))
 	else:
 		_now_win.position = at
+
+func _refresh_dual_bars_btn() -> void:
+	if is_instance_valid(_dual_bars_btn):
+		_dual_bars_btn.text = "[*] A + B" if _dual_bars else "[ ] ONE BAR"
+
+func _refresh_meter_btn() -> void:
+	if is_instance_valid(_meter_btn):
+		_meter_btn.text = "[*] ON" if _meter_on else "[ ] OFF"
 
 func _refresh_now_btn() -> void:
 	if is_instance_valid(_now_btn):
@@ -4461,7 +4635,7 @@ const SETTING_GROUPS := {
 	"LIBRARY": ["ShowMsRow"],
 	"DISPLAY": ["FeedSizeRow", "FpsRow", "LayoutRow", "ClockRow", "FontRow", "FontsRow",
 		"CursorRow", "CrtRow", "PlayBarRow", "PlayBarShapeRow", "VisualWinRow", "DualDeckRow",
-		"FadeSpeedRow", "BgThrottleRow", "NowPlayingRow"],
+		"FadeSpeedRow", "BgThrottleRow", "NowPlayingRow", "DualBarsRow", "MeterRow"],
 	"VIDEO": ["IntroRow", "VideoTestRow", "VideoColorRow"],
 	"INPUT": ["SkipSecsRow", "MidiSetupRow"],
 	"ADVANCED": ["MessageLogRow", "CheatRow", "AutopsyPanel"],
@@ -4816,6 +4990,34 @@ func _add_settings_rows() -> void:
 	_skip_field.text_submitted.connect(func(_s: String) -> void: _commit_skip_secs())
 	_skip_field.focus_exited.connect(_commit_skip_secs)
 	after = _skip_field.get_parent()
+
+	_dual_bars_btn = _add_setting_row("DUAL PLAY BARS", "DualBarsRow", after)
+	_dual_bars_btn.toggle_mode = true
+	_dual_bars_btn.button_pressed = _dual_bars
+	_dual_bars_btn.pressed.connect(func() -> void:
+		_dual_bars = _dual_bars_btn.button_pressed
+		_refresh_dual_bars_btn()
+		_apply_dual_bars()
+		_save())
+	_refresh_dual_bars_btn()
+	_hover_note(_dual_bars_btn, func() -> String:
+		return "TWO SCRUB BARS, DECK A OVER DECK B, BOTH DRAWN WHATEVER HAS FOCUS  //  " \
+			+ "CLICK EITHER TO SEEK THAT DECK; MARKERS ARE EDITED ON THE TOP BAR")
+	after = _dual_bars_btn.get_parent()
+
+	_meter_btn = _add_setting_row("MASTER LEVEL METER", "MeterRow", after)
+	_meter_btn.toggle_mode = true
+	_meter_btn.button_pressed = _meter_on
+	_meter_btn.pressed.connect(func() -> void:
+		_meter_on = _meter_btn.button_pressed
+		if is_instance_valid(_meter):
+			_meter.visible = _meter_on
+		_refresh_meter_btn()
+		_save())
+	_refresh_meter_btn()
+	_hover_note(_meter_btn, func() -> String:
+		return "PEAK OUTPUT BESIDE THE VOLUME FADER  //  %s" % _meter_text())
+	after = _meter_btn.get_parent()
 
 	var midi_btn := _add_setting_row("MIDI SETUP", "MidiSetupRow", after)
 	midi_btn.text = "[ OPEN MAPPER ]"
@@ -5731,6 +5933,7 @@ func _apply_feed(mode: int) -> void:
 	%StatusBar.visible = not full
 	%ScrubRow.visible = not full and _playbar_on
 	%ControlDeck.visible = not full and _playbar_on
+	_apply_dual_bars()
 	# SplitContainer ignores size_flags_stretch_ratio -- it positions the divider from
 	# split_offset instead -- so the preset sizes are translated into an offset, and
 	# CUSTOM simply restores the one a drag last left it at.
@@ -6077,6 +6280,14 @@ func _unhandled_input(event: InputEvent) -> void:
 	# every letter of a search would drive a shortcut. One line beats reasoning about which
 	# fields can be in that state.
 	if get_viewport().gui_get_focus_owner() is LineEdit:
+		return
+	# CTRL+Z / CTRL+SHIFT+Z / CTRL+Y, ahead of the remappable table because they are not in it:
+	# a modifier combination cannot be expressed in KEYBIND_SPEC, which stores one keycode per
+	# action, and putting them there would mean somebody could rebind UNDO onto a bare letter
+	# and lose it to the cheat buffer.
+	if k.ctrl_pressed and (k.keycode == KEY_Z or k.keycode == KEY_Y):
+		_cue_undo_step(k.keycode == KEY_Y or k.shift_pressed)
+		get_viewport().set_input_as_handled()
 		return
 	# Fed BEFORE the shortcuts below and deliberately NOT consuming the event, so a letter
 	# can drive its shortcut and advance a code in the same press -- see the note on
@@ -7687,6 +7898,7 @@ func _setup_menus() -> void:
 		return "MARK MODE: CLICK THE BAR TO DROP A CUE THERE  //  SEEKING IS OFF" if _mark_mode \
 			else "MARK MODE: OFF")
 	_setup_cue_overlay()
+	_setup_dual_bars()
 	_refresh_playlists()
 
 ## Cue markers get their own canvas item. Nothing is painted into %Scrub any more.
@@ -7721,6 +7933,98 @@ func _setup_cue_overlay() -> void:
 	# the ProgressBar used to repaint every frame as its value changed, which hid the
 	# fact that markers need a repaint of their own; an overlay only redraws when asked
 	_cue_overlay.resized.connect(_cue_overlay.queue_redraw)
+
+# --- DUAL PLAY BARS -------------------------------------------------------------------------
+## One transport bar shows the deck the transport is on, which means the other deck's playhead,
+## waveform and markers are invisible until you switch to it -- and switching is exactly what you
+## do not want to do while beat-matching. With this on there are two bars, deck A above deck B,
+## both drawn all the time whatever has focus.
+##
+## The second bar is a SIBLING of %ScrubRow inside the PlayerBar column, not a reparenting of
+## anything the scene ships. That matters here: %ScrubRow, %Scrub and %CueOverlay are all
+## %UniqueNames, and moving them around is how this program has broken itself before.
+##
+## Click-to-seek works on it; dragging a marker does not. Cue editing stays on the main bar
+## where the menu, the audition and the drag already live, rather than being half-implemented in
+## two places.
+var _dual_bars := false          # TBS DUAL PLAY BARS, saved
+var _dual_bars_btn: Button
+var _scrub_b: ProgressBar
+var _overlay_b: Control
+var _dual_row: Control
+
+func _setup_dual_bars() -> void:
+	var bar := %ScrubRow.get_parent()   # the PlayerBar column built by _setup_playbar_split
+	_dual_row = HBoxContainer.new()
+	_dual_row.name = "ScrubRowB"
+	_dual_row.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	(_dual_row as HBoxContainer).add_theme_constant_override("separation", 6)
+	bar.add_child(_dual_row)
+	bar.move_child(_dual_row, %ScrubRow.get_index() + 1)
+	var tag := Label.new()
+	tag.text = "B"
+	tag.theme_type_variation = &"Green"
+	_dual_row.add_child(tag)
+	_pin_label(tag)
+	_scrub_b = ProgressBar.new()
+	_scrub_b.name = "ScrubB"
+	_scrub_b.show_percentage = false
+	_scrub_b.max_value = 100.0
+	_scrub_b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_scrub_b.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	# the scene's own bar carries stylebox overrides; a ProgressBar built at runtime gets the
+	# theme default instead, and the two bars then look like they came from different programs
+	for style: String in ["background", "fill"]:
+		var sb: StyleBox = %Scrub.get_theme_stylebox(style)
+		if sb:
+			_scrub_b.add_theme_stylebox_override(style, sb)
+	_dual_row.add_child(_scrub_b)
+	_overlay_b = Control.new()
+	_overlay_b.name = "CueOverlayB"
+	_overlay_b.mouse_filter = Control.MOUSE_FILTER_PASS
+	_scrub_b.add_child(_overlay_b)
+	_overlay_b.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_overlay_b.offset_top = -CUE_TAB.y
+	_overlay_b.draw.connect(func() -> void: _draw_cues_on(_overlay_b, 1))
+	_overlay_b.resized.connect(_overlay_b.queue_redraw)
+	# click anywhere on B's bar to seek B -- through _seek_deck, so it works while B is paused
+	_scrub_b.gui_input.connect(func(e: InputEvent) -> void:
+		var click := e as InputEventMouseButton
+		if click and click.pressed and click.button_index == MOUSE_BUTTON_LEFT:
+			_seek_deck(1, _ratio_at(click.position.x, _scrub_b.size.x) * _deck_len(1))
+			_scrub_b.accept_event())
+	_hover_note(_scrub_b, func() -> String:
+		var path := _deck_path(1)
+		return "DECK B: %s  //  %s" % [path.get_file() if not path.is_empty() else "EMPTY",
+			_deck_state(1)])
+	_apply_dual_bars()
+
+## The A tag only appears when there are two bars to tell apart. With one bar it would be a
+## label on the only thing there is.
+func _apply_dual_bars() -> void:
+	if not is_instance_valid(_dual_row):
+		return
+	_dual_row.visible = _dual_bars and _playbar_on and _feed != Feed.FULLSCREEN
+	var tag_a := %ScrubRow.get_node_or_null("ScrubTagA") as Label
+	if _dual_bars and not tag_a:
+		tag_a = Label.new()
+		tag_a.name = "ScrubTagA"
+		tag_a.text = "A"
+		tag_a.theme_type_variation = &"Green"
+		%ScrubRow.add_child(tag_a)
+		%ScrubRow.move_child(tag_a, 0)
+		_pin_label(tag_a)
+	elif tag_a:
+		tag_a.visible = _dual_bars
+	_cue_overlay.queue_redraw()   # the main bar changes which deck it is showing
+
+## Deck B's bar, stepped from _process beside the main one.
+func _step_dual_bars() -> void:
+	if not _dual_bars or not is_instance_valid(_scrub_b) or not _scrub_b.is_visible_in_tree():
+		return
+	var span := _deck_len(1)
+	_scrub_b.value = clampf(_deck_pos(1) / span * 100.0, 0.0, 100.0) if span > 0.0 else 0.0
+	_overlay_b.queue_redraw()
 
 ## Rebuilt rather than patched: playlists are a handful of entries, and this runs on a
 ## config load or a playlist being created, not per frame.
@@ -8303,17 +8607,23 @@ const CUE_TAB := Vector2(9.0, 6.0)
 ## fill and the markers all have to stay easier to read than the shape behind them.
 const WAVE_ALPHA := 0.30
 
+## The main bar's overlay. In DUAL PLAY BARS it is pinned to deck A; otherwise it follows the
+## transport, which is what it has always done.
 func _draw_cues() -> void:
-	var length := _len()
-	if _bar_path().is_empty() or length <= 0.0:
+	_draw_cues_on(_cue_overlay, 0 if _dual_bars else _bar_deck())
+
+func _draw_cues_on(overlay: Control, deck: int) -> void:
+	var length := _deck_len(deck)
+	var path := _deck_path(deck)
+	if path.is_empty() or length <= 0.0:
 		return
-	var w := _cue_overlay.size.x
+	var w := overlay.size.x
 	var top := CUE_TAB.y
-	_draw_waveform(w, top)
-	for c in _cues_for(_bar_path()):
+	_draw_waveform_on(overlay, deck, w, top)
+	for c in _cues_for(path):
 		var col := Color(str(c["color"]))
-		var x := cue_x(_cue_stream(float(c["time"])), length, w)
-		_cue_overlay.draw_rect(Rect2(x - 1.0, top, 2.0, _cue_overlay.size.y - top), col)
+		var x := cue_x(_cue_stream_deck(deck, float(c["time"])), length, w)
+		overlay.draw_rect(Rect2(x - 1.0, top, 2.0, overlay.size.y - top), col)
 		# the handle. Its footprint is the same CUE_TAB box whatever the shape, so the
 		# hit test stays one rectangle and a triangle is no harder to grab than a square.
 		match str(c.get("shape", "square")):
@@ -8338,14 +8648,14 @@ func _draw_cues() -> void:
 ## Drawn UNDER the cue lines deliberately -- a marker has to stay findable against it, which is
 ## also why WAVE_ALPHA is as low as it is. Mirrored about the middle of the strip, min below and
 ## max above, so a track with a loud left channel does not read as lopsided.
-func _draw_waveform(w: float, top: float) -> void:
+func _draw_waveform_on(overlay: Control, deck: int, w: float, top: float) -> void:
 	if not _show_playbar_wave:
 		return   # before waveform_for(), so OFF does not start a build nobody will draw
-	var wave := _engine.waveform_for(_bar_path())
+	var wave := _engine.waveform_for(_deck_path(deck))
 	if wave.is_empty() or w <= 0.0:
 		return
 	var buckets := wave.size() / AudioEngine.WAVE_STRIDE
-	var h := _cue_overlay.size.y - top
+	var h := overlay.size.y - top
 	if h <= 0.0:
 		return
 	var mid := top + h * 0.5
@@ -8361,7 +8671,7 @@ func _draw_waveform(w: float, top: float) -> void:
 		var y0 := mid - left * h * 0.5
 		var y1 := mid + right * h * 0.5
 		# at least a pixel, so silence is a centre line rather than a gap in the drawing
-		_cue_overlay.draw_rect(Rect2(float(b) * step, y0, maxf(step, 1.0), maxf(y1 - y0, 1.0)), col)
+		overlay.draw_rect(Rect2(float(b) * step, y0, maxf(step, 1.0), maxf(y1 - y0, 1.0)), col)
 
 ## The cue under a click, or {} -- returned by reference, so the caller can hand the same
 ## Dictionary to the scope and delete paths and have them find it in whichever store it
@@ -8479,6 +8789,63 @@ static func cue_too_close(cues: Array, t: float, min_gap: float) -> bool:
 			return true
 	return false
 
+# --- cue undo -----------------------------------------------------------------------------
+## CTRL+Z for markers. Snapshots, not operations: one track's cue list is a handful of small
+## dictionaries, and storing the list either side of a change is both simpler and harder to get
+## wrong than replaying an inverse of every kind of edit. Add and delete are what it covers --
+## including the pads, which can now drop and clear a cue faster than anything else in the
+## program and are by far the easiest way to lose one by accident.
+##
+## The stack holds a REFERENCE to the store dictionary, so anything that replaces those
+## wholesale -- importing a setup file -- has to clear it, or undo would write into a dictionary
+## nothing is reading any more.
+const CUE_UNDO_MAX := 50
+var _cue_undo: Array[Dictionary] = []
+var _cue_redo: Array[Dictionary] = []
+var _cue_pending := {}
+
+func _cue_undo_push(store: Dictionary, id: String) -> void:
+	_cue_pending = {"store": store, "id": id,
+		"before": (store.get(id, []) as Array).duplicate(true)}
+
+func _cue_undo_commit() -> void:
+	if _cue_pending.is_empty():
+		return
+	var store: Dictionary = _cue_pending["store"]
+	var id := str(_cue_pending["id"])
+	_cue_undo.append({"store": store, "id": id, "before": _cue_pending["before"],
+		"after": (store.get(id, []) as Array).duplicate(true)})
+	if _cue_undo.size() > CUE_UNDO_MAX:
+		_cue_undo.pop_front()
+	_cue_redo.clear()   # a new edit is a new branch; whatever was undone is not coming back
+	_cue_pending = {}
+
+func _cue_undo_step(redo: bool) -> void:
+	var from: Array[Dictionary] = _cue_redo if redo else _cue_undo
+	var to: Array[Dictionary] = _cue_undo if redo else _cue_redo
+	if from.is_empty():
+		_note = "  //  NOTHING TO %s" % ("REDO" if redo else "UNDO")
+		_clear_note_later()
+		return
+	var step: Dictionary = from.pop_back()
+	var store: Dictionary = step["store"]
+	var id := str(step["id"])
+	var want: Array = (step["after"] if redo else step["before"]) as Array
+	if want.is_empty():
+		store.erase(id)
+	else:
+		store[id] = want.duplicate(true)
+	to.append(step)
+	_cue_overlay.queue_redraw()
+	_save_soon()
+	_note = "  //  CUES %s (%d LEFT)" % ["REDONE" if redo else "UNDONE", from.size()]
+	_clear_note_later()
+
+func _cue_undo_clear() -> void:
+	_cue_undo.clear()
+	_cue_redo.clear()
+	_cue_pending = {}
+
 # --- hot cues, for a pad grid -----------------------------------------------------------------
 ## A pad is not a list position. SOUNDSCAPE's markers are an arbitrary keyed list -- as many as
 ## you drop, ordered by time -- and mapping pad N to "the Nth marker along" was fine for jumping
@@ -8577,6 +8944,7 @@ func _write_cue(deck: int, t: float, slot: int) -> void:
 		return
 	var store := _cue_store(not _library.crate_pl[deck].is_empty())
 	var id := _library.id_for(path)
+	_cue_undo_push(store, id)
 	var list: Array = store.get(id, [])
 	var cue := {
 		"id": next_cue_id(_cues_for(path)),
@@ -8591,6 +8959,7 @@ func _write_cue(deck: int, t: float, slot: int) -> void:
 		cue["slot"] = slot   # only a pad's cue carries one; markers made on the bar have none
 	list.append(cue)
 	store[id] = list
+	_cue_undo_commit()
 	_note = "  //  %s @ %s" % [cue["label"], _time_text(t)]
 	_clear_note_later()
 	_cue_overlay.queue_redraw()
@@ -8732,11 +9101,31 @@ func _jump_to_key(k: String) -> bool:
 	return false
 
 func _delete_cue(cue: Dictionary) -> void:
+	var home := _cue_home(cue)
+	if home.is_empty():
+		return
+	_cue_undo_push(home["store"], str(home["id"]))
 	_pull_cue(cue)
+	_cue_undo_commit()
 	_note = "  //  DELETED %s" % cue["label"]
 	_clear_note_later()
 	_cue_overlay.queue_redraw()
 	_save_soon()
+
+## Which store and which track id a cue actually lives under. Dictionaries are reference types,
+## so `has` finds the instance rather than an equal copy.
+func _cue_home(cue: Dictionary) -> Dictionary:
+	for store: Dictionary in _cue_stores():
+		for id in store.keys():
+			if (store[id] as Array).has(cue):
+				return {"store": store, "id": id}
+	return {}
+
+func _cue_stores() -> Array[Dictionary]:
+	var all: Array[Dictionary] = [_library.cues]
+	for name in _library.pl_cues:
+		all.append(_library.pl_cues[name])
+	return all
 
 ## Takes a cue out of whichever store holds it. Dictionaries are reference types in
 ## GDScript, so erase() finds the instance the menu was opened on without an id search.
@@ -8744,16 +9133,22 @@ func _delete_cue(cue: Dictionary) -> void:
 ## An emptied list is dropped rather than left behind: without that, every track that
 ## ever held a cue keeps a `path: []` entry in library.cfg forever, and the file grows
 ## with tracks that have nothing to say.
+## Searched for rather than looked up under _bar_path(): the bar-deck assumption was fine while
+## the only way to delete a marker was the menu on the bar itself, and wrong the moment a pad on
+## deck B could clear one -- it erased from deck A's list, found nothing, and left the marker
+## exactly where it was while reporting it deleted.
 func _pull_cue(cue: Dictionary) -> void:
-	var bar_id := _library.id_for(_bar_path())
-	(_library.cues.get(bar_id, []) as Array).erase(cue)
-	if (_library.cues.get(bar_id, []) as Array).is_empty():
-		_library.cues.erase(bar_id)
-	for name in _library.pl_cues:
-		var d := _library.pl_cues[name] as Dictionary
-		(d.get(bar_id, []) as Array).erase(cue)
-		if (d.get(bar_id, []) as Array).is_empty():
-			d.erase(bar_id)
+	for store: Dictionary in _cue_stores():
+		for id in store.keys():
+			var list: Array = store[id]
+			if not list.has(cue):
+				continue
+			list.erase(cue)
+			# An emptied list is dropped rather than left behind: without that, every track that
+			# ever held a cue keeps a `id: []` entry in library.cfg forever.
+			if list.is_empty():
+				store.erase(id)
+			return
 
 ## A 500 ms taste of a cue: seek, play, pause. The generation counter is what keeps a
 ## second audition from being cut short by the first one's timer -- shift-clicking along
