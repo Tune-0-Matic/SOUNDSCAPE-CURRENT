@@ -3219,6 +3219,7 @@ func _import_setup(path: String) -> void:
 var _midi := MidiMap.new()
 var _midi_learn := ""                       # the action currently listening, or ""
 var _midi_shift := false                    # the controller's own SHIFT, while it is held
+var _midi_shift_at := 0                     # when it went down, so a lost note-off cannot latch it
 var _midi_monitor: Label                    # the live message line, while the window is open
 var _midi_device: OptionButton
 var _midi_rows := {}                        # action -> [assignment Label, LEARN Button, mode Button]
@@ -3294,6 +3295,7 @@ func _run_midi(action: String, e: InputEventMIDI) -> void:
 	# is read before the press test rather than inside it.
 	if action in MidiMap.HELD:
 		_midi_shift = MidiMap.is_press(e)
+		_midi_shift_at = Time.get_ticks_msec()
 		return
 	if kind == MidiMap.BUTTON:
 		if MidiMap.is_press(e):
@@ -3320,7 +3322,16 @@ func _run_midi(action: String, e: InputEventMIDI) -> void:
 ## Whether a pad press means CLEAR rather than set-or-jump. Either the controller's own SHIFT,
 ## if one is bound to the `shift` action, or the keyboard's -- so the pads work the same whether
 ## or not the surface has a spare button to give up.
+## A LOST NOTE-OFF MUST NOT LATCH THE MODIFIER. A controller unplugged mid-hold, or a message
+## dropped, would otherwise leave every pad press deleting a cue with nothing on screen to say
+## why. Nobody holds shift for half a minute, so a hold older than that is a note-off that never
+## arrived and the modifier lets go of itself. Checked here rather than per frame: this is the
+## only thing that asks, and it asks a handful of times a session.
+const MIDI_SHIFT_MAX_MS := 30000
+
 func _midi_shift_held() -> bool:
+	if _midi_shift and Time.get_ticks_msec() - _midi_shift_at > MIDI_SHIFT_MAX_MS:
+		_midi_shift = false
 	return _midi_shift or Input.is_key_pressed(KEY_SHIFT)
 
 func _midi_button(action: String) -> void:
@@ -3571,7 +3582,8 @@ func _open_midi_window() -> void:
 		_midi_monitor = null
 		_midi_device = null
 		_midi_rows = {}
-		_midi_learn = "")
+		_midi_learn = ""
+		_midi_shift = false)   # nothing is being held once the mapper is shut
 	_wheel_through(grid)
 	_wheel_scrolls(scroll)
 	_refresh_midi_devices()
@@ -3647,6 +3659,7 @@ func _refresh_midi_devices() -> void:
 		return
 	OS.close_midi_inputs()
 	OS.open_midi_inputs()
+	_midi_shift = false   # the driver just went down; whatever was held is not held now
 	var found := OS.get_connected_midi_inputs()
 	_midi_device.clear()
 	_midi_device.disabled = found.is_empty()
@@ -5796,6 +5809,14 @@ func _seek_deck(deck: int, t: float) -> void:
 	if pl.stream_paused:
 		pl.stream_paused = false
 		pl.seek(target)
+		pl.stream_paused = true
+	elif not pl.playing:
+		# A PARKED DECK -- loaded and never started, which is exactly the deck you want to jog
+		# while you find its first beat. seek() is ignored on a stopped player the same way it
+		# is on a paused one, and play() is the only call that takes a position; pausing in the
+		# same frame means it holds there without sounding. The deck reads PAUSED afterwards,
+		# which is what being cued up IS.
+		pl.play(target)
 		pl.stream_paused = true
 	else:
 		pl.seek(target)
@@ -8350,7 +8371,9 @@ MOVES THE FILE TO THE RECYCLE BIN AND FORGETS ITS CUES, TAG AND PLAYLIST ENTRIES
 					return
 				# clamped to the track, and playback is not touched: retiming a marker is
 				# an edit to the marker, not a seek
+				_cue_edit_begin(cue)
 				cue["time"] = clampf(t, 0.0, _len())
+				_cue_undo_commit()
 				_note = "  //  %s -> %s" % [cue["label"], _time_text(float(cue["time"]))]
 				_clear_note_later()
 				_cue_overlay.queue_redraw()
@@ -8508,12 +8531,34 @@ const CUE_GRAB := 5.0
 ## Everything drawn and clickable for this track: the track's own cues, plus the ones
 ## scoped to the playlist that is currently active. A cue lives in exactly one of the
 ## two, which is what makes the scope menu a move rather than a copy.
-func _cues_for(path: String) -> Array:
+## `deck` says whose playlist scope to merge in. It defaults to -1, meaning "work it out from
+## the path", so every existing caller keeps behaving as it did -- and a caller that knows which
+## deck it is asking about can say so and get the right answer.
+##
+## Reading the BAR deck's scope for whatever path it was handed was wrong the moment a second
+## bar could draw the other deck and a pad could place a marker on it: deck B's cues were
+## filtered through deck A's playlist, so they came back short, duplicated, or with the
+## too-close test consulting a list the marker was never going into.
+func _cues_for(path: String, deck := -1) -> Array:
 	var id := _library.id_for(path)
 	var out: Array = (_library.cues.get(id, []) as Array).duplicate()
-	if not _library.crate_pl[_bar_deck()].is_empty():
-		out.append_array((_library.pl_cues.get(_library.crate_pl[_bar_deck()], {}) as Dictionary).get(id, []))
+	var scope: String = _library.crate_pl[_scope_deck(path, deck)]
+	if not scope.is_empty():
+		out.append_array((_library.pl_cues.get(scope, {}) as Dictionary).get(id, []))
 	return out
+
+## Whose playlist scope a path belongs under: the deck named outright, else whichever deck is
+## actually holding that track, else the bar deck. The middle case is what makes the old
+## single-argument callers correct without touching them.
+func _scope_deck(path: String, deck := -1) -> int:
+	if deck >= 0 and deck < 2:
+		return deck
+	if path == _deck_path(_bar_deck()):
+		return _bar_deck()     # the same track on both decks belongs to the one being shown
+	for d in 2:
+		if path == _deck_path(d):
+			return d
+	return _bar_deck()
 
 static func cue_x(t: float, length: float, w: float) -> float:
 	return clampf(t / maxf(length, 0.001), 0.0, 1.0) * w
@@ -8620,7 +8665,7 @@ func _draw_cues_on(overlay: Control, deck: int) -> void:
 	var w := overlay.size.x
 	var top := CUE_TAB.y
 	_draw_waveform_on(overlay, deck, w, top)
-	for c in _cues_for(path):
+	for c in _cues_for(path, deck):
 		var col := Color(str(c["color"]))
 		var x := cue_x(_cue_stream_deck(deck, float(c["time"])), length, w)
 		overlay.draw_rect(Rect2(x - 1.0, top, 2.0, overlay.size.y - top), col)
@@ -8739,6 +8784,10 @@ func _drag_cue_step() -> void:
 	if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		var x := _cue_overlay.get_local_mouse_position().x
 		if absf(x - _drag_from_x) > DRAG_SLOP:
+			# ONCE, on the frame the drag starts moving -- not per frame, or a single drag
+			# across the bar would fill the whole undo stack with its own intermediate steps
+			if not _drag_moved:
+				_cue_edit_begin(_drag_cue)
 			_drag_moved = true
 		if _drag_moved and _len() > 0.0:
 			# where the pointer is in what is SOUNDING, mapped back to the track's own time
@@ -8759,6 +8808,7 @@ func _drag_cue_step() -> void:
 	_drag_cue = {}
 	_drag_moved = false
 	if moved:
+		_cue_undo_commit()   # the pair to _cue_edit_begin above; one entry for the whole drag
 		_clear_note_later()
 		_save_soon()
 	else:
@@ -8799,26 +8849,38 @@ static func cue_too_close(cues: Array, t: float, min_gap: float) -> bool:
 ## The stack holds a REFERENCE to the store dictionary, so anything that replaces those
 ## wholesale -- importing a setup file -- has to clear it, or undo would write into a dictionary
 ## nothing is reading any more.
+## ONE STEP CAN TOUCH SEVERAL LISTS. Moving a marker between ALL TRACKS and a playlist takes it
+## out of one store and puts it in another, and an undo that only knew about one of those would
+## restore half the change -- leaving the marker in both places or neither. So an entry holds a
+## LIST of snapshots and they are applied together.
 const CUE_UNDO_MAX := 50
 var _cue_undo: Array[Dictionary] = []
 var _cue_redo: Array[Dictionary] = []
-var _cue_pending := {}
+var _cue_pending: Array[Dictionary] = []
 
+## Snapshots one list before it changes. Called once per store a single operation will touch;
+## asking twice for the same list is a no-op, so a caller can be safe rather than clever.
 func _cue_undo_push(store: Dictionary, id: String) -> void:
-	_cue_pending = {"store": store, "id": id,
-		"before": (store.get(id, []) as Array).duplicate(true)}
+	for s in _cue_pending:
+		if is_same(s["store"], store) and str(s["id"]) == id:
+			return
+	_cue_pending.append({"store": store, "id": id,
+		"before": (store.get(id, []) as Array).duplicate(true)})
 
 func _cue_undo_commit() -> void:
 	if _cue_pending.is_empty():
 		return
-	var store: Dictionary = _cue_pending["store"]
-	var id := str(_cue_pending["id"])
-	_cue_undo.append({"store": store, "id": id, "before": _cue_pending["before"],
-		"after": (store.get(id, []) as Array).duplicate(true)})
+	var snaps: Array[Dictionary] = []
+	for s in _cue_pending:
+		var store: Dictionary = s["store"]
+		var id := str(s["id"])
+		snaps.append({"store": store, "id": id, "before": s["before"],
+			"after": (store.get(id, []) as Array).duplicate(true)})
+	_cue_pending = []
+	_cue_undo.append({"snaps": snaps})
 	if _cue_undo.size() > CUE_UNDO_MAX:
 		_cue_undo.pop_front()
 	_cue_redo.clear()   # a new edit is a new branch; whatever was undone is not coming back
-	_cue_pending = {}
 
 func _cue_undo_step(redo: bool) -> void:
 	var from: Array[Dictionary] = _cue_redo if redo else _cue_undo
@@ -8828,15 +8890,24 @@ func _cue_undo_step(redo: bool) -> void:
 		_clear_note_later()
 		return
 	var step: Dictionary = from.pop_back()
-	var store: Dictionary = step["store"]
-	var id := str(step["id"])
-	var want: Array = (step["after"] if redo else step["before"]) as Array
-	if want.is_empty():
-		store.erase(id)
-	else:
-		store[id] = want.duplicate(true)
+	for s: Dictionary in step["snaps"]:
+		var store: Dictionary = s["store"]
+		var id := str(s["id"])
+		var want: Array = (s["after"] if redo else s["before"]) as Array
+		if want.is_empty():
+			store.erase(id)
+		else:
+			store[id] = want.duplicate(true)
 	to.append(step)
+	# Restoring puts COPIES in the store, so anything still holding one of the old dictionaries
+	# is now pointing at a marker that is in no list at all -- an armed drag would move it and
+	# an open menu would recolour it, both writing into nothing. Both are dropped.
+	_drag_cue = {}
+	if str(_menu_ctx.get("kind", "")) == "cue":
+		_menu_ctx = {}
 	_cue_overlay.queue_redraw()
+	if is_instance_valid(_overlay_b):
+		_overlay_b.queue_redraw()
 	_save_soon()
 	_note = "  //  CUES %s (%d LEFT)" % ["REDONE" if redo else "UNDONE", from.size()]
 	_clear_note_later()
@@ -8844,7 +8915,7 @@ func _cue_undo_step(redo: bool) -> void:
 func _cue_undo_clear() -> void:
 	_cue_undo.clear()
 	_cue_redo.clear()
-	_cue_pending = {}
+	_cue_pending = []
 
 # --- hot cues, for a pad grid -----------------------------------------------------------------
 ## A pad is not a list position. SOUNDSCAPE's markers are an arbitrary keyed list -- as many as
@@ -8857,10 +8928,8 @@ func _cue_undo_clear() -> void:
 ## dictionary as everything else, and persist through the same config with no new storage.
 ## Markers made the old way (clicking the bar in MARK MODE) have no slot and are untouched by
 ## this -- they still jump by key, and a pad will never delete one.
-const CUE_PADS := 4
-
 func _cue_in_slot(deck: int, slot: int) -> Dictionary:
-	for c in _cues_for(_deck_path(deck)):
+	for c in _cues_for(_deck_path(deck), deck):
 		if int((c as Dictionary).get("slot", 0)) == slot:
 			return c
 	return {}
@@ -8892,27 +8961,6 @@ func _pad_cue(deck: int, slot: int, shift: bool) -> void:
 	_note = "  //  CUE %d  //  %s" % [slot, AudioEngine.DECK_NAMES[deck]]
 	_clear_note_later()
 
-## Seeks to the Nth marker on the loaded track, counting from 1 in TIME order.
-##
-## SOUNDSCAPE has no hot-cue slots -- a track carries as many markers as you drop on it, keyed by
-## letter, not four numbered pads. "CUE 3" is therefore a MAPPING convention rather than a stored
-## slot: it means the third marker along the bar. That is the honest way to give a pad grid
-## something to do without inventing a second cue system for the same markers to disagree with.
-func _jump_cue_index(n: int) -> void:
-	var path := _bar_path()
-	if path.is_empty():
-		return
-	var cues := _cues_for(path).duplicate()
-	cues.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return float(a["time"]) < float(b["time"]))
-	if n < 1 or n > cues.size():
-		_note = "  //  NO CUE %d ON THIS TRACK" % n
-		_clear_note_later()
-		return
-	var cue: Dictionary = cues[n - 1]
-	_seek(_cue_stream(float(cue["time"])))   # mirrored back if the deck is running in reverse
-	_note = "  //  CUE %d: %s" % [n, cue.get("label", "")]
-	_clear_note_later()
-
 ## `at` arrives as a position in what is currently SOUNDING. While the deck is reversed that is
 ## the mirror of the track's own time, and the marker is stored in the track's terms.
 func _add_cue(at: float) -> void:
@@ -8942,15 +8990,15 @@ func _write_cue(deck: int, t: float, slot: int) -> void:
 	var path := _deck_path(deck)
 	if path.is_empty():
 		return
-	var store := _cue_store(not _library.crate_pl[deck].is_empty())
+	var store := _cue_store(not _library.crate_pl[deck].is_empty(), deck)
 	var id := _library.id_for(path)
 	_cue_undo_push(store, id)
 	var list: Array = store.get(id, [])
 	var cue := {
-		"id": next_cue_id(_cues_for(path)),
+		"id": next_cue_id(_cues_for(path, deck)),
 		"time": t,
 		"shape": "square",
-		"label": ("CUE %d" % slot) if slot > 0 else "CUE %d" % (_cues_for(path).size() + 1),
+		"label": ("CUE %d" % slot) if slot > 0 else "CUE %d" % (_cues_for(path, deck).size() + 1),
 		# the skin accent, captured at creation: markers read against every scheme, and a
 		# cue keeps the colour it was born with even after the skin changes
 		"color": theme.get_color("font_color", "Green").to_html(false),
@@ -8975,7 +9023,7 @@ func _add_cue_on(deck: int, at: float, slot: int) -> void:
 		_clear_note_later()
 		return
 	var t := clampf(_cue_stream_deck(deck, at), 0.0, span)
-	if cue_too_close(_cues_for(path), t, MIN_CUE_GAP_SEC):
+	if cue_too_close(_cues_for(path, deck), t, MIN_CUE_GAP_SEC):
 		_note = "  //  TOO CLOSE TO AN EXISTING MARKER"
 		_clear_note_later()
 		return
@@ -8989,31 +9037,59 @@ func _cue_stream_deck(deck: int, t: float) -> float:
 ## The dictionary a cue of the given scope lives in, created on demand. Playlist scope
 ## with no playlist selected has nowhere to go, and the caller says so rather than
 ## silently writing the cue somewhere the user cannot see it.
-func _cue_store(playlist_scope: bool) -> Dictionary:
+## `deck` names whose playlist the cue is going into. It used to read the BAR deck's, while the
+## caller decided the SCOPE from the target deck's -- so a marker dropped on deck B while B had
+## a playlist open and A did not was filed under `pl_cues[""]`, a bucket with no name that
+## _cues_for never looks in. The cue was saved, and never seen again.
+##
+## The empty-name guard is the belt to that brace: a playlist store with no playlist is not a
+## thing, and anything asking for one gets the track's own cues instead.
+func _cue_store(playlist_scope: bool, deck: int) -> Dictionary:
 	if not playlist_scope:
 		return _library.cues
-	if not _library.pl_cues.has(_library.crate_pl[_bar_deck()]):
-		_library.pl_cues[_library.crate_pl[_bar_deck()]] = {}
-	return _library.pl_cues[_library.crate_pl[_bar_deck()]]
+	var name: String = _library.crate_pl[deck]
+	if name.is_empty():
+		return _library.cues
+	if not _library.pl_cues.has(name):
+		_library.pl_cues[name] = {}
+	return _library.pl_cues[name]
 
 func _move_cue(cue: Dictionary, to_playlist: bool) -> void:
 	if to_playlist and _library.crate_pl[_bar_deck()].is_empty():
 		_note = "  //  NO PLAYLIST SELECTED"
 		_clear_note_later()
 		return
+	# BOTH lists are snapshotted, the one it leaves and the one it joins -- that is the whole
+	# reason an undo entry holds a list. The order matters: the source has to be photographed
+	# while the cue is still in it.
+	var home := _cue_home(cue)
+	if not home.is_empty():
+		_cue_undo_push(home["store"], str(home["id"]))
 	_pull_cue(cue)
-	var store := _cue_store(to_playlist)
+	var store := _cue_store(to_playlist, _bar_deck())   # the scope menu is the bar's own menu
 	var bar_id := _library.id_for(_bar_path())
+	_cue_undo_push(store, bar_id)
 	var list: Array = store.get(bar_id, [])
 	list.append(cue)
 	store[bar_id] = list
+	_cue_undo_commit()
 	_note = "  //  %s -> %s" % [cue["label"], _library.crate_pl[_bar_deck()] if to_playlist else "ALL TRACKS"]
 	_clear_note_later()
 	_cue_overlay.queue_redraw()
 	_save_soon()
 
+## Snapshots the list a cue lives in, for an edit that changes the cue IN PLACE rather than
+## moving it. The dictionary is shared with the store, so the copy has to be taken before the
+## field is written, not after.
+func _cue_edit_begin(cue: Dictionary) -> void:
+	var home := _cue_home(cue)
+	if not home.is_empty():
+		_cue_undo_push(home["store"], str(home["id"]))
+
 func _set_cue_color(cue: Dictionary, hex: String) -> void:
+	_cue_edit_begin(cue)
 	cue["color"] = hex
+	_cue_undo_commit()
 	_cue_overlay.queue_redraw()
 	_save_soon()
 
@@ -9080,10 +9156,12 @@ func _set_cue_key(cue: Dictionary, raw: String) -> void:
 		_note = "  //  KEYBIND ASSIGNED TO [TS %s]" % ts_text(float(clash["time"]))
 		_clear_note_later()
 		return
+	_cue_edit_begin(cue)
 	if k.is_empty():
 		cue.erase("key")
 	else:
 		cue["key"] = k
+	_cue_undo_commit()
 	_note = "  //  %s -> %s" % [cue["label"], k if k else "NO KEY"]
 	_clear_note_later()
 	_cue_overlay.queue_redraw()
